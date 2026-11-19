@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyMSS</title>
+  <link rel="stylesheet" href="/ui/assets/app.css">
+  <script src="/ui/assets/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>PyMSS</h1><span>Audio separation</span></div>
+    <nav><a href="/docs">API reference</a></nav>
+  </header>
+  <main>
+    <p id="status" role="status" aria-live="polite">Connecting to the server…</p>
+    <details id="connection">
+      <summary>Connection and downloads</summary>
+      <div class="connection-grid">
+        <label>API key<input id="api-key" type="password" autocomplete="off"></label>
+        <label>Download source<select id="source"></select></label>
+        <label>Custom endpoint<input id="endpoint" type="url" placeholder="https://…"></label>
+      </div>
+      <div class="actions"><button id="refresh" type="button">Reconnect</button><button id="save-source" type="button">Save download source</button></div>
+    </details>
+    <div class="workspace">
+      <section aria-labelledby="models-heading">
+        <h2 id="models-heading">Models</h2>
+        <div class="filters">
+          <label>Search<input id="search" type="search" placeholder="Model, architecture or stem"></label>
+          <label>Category<select id="category"><option value="">All categories</option></select></label>
+        </div>
+        <div class="checks">
+          <label><input id="local-only" type="checkbox"> Downloaded only</label>
+          <label><input id="show-unsupported" type="checkbox"> Show unsupported</label>
+        </div>
+        <label for="catalog">Model catalog</label>
+        <select id="catalog" size="8"></select>
+        <p id="model-detail" class="secondary">Select a model to view its details.</p>
+        <div class="actions"><button id="download" type="button" disabled>Download</button><button id="load" class="primary" type="button" disabled>Load model</button></div>
+        <details id="inference-options">
+          <summary>Model parameters</summary>
+          <label>Inference overrides (JSON)<textarea id="params" rows="3" spellcheck="false" placeholder="{}"></textarea></label>
+          <p id="parameters" class="secondary"></p>
+        </details>
+      </section>
+      <section aria-labelledby="separation-heading">
+        <h2 id="separation-heading">Separate audio</h2>
+        <p id="active-model" class="secondary">No model loaded.</p>
+        <form id="separation">
+          <label class="file">Audio file<input id="audio-file" type="file" accept="audio/*,.flac,.wav,.mp3,.m4a,.ogg,.opus" required></label>
+          <fieldset><legend>Stems</legend><div id="stems" class="checks"></div></fieldset>
+          <label>Output<select id="output-format">
+            <option value="preview">Preview and WAV downloads</option>
+            <option value="wav">WAV archive</option><option value="flac">FLAC archive</option>
+            <option value="mp3">MP3 archive</option><option value="m4a">M4A archive</option>
+            <option value="pcm_f32le">Raw PCM archive</option>
+          </select></label>
+          <button id="separate" class="primary" type="submit" disabled>Separate</button>
+        </form>
+        <div id="results" aria-live="polite"></div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

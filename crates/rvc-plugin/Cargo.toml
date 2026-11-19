@@ -1,0 +1,30 @@
+[package]
+name = "rvc-plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+
+[lib]
+name = "rvc_realtime"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+rtrb = "0.3"
+rvc = { path = "../rvc", default-features = false, features = ["realtime"] }
+vst = { version = "0.4", features = ["disable_deprecation_warning"] }
+vst3 = "0.3"
+
+[dev-dependencies]
+libloading = "0.8"
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+baseview = { version = "0.4.2", features = ["opengl"] }
+egui = "0.32.3"
+egui_glow = "0.32.3"
+keyboard-types = "0.8"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }

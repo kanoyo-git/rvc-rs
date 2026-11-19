@@ -1,0 +1,4 @@
+[workspace]
+members = ["crates/rvc", "crates/rvc-plugin"]
+default-members = ["crates/rvc"]
+resolver = "3"

@@ -1,0 +1,449 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "pymss server",
+    "version": "1",
+    "description": "Load a catalog model and send raw audio to separate it into stems. Send an Authorization bearer token for /v1 routes when the server was started with --api-key."
+  },
+  "security": [{}, {"BearerAuth": []}],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health_health_get",
+        "summary": "Check service health",
+        "security": [],
+        "responses": {
+          "200": {"description": "Service status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Health"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "operationId": "list_models_v1_models_get",
+        "summary": "List loaded models",
+        "responses": {
+          "200": {"description": "Zero or one loaded models", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ModelList"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/models/{model}": {
+      "get": {
+        "operationId": "get_model_v1_models__model__get",
+        "summary": "Inspect the loaded model",
+        "parameters": [{"$ref": "#/components/parameters/Model"}],
+        "responses": {
+          "200": {"description": "Loaded model details", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LoadedModel"}}}},
+          "404": {"description": "Model is not loaded by this process"},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/catalog/models": {
+      "get": {
+        "operationId": "list_catalog_models_v1_catalog_models_get",
+        "summary": "Search the model catalog",
+        "parameters": [
+          {"name": "category", "in": "query", "schema": {"type": "string"}},
+          {"name": "supported", "in": "query", "schema": {"type": "string", "enum": ["true", "false", "all"], "default": "true"}},
+          {"name": "local", "in": "query", "schema": {"type": "string", "enum": ["all", "complete", "missing"], "default": "all"}},
+          {"name": "q", "in": "query", "description": "Search names, aliases, architectures and target stems.", "schema": {"type": "string"}},
+          {"name": "include_files", "in": "query", "schema": {"type": "boolean", "default": false}},
+          {"$ref": "#/components/parameters/Source"},
+          {"$ref": "#/components/parameters/Endpoint"}
+        ],
+        "responses": {
+          "200": {"description": "Matching catalog models", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CatalogList"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/catalog/models/{model}": {
+      "get": {
+        "operationId": "get_catalog_model_v1_catalog_models__model__get",
+        "summary": "Inspect a catalog model and its files",
+        "parameters": [
+          {"$ref": "#/components/parameters/Model"},
+          {"$ref": "#/components/parameters/Source"},
+          {"$ref": "#/components/parameters/Endpoint"}
+        ],
+        "responses": {
+          "200": {"description": "Catalog model details", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CatalogModel"}}}},
+          "404": {"description": "Model is not in the catalog"},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/models/load": {
+      "post": {
+        "operationId": "load_model_endpoint_v1_models_load_post",
+        "summary": "Load or switch a model",
+        "description": "Download any missing catalog files and load the model. The current model is replaced after the new model is ready.",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/LoadRequest"},
+            "example": {"model": "HTDemucs4.th"}
+          }}
+        },
+        "responses": {
+          "200": {"description": "Model loaded", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LoadResult"}}}},
+          "409": {"description": "A model load is already in progress"},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/models/download": {
+      "post": {
+        "operationId": "download_model_endpoint_v1_models_download_post",
+        "summary": "Download model and configuration files",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/DownloadRequest"},
+            "example": {"model": "HTDemucs4.th", "force": false}
+          }}
+        },
+        "responses": {
+          "200": {"description": "Downloaded and reusable files", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DownloadResult"}}}},
+          "409": {"description": "A model download is already in progress"},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/download-source": {
+      "get": {
+        "operationId": "get_download_source_v1_download_source_get",
+        "summary": "Read the default download source",
+        "responses": {
+          "200": {"description": "Active download source", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DownloadSource"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      },
+      "post": {
+        "operationId": "update_download_source_v1_download_source_post",
+        "summary": "Change the default download source",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/Remote"},
+            "example": {"source": "modelscope"}
+          }}
+        },
+        "responses": {
+          "200": {"description": "Updated download source", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DownloadSource"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/server/info": {
+      "get": {
+        "operationId": "get_server_info_v1_server_info_get",
+        "summary": "Read server limits and the active model",
+        "responses": {
+          "200": {"description": "Server settings", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ServerInfo"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/audio/separations": {
+      "post": {
+        "operationId": "separate_audio_v1_audio_separations_post",
+        "summary": "Separate audio into stems",
+        "description": "Use the loaded model's sample rate. JSON carries Base64 PCM and its metadata in the body. With a binary PCM body, supply model, format, sample_rate and channels in the query.",
+        "parameters": [
+          {"name": "model", "in": "query", "schema": {"type": "string"}},
+          {"name": "format", "in": "query", "schema": {"$ref": "#/components/schemas/PcmFormat"}},
+          {"name": "sample_rate", "in": "query", "schema": {"type": "integer", "minimum": 1}},
+          {"name": "channels", "in": "query", "schema": {"type": "integer", "enum": [1, 2]}},
+          {"name": "stems", "in": "query", "description": "Comma-separated output names. Omit to get all stems.", "schema": {"type": "string"}},
+          {"name": "response_format", "in": "query", "schema": {"$ref": "#/components/schemas/ResponseFormat"}},
+          {"name": "output_audio_format", "in": "query", "schema": {"$ref": "#/components/schemas/OutputAudioFormat"}}
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/SeparationRequest"}},
+            "application/octet-stream": {"schema": {"type": "string", "format": "binary", "description": "Interleaved little-endian PCM bytes"}}
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Separated stems",
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/SeparationResult"}},
+              "application/zip": {"schema": {"type": "string", "format": "binary", "description": "Stem files and manifest.json"}}
+            }
+          },
+          "400": {"description": "Invalid PCM metadata, audio or response format"},
+          "404": {"description": "Requested model is not loaded"},
+          "409": {"description": "No model has been loaded"},
+          "413": {"description": "The request or input duration exceeds the configured limit"},
+          "415": {"description": "Unsupported request content type"},
+          "429": {"description": "The separation queue is full"},
+          "504": {"description": "Audio separation timed out"},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {"type": "http", "scheme": "bearer"}
+    },
+    "parameters": {
+      "Model": {"name": "model", "in": "path", "required": true, "description": "Catalog name, model ID or alias", "schema": {"type": "string"}},
+      "Source": {"name": "source", "in": "query", "schema": {"$ref": "#/components/schemas/Source"}},
+      "Endpoint": {"name": "endpoint", "in": "query", "description": "Custom HTTP or HTTPS base URL for catalog files.", "schema": {"type": "string", "format": "uri"}}
+    },
+    "responses": {
+      "Error": {
+        "description": "Request processing failed",
+        "content": {
+          "application/json": {"schema": {"$ref": "#/components/schemas/Error"}},
+          "text/plain": {"schema": {"type": "string"}}
+        }
+      }
+    },
+    "schemas": {
+      "Health": {
+        "type": "object",
+        "required": ["status", "model_loaded", "model_loading", "model", "device"],
+        "properties": {
+          "status": {"type": "string", "enum": ["ok"]},
+          "model_loaded": {"type": "boolean"},
+          "model_loading": {"type": "boolean"},
+          "model": {"type": ["string", "null"]},
+          "device": {"type": ["string", "null"]}
+        }
+      },
+      "ModelList": {
+        "type": "object",
+        "required": ["object", "data"],
+        "properties": {
+          "object": {"type": "string", "enum": ["list"]},
+          "data": {"type": "array", "items": {"$ref": "#/components/schemas/LoadedModel"}}
+        }
+      },
+      "LoadedModel": {
+        "type": "object",
+        "required": ["id", "object", "pymss"],
+        "properties": {
+          "id": {"type": "string"},
+          "object": {"type": "string", "enum": ["model"]},
+          "created": {"type": "integer"},
+          "owned_by": {"type": "string"},
+          "pymss": {
+            "type": "object",
+            "required": ["catalog_name", "sample_rate", "instruments", "supported_parameters"],
+            "properties": {
+              "catalog_name": {"type": "string"},
+              "model_type": {"type": ["string", "null"]},
+              "architecture": {"type": "string"},
+              "category": {"type": "string"},
+              "catalog_target_stem": {"type": "string"},
+              "supported": {"type": "boolean"},
+              "sample_rate": {"type": "integer"},
+              "instruments": {"type": "array", "items": {"type": "string"}},
+              "instruments_source": {"type": "string"},
+              "supported_parameters": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}}
+            }
+          }
+        }
+      },
+      "CatalogList": {
+        "type": "object",
+        "required": ["object", "data", "pymss"],
+        "properties": {
+          "object": {"type": "string", "enum": ["list"]},
+          "data": {"type": "array", "items": {"$ref": "#/components/schemas/CatalogModel"}},
+          "pymss": {
+            "allOf": [{"$ref": "#/components/schemas/Remote"}],
+            "properties": {"total": {"type": "integer", "minimum": 0}}
+          }
+        }
+      },
+      "CatalogModel": {
+        "type": "object",
+        "required": ["id", "object", "pymss"],
+        "properties": {
+          "id": {"type": "string"},
+          "object": {"type": "string", "enum": ["pymss.model_catalog_entry"]},
+          "owned_by": {"type": "string"},
+          "pymss": {
+            "type": "object",
+            "properties": {
+              "name": {"type": "string"},
+              "aliases": {"type": "array", "items": {"type": "string"}},
+              "model_type": {"type": ["string", "null"]},
+              "architecture": {"type": "string"},
+              "category": {"type": "string"},
+              "primary_category": {"type": "string"},
+              "secondary_category": {"type": "string"},
+              "target_stem": {"type": "string"},
+              "supported": {"type": "boolean"},
+              "unsupported_reason": {"type": "string"},
+              "size_bytes": {"type": "integer", "minimum": 0},
+              "local": {"type": "object", "properties": {"complete": {"type": "boolean"}, "missing_count": {"type": "integer"}}},
+              "remote": {"allOf": [{"$ref": "#/components/schemas/Remote"}], "properties": {"available": {"type": "boolean"}}},
+              "files": {"type": "array", "items": {"$ref": "#/components/schemas/CatalogFile"}}
+            }
+          }
+        }
+      },
+      "CatalogFile": {
+        "type": "object",
+        "properties": {
+          "role": {"type": "string", "enum": ["model", "config", "auxiliary"]},
+          "relpath": {"type": "string"},
+          "exists": {"type": "boolean"},
+          "size_bytes": {"type": "integer", "minimum": 0},
+          "remote_url": {"type": "string", "format": "uri"}
+        }
+      },
+      "Source": {"type": "string", "enum": ["modelscope", "huggingface", "hf-mirror"]},
+      "Remote": {
+        "type": "object",
+        "required": ["source"],
+        "properties": {
+          "source": {"$ref": "#/components/schemas/Source"},
+          "endpoint": {"type": ["string", "null"], "format": "uri"}
+        }
+      },
+      "DownloadSource": {
+        "allOf": [{"$ref": "#/components/schemas/Remote"}],
+        "properties": {"object": {"type": "string", "enum": ["download.source"]}}
+      },
+      "LoadRequest": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+          "model": {"type": "string"},
+          "source": {"$ref": "#/components/schemas/Source"},
+          "endpoint": {"type": ["string", "null"], "format": "uri"},
+          "inference_params": {"type": "object", "description": "Overrides supported by the selected model architecture.", "additionalProperties": true}
+        }
+      },
+      "LoadResult": {
+        "type": "object",
+        "properties": {
+          "object": {"type": "string", "enum": ["model.load"]},
+          "previous_model_loaded": {"type": "boolean"},
+          "model_loaded": {"type": "boolean"},
+          "model": {"$ref": "#/components/schemas/LoadedModel"}
+        }
+      },
+      "DownloadRequest": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+          "model": {"type": "string"},
+          "source": {"$ref": "#/components/schemas/Source"},
+          "endpoint": {"type": ["string", "null"], "format": "uri"},
+          "force": {"type": ["boolean", "string"], "default": false},
+          "verify": {"type": ["boolean", "string"], "default": true, "description": "Check available catalog metadata for standard sources."},
+          "timeout_seconds": {"oneOf": [{"type": "number", "exclusiveMinimum": 0}, {"type": "string"}], "default": 30, "description": "Positive transfer timeout in seconds. Fractions are allowed."},
+          "timeout": {"type": "number", "exclusiveMinimum": 0, "deprecated": true, "description": "Alias for timeout_seconds. Supply one field."}
+        }
+      },
+      "DownloadResult": {
+        "allOf": [{"$ref": "#/components/schemas/Remote"}],
+        "properties": {
+          "object": {"type": "string", "enum": ["model.download"]},
+          "model": {"$ref": "#/components/schemas/CatalogModel"},
+          "downloaded": {"type": "array", "items": {"type": "string"}},
+          "skipped": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "ServerInfo": {
+        "type": "object",
+        "properties": {
+          "object": {"type": "string", "enum": ["server.info"]},
+          "webui": {"type": "object", "properties": {"enabled": {"type": "boolean"}, "path": {"type": ["string", "null"]}}},
+          "auth": {"type": "object", "properties": {"api_key_required": {"type": "boolean"}}},
+          "limits": {
+            "type": "object",
+            "properties": {
+              "max_audio_seconds": {"type": "number"},
+              "max_request_bytes": {"type": "integer"},
+              "max_queue_size": {"type": "integer"},
+              "request_timeout_seconds": {"type": "number"}
+            }
+          },
+          "download_source": {"$ref": "#/components/schemas/Remote"},
+          "model_loaded": {"type": "boolean"},
+          "model_loading": {"type": "boolean"},
+          "model": {"anyOf": [{"$ref": "#/components/schemas/LoadedModel"}, {"type": "null"}]}
+        }
+      },
+      "PcmFormat": {"type": "string", "enum": ["pcm_f32le", "pcm_s16le"]},
+      "ResponseFormat": {"type": "string", "enum": ["json", "zip"], "default": "json"},
+      "OutputAudioFormat": {
+        "type": "string",
+        "enum": ["pcm_f32le", "wav", "flac", "mp3", "m4a"],
+        "default": "pcm_f32le",
+        "description": "Encoded formats require a ZIP response. JSON uses pcm_f32le."
+      },
+      "AudioField": {
+        "type": "object",
+        "required": ["format", "channels", "sample_rate", "data"],
+        "properties": {
+          "format": {"$ref": "#/components/schemas/PcmFormat"},
+          "channels": {"type": "integer", "enum": [1, 2]},
+          "sample_rate": {"type": "integer", "minimum": 1},
+          "data": {"type": "string", "contentEncoding": "base64", "description": "Base64-encoded interleaved little-endian PCM bytes"}
+        }
+      },
+      "SeparationRequest": {
+        "type": "object",
+        "required": ["model", "input"],
+        "properties": {
+          "model": {"type": "string"},
+          "input": {"$ref": "#/components/schemas/AudioField"},
+          "stems": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+          "response_format": {"$ref": "#/components/schemas/ResponseFormat"},
+          "output_audio_format": {"$ref": "#/components/schemas/OutputAudioFormat"}
+        }
+      },
+      "SeparationResult": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "object": {"type": "string", "enum": ["audio.separation"]},
+          "created": {"type": "integer"},
+          "model": {"type": "string"},
+          "outputs": {"type": "array", "items": {"type": "object", "properties": {
+            "stem": {"type": "string"},
+            "audio": {"$ref": "#/components/schemas/AudioField"}
+          }}},
+          "metadata": {"type": "object", "properties": {
+            "input_seconds": {"type": "number"},
+            "output_stems": {"type": "array", "items": {"type": "string"}},
+            "device": {"type": "string"}
+          }},
+          "usage": {"type": "object", "properties": {
+            "type": {"type": "string", "enum": ["duration"]},
+            "seconds": {"type": "number"}
+          }}
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["message", "code", "type"],
+            "properties": {
+              "message": {"type": "string"},
+              "code": {"type": "string"},
+              "type": {"type": "string"},
+              "param": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    }
+  }
+}

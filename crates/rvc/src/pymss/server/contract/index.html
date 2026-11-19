@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyMSS API</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { margin: 0 auto; max-width: 62rem; padding: 1.5rem; }
+    header, details { border: 1px solid GrayText; border-radius: .5rem; padding: .8rem 1rem; }
+    h1, h2, h3 { line-height: 1.2; }
+    h1 { margin-top: .25rem; }
+    nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+    details { margin: .6rem 0; }
+    summary { cursor: pointer; overflow-wrap: anywhere; }
+    mark { border-radius: .25rem; padding: .1rem .35rem; margin-right: .5rem; }
+    pre { max-height: 22rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: Canvas; padding: .6rem; border: 1px solid GrayText; }
+    label { display: block; margin: .4rem 0; }
+    input, select, textarea, button { font: inherit; }
+    label input:not([type=file]), label select, textarea { display: block; width: min(100%, 35rem); box-sizing: border-box; }
+    textarea { min-height: 5rem; }
+    button { margin: .5rem 0; }
+    .name { word-break: break-word; }
+    .inputs { margin-block: .5rem; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">PyMSS API</h1>
+    <nav aria-label="API documentation">
+      <a href="/docs">Request explorer</a>
+      <a href="/redoc">API reference</a>
+      <a href="/openapi.json">OpenAPI JSON</a>
+    </nav>
+    <p id="description" role="status">Loading the API definition…</p>
+    <label id="authentication" hidden>Bearer token
+      <input id="token" type="password" autocomplete="off" placeholder="Required only when --api-key is set">
+    </label>
+  </header>
+  <main id="operations"></main>
+  <script>
+    const reference = location.pathname === '/redoc';
+    const model = document.getElementById('operations');
+    const description = document.getElementById('description');
+    const token = document.getElementById('token');
+
+    function add(parent, tag, text = '') {
+      const element = document.createElement(tag);
+      element.textContent = text;
+      parent.append(element);
+      return element;
+    }
+
+    function requestForm(container, method, path, operation, parameters) {
+      const form = add(container, 'form');
+      form.className = 'inputs';
+      const fields = parameters.map(parameter => {
+        const label = add(form, 'label', parameter.name + (parameter.required ? ' (required)' : ''));
+        const field = add(label, 'input');
+        field.required = Boolean(parameter.required);
+        field.placeholder = parameter.description || '';
+        return [parameter, field];
+      });
+      const content = operation.requestBody?.content;
+      let media, body, binary;
+      if (content) {
+        media = add(add(form, 'label', 'Request content type'), 'select');
+        for (const name of Object.keys(content)) add(media, 'option', name).value = name;
+        const jsonLabel = add(form, 'label', 'JSON body');
+        body = add(jsonLabel, 'textarea');
+        const fileLabel = add(form, 'label', 'PCM file');
+        binary = add(fileLabel, 'input');
+        binary.type = 'file';
+        function setContentType() {
+          const isJson = media.value === 'application/json';
+          jsonLabel.hidden = binary.required = !isJson;
+          fileLabel.hidden = body.required = isJson;
+          const example = content[media.value].example;
+          if (!body.value && example) body.value = JSON.stringify(example, null, 2);
+        }
+        media.addEventListener('change', setContentType);
+        setContentType();
+      }
+      const submit = add(form, 'button', 'Send request');
+      submit.type = 'submit';
+      const status = add(form, 'p');
+      status.setAttribute('role', 'status');
+      const output = add(form, 'div');
+      let download;
+      form.addEventListener('submit', async event => {
+        event.preventDefault();
+        if (download) URL.revokeObjectURL(download);
+        output.replaceChildren();
+        const query = new URLSearchParams();
+        let endpoint = path;
+        for (const [parameter, field] of fields) {
+          if (parameter.in === 'path') {
+            endpoint = endpoint.replace(`{${parameter.name}}`, encodeURIComponent(field.value));
+          } else if (field.value) {
+            query.set(parameter.name, field.value);
+          }
+        }
+        const url = new URL(endpoint, location.origin);
+        url.search = query.toString();
+        const options = {method, headers: {}};
+        if (operation.security?.length !== 0 && token.value) options.headers.Authorization = 'Bearer ' + token.value;
+        if (content) {
+          options.headers['Content-Type'] = media.value;
+          options.body = media.value === 'application/json' ? body.value : binary.files[0];
+        }
+        status.textContent = 'Request in progress…';
+        submit.disabled = true;
+        try {
+          const response = await fetch(url, options);
+          status.textContent = `HTTP ${response.status}`;
+          const kind = response.headers.get('Content-Type') || '';
+          if (kind.includes('application/zip')) {
+            download = URL.createObjectURL(await response.blob());
+            const link = add(output, 'a', 'Download stems');
+            link.href = download;
+            link.download = 'pymss-stems.zip';
+          } else {
+            const text = await response.text();
+            add(output, 'pre', kind.includes('application/json') ? JSON.stringify(JSON.parse(text), null, 2) : text);
+          }
+        } catch (error) {
+          status.textContent = error.message;
+        } finally {
+          submit.disabled = false;
+        }
+      });
+    }
+
+    async function render() {
+      const response = await fetch('/openapi.json');
+      if (!response.ok) throw new Error(`Could not load OpenAPI (HTTP ${response.status})`);
+      const schema = await response.json();
+      function resolve(item) {
+        return item.$ref ? item.$ref.slice(2).split('/').reduce((object, key) => object[key], schema) : item;
+      }
+      description.textContent = schema.info.description;
+      document.getElementById('authentication').hidden = reference;
+      add(model, 'h2', 'Endpoints');
+      for (const [path, methods] of Object.entries(schema.paths)) {
+        for (const [verb, operation] of Object.entries(methods)) {
+          const method = verb.toUpperCase();
+          const block = add(model, 'details');
+          block.open = reference;
+          const summary = add(block, 'summary');
+          add(summary, 'mark', method);
+          add(summary, 'code', path).className = 'name';
+          add(block, 'h3', operation.summary);
+          if (operation.description) add(block, 'p', operation.description);
+          const parameters = (operation.parameters || []).map(resolve);
+          if (parameters.length) {
+            const list = add(block, 'ul');
+            for (const parameter of parameters) {
+              const type = resolve(parameter.schema);
+              const values = type.enum ? ` (${type.enum.join(', ')})` : '';
+              const note = parameter.description ? ` — ${parameter.description}` : '';
+              add(list, 'li', `${parameter.name} · ${parameter.in} ${type.type}${values}${note}`);
+            }
+          }
+          if (operation.requestBody) {
+            for (const [contentType, data] of Object.entries(operation.requestBody.content)) {
+              add(block, 'p', `Request · ${contentType}`);
+              add(block, 'pre', JSON.stringify(data.schema, null, 2));
+            }
+          }
+          const responses = add(block, 'ul');
+          for (const [status, raw] of Object.entries(operation.responses)) {
+            const result = resolve(raw);
+            const formats = Object.keys(result.content || {}).join(', ');
+            add(responses, 'li', `${status} · ${result.description}${formats ? ` (${formats})` : ''}`);
+          }
+          if (!reference) requestForm(block, method, path, operation, parameters);
+        }
+      }
+      add(model, 'h2', 'Schemas');
+      for (const [name, definition] of Object.entries(schema.components.schemas)) {
+        const block = add(model, 'details');
+        block.open = reference;
+        add(block, 'summary', name);
+        add(block, 'pre', JSON.stringify(definition, null, 2));
+      }
+    }
+
+    render().catch(error => { description.textContent = error.message; });
+  </script>
+</body>
+</html>

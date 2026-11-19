@@ -1,0 +1,75 @@
+[package]
+name = "rvc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+
+[[example]]
+name = "realtime_benchmark"
+required-features = ["realtime"]
+
+[features]
+default = ["inference", "realtime", "index-training"]
+inference = ["dep:tch", "dep:cc", "dep:ndarray", "dep:ndarray-npy", "dep:rustfft", "dep:rand", "dep:serde_yaml", "dep:sha2", "dep:base64", "dep:uuid", "dep:libloading", "dep:tower-http", "dep:tokio-util", "tokio/fs", "tokio/io-util", "tokio/process"]
+realtime = ["inference", "dep:cpal", "dep:rtrb", "dep:windows"]
+asio = ["realtime", "cpal/asio"]
+cuda-graph = ["inference"]
+index-training = ["dep:faiss", "dep:ndarray", "dep:ndarray-npy", "dep:rand", "dep:same-file"]
+onnx = ["inference", "dep:ort", "dep:prost"]
+onnx-f0 = ["onnx"]
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["multipart", "ws"] }
+base64 = { version = "0.22", optional = true }
+clap = { version = "4", features = ["derive"] }
+cpal = { version = "0.18.2", optional = true }
+hound = "3.5"
+libloading = { version = "0.8", optional = true }
+ndarray = { version = "0.17", optional = true }
+ndarray-npy = { version = "0.10", default-features = false, optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "api-24", "alternative-backend", "directml"], optional = true }
+prost = { version = "0.14", optional = true }
+rand = { version = "0.9", optional = true }
+rayon = "1"
+regex = "1"
+rtrb = { version = "0.3", optional = true }
+rustfft = { version = "6", optional = true }
+same-file = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = { version = "0.9", optional = true }
+sha1 = "0.10"
+sha2 = { version = "0.10", optional = true }
+tch = { version = "0.20", optional = true }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
+tower-http = { version = "0.6", features = ["fs"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+walkdir = "2"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+faiss = { version = "0.13", optional = true }
+
+[target.'cfg(not(any(target_os = "windows", target_os = "macos")))'.dependencies]
+faiss = { version = "0.13", features = ["static"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["pulseaudio"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+] }
