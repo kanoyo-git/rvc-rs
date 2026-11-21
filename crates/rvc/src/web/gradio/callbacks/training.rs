@@ -42,13 +42,14 @@ pub(super) fn run(
             return Ok(vec![update(text), update(json!({"visible":!multi}))]);
         }
         15 => {
-            let visible = args.text(0)? == "rmvpe" && has_training_gpu();
+            let visible = matches!(args.text(0)?, "rmvpe" | "rmcpe") && has_training_gpu();
             return Ok(vec![update(json!({"visible":visible}))]);
         }
         16 => {
             let method = args.boolean(3)?.then(|| pitch(args.text(2)?)).transpose()?;
             let mut devices = gpu_list(args.text(0)?)?;
-            if devices.is_empty() && method == Some(PitchMethod::Rmvpe) {
+            if devices.is_empty() && matches!(method, Some(PitchMethod::Rmvpe | PitchMethod::Rmcpe))
+            {
                 devices = gpu_list(args.text(6)?)?;
             }
             Action::Extract {

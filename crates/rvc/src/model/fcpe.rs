@@ -114,12 +114,33 @@ impl Fcpe {
         threshold: f32,
         stream: Option<&Cache>,
     ) -> Result<Vec<f32>> {
+        self.output(samples, Some(threshold), stream)
+    }
+
+    pub(super) fn infer_salience(
+        &self,
+        samples: &[f32],
+        stream: Option<&Cache>,
+    ) -> Result<Vec<f32>> {
+        self.output(samples, None, stream)
+    }
+
+    pub(super) fn cent_table(&self) -> Result<Vec<f32>> {
+        Ok(Vec::try_from(self.cents.to_device(Device::Cpu).view([-1]))?)
+    }
+
+    fn output(
+        &self,
+        samples: &[f32],
+        threshold: Option<f32>,
+        stream: Option<&Cache>,
+    ) -> Result<Vec<f32>> {
         ensure!(
             !samples.is_empty(),
             "FCPE requires at least one audio sample"
         );
         ensure!(
-            samples.iter().all(|sample| sample.is_finite()) && threshold.is_finite(),
+            samples.iter().all(|sample| sample.is_finite()) && threshold.is_none_or(f32::is_finite),
             "FCPE requires finite samples and threshold"
         );
         no_grad(|| {
@@ -128,11 +149,15 @@ impl Fcpe {
                 .f_to_device(self.window.device())?;
             let predict = |input: &[&Tensor]| {
                 let mel = self.wav_to_mel(input[0])?;
-                self.decode(&self.salience(&mel)?, threshold)
+                let salience = self.salience(&mel)?;
+                match threshold {
+                    Some(value) => self.decode(&salience, value),
+                    None => Ok(salience),
+                }
             };
             let pitch = if stream.is_some() && matches!(&self.backend, Backend::Torch(_)) {
                 self.graph.borrow_mut().run(
-                    [i64::from(threshold.to_bits()), 0, 0, 0],
+                    [threshold.map_or(-1, |v| i64::from(v.to_bits())), 0, 0, 0],
                     &[&waveform],
                     stream,
                     predict,
@@ -144,7 +169,7 @@ impl Fcpe {
             let pitch = Vec::<f32>::try_from(pitch.f_reshape([-1])?)?;
             ensure!(
                 pitch.iter().all(|hz| hz.is_finite()),
-                "FCPE produced nonfinite F0"
+                "FCPE produced nonfinite output"
             );
             Ok(pitch)
         })

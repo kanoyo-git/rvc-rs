@@ -58,6 +58,77 @@ pub fn run_on_devices(
 
 const SOURCE_FILE: &str = ".embedder.json";
 pub(super) const RAW_F0: &str = "2d-f0raw";
+pub(super) const PITCH_PENDING: &str = ".incomplete";
+
+/// Each track publishes its source only after all three NumPy files are durable.
+/// A missing source (including an old experiment) is rebuilt on explicit extraction.
+#[derive(Debug, PartialEq, Deserialize, Serialize)]
+struct PitchSource {
+    revision: u32,
+    method: PitchMethod,
+    unvoice_fricatives: bool,
+    rmvpe_threshold_bits: Option<u32>,
+    weights: Vec<FileStamp>,
+}
+
+#[derive(Debug, PartialEq, Deserialize, Serialize)]
+struct FileStamp {
+    bytes: u64,
+    modified: std::time::SystemTime,
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Result<Self> {
+        let meta = path
+            .metadata()
+            .with_context(|| format!("reading {}", path.display()))?;
+        Ok(Self {
+            bytes: meta.len(),
+            modified: meta.modified()?,
+        })
+    }
+}
+
+impl PitchSource {
+    fn new(paths: &Paths, method: PitchMethod, unvoice_fricatives: bool) -> Result<Self> {
+        let mut weights = Vec::new();
+        if matches!(method, PitchMethod::Rmvpe | PitchMethod::Rmcpe) {
+            let pt = paths.rmvpe.join("rmvpe.pt");
+            let path = if pt.is_file() {
+                pt
+            } else {
+                paths.rmvpe.join("rmvpe.onnx")
+            };
+            weights.push(FileStamp::read(&path)?);
+        }
+        if matches!(method, PitchMethod::Fcpe | PitchMethod::Rmcpe) {
+            weights.push(FileStamp::read(&paths.root.join(super::FCPE_CHECKPOINT))?);
+        }
+        if method == PitchMethod::Nmvpe {
+            weights.push(FileStamp::read(&paths.nmvpe())?);
+        }
+        Ok(Self {
+            revision: 1,
+            method,
+            unvoice_fricatives,
+            rmvpe_threshold_bits: (method == PitchMethod::Rmvpe)
+                .then(|| super::rmvpe_threshold().to_bits()),
+            weights,
+        })
+    }
+
+    fn matches(&self, marker: &Path, wave: &FileStamp) -> Result<bool> {
+        match File::open(marker) {
+            Ok(file) => {
+                let (old_source, old_wave): (Self, FileStamp) = serde_json::from_reader(file)
+                    .with_context(|| format!("reading {}", marker.display()))?;
+                Ok(&old_source == self && &old_wave == wave)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 struct FeatureSource {
@@ -124,6 +195,10 @@ pub fn run_with_embedder(
     lock.try_lock()
         .context("another process is extracting features or training this experiment")?;
     let mut input = Input::prepare(request)?;
+    if let Some(method) = request.f0 {
+        input.pitch_source = Some(PitchSource::new(paths, method, request.unvoice_fricatives)?);
+        fs::create_dir_all(input.raw_dir.join(".provenance"))?;
+    }
     let existing = read_source(&input.feature_dir)?;
     let configured = configured_embedder(request.experiment)?;
     let recorded = existing
@@ -163,8 +238,15 @@ pub fn run_with_embedder(
         )
     };
     mark(false)?;
+    let pitch_pending = input.raw_dir.join(PITCH_PENDING);
+    if request.f0.is_some() {
+        audio::write_file(&pitch_pending, b"", true)?;
+    }
     let result = extract_on_devices(paths, request, devices, &input, progress)?;
     mark(true)?;
+    if request.f0.is_some() {
+        fs::remove_file(pitch_pending)?;
+    }
     Ok(result)
 }
 
@@ -268,6 +350,7 @@ struct Input {
     dims: usize,
     hubert_root: PathBuf,
     replace_features: bool,
+    pitch_source: Option<PitchSource>,
     wavs: Vec<PathBuf>,
     feature_dir: PathBuf,
     pitch_dir: PathBuf,
@@ -301,6 +384,7 @@ impl Input {
             dims,
             hubert_root: PathBuf::new(),
             replace_features: false,
+            pitch_source: None,
             wavs,
             feature_dir,
             pitch_dir,
@@ -351,17 +435,30 @@ fn extract(
             let raw_file = input.raw_dir.join(&f0_name);
             let need_feature =
                 request.overwrite || input.replace_features || !feature_file.is_file();
-            let write_legacy_pitch =
-                request.overwrite || !pitch_file.is_file() || !hz_file.is_file();
-            let need_pitch = request
-                .f0
-                .filter(|_| write_legacy_pitch || !raw_file.is_file());
+            let marker = input
+                .raw_dir
+                .join(".provenance")
+                .join(&f0_name)
+                .with_extension("json");
+            let mut need_pitch = None;
+            if let Some(source) = &input.pitch_source {
+                let wave_stamp = FileStamp::read(wav)?;
+                if request.overwrite
+                    || !pitch_file.is_file()
+                    || !hz_file.is_file()
+                    || !raw_file.is_file()
+                    || !source.matches(&marker, &wave_stamp)?
+                {
+                    need_pitch = Some((source, wave_stamp));
+                }
+            }
             if !need_feature && need_pitch.is_none() {
                 report.cached += 1;
                 continue;
             }
             let wave = audio::read_mono(wav, ANALYSIS_RATE)?;
-            if let Some(method) = need_pitch {
+            if let Some((source, wave_stamp)) = need_pitch {
+                let method = source.method;
                 if f0.is_none() {
                     f0 = Some(Pitch::load(method, paths, device, kind)?);
                 }
@@ -377,24 +474,20 @@ fn extract(
                 if request.unvoice_fricatives {
                     super::aperiodic::unvoice_fricatives(&wave, &mut hz);
                 }
+                if marker.exists() {
+                    fs::remove_file(&marker)?;
+                }
                 npy(&raw_file, &ndarray::ArrayView1::from(&hz))?;
                 if hz.iter().any(|&v| v > 0.0) {
-                    if write_legacy_pitch {
-                        interpolate_voiced(&mut hz);
-                        let bands = Array1::from_iter(hz.iter().map(|&value| coarse_pitch(value)));
-                        npy(&pitch_file, &bands)?;
-                        npy(&hz_file, &Array1::from(hz))?;
-                    }
+                    interpolate_voiced(&mut hz);
                     report.pitch += 1;
                 } else {
-                    if write_legacy_pitch && (pitch_file.is_file() || hz_file.is_file()) {
-                        // A changed pitch method can leave no voiced frames in a
-                        // previously extracted clip. Replace its stale tracks.
-                        npy(&pitch_file, &Array1::from_elem(hz.len(), 1i64))?;
-                        npy(&hz_file, &Array1::from(hz))?;
-                    }
                     report.unvoiced += 1;
                 }
+                let bands = Array1::from_iter(hz.iter().map(|&value| coarse_pitch(value)));
+                npy(&pitch_file, &bands)?;
+                npy(&hz_file, &Array1::from(hz))?;
+                audio::write_file(&marker, &serde_json::to_vec(&(source, wave_stamp))?, true)?;
             }
             if need_feature {
                 if hubert.is_none() {
@@ -428,4 +521,35 @@ fn npy(path: &Path, data: &impl WriteNpyExt) -> Result<()> {
     data.write_npy(staged.as_file_mut())?;
     staged.persist(path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pitch_cache_requires_the_same_extractor_weights_input_and_voicing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = Paths::new(dir.path())?;
+        fs::create_dir_all(&paths.rmvpe)?;
+        fs::write(paths.rmvpe.join("rmvpe.pt"), b"rmvpe")?;
+        let fcpe = paths.root.join(super::super::FCPE_CHECKPOINT);
+        fs::create_dir_all(fcpe.parent().unwrap())?;
+        fs::write(&fcpe, b"fcpe")?;
+        let wav = dir.path().join("voice.wav");
+        fs::write(&wav, b"input")?;
+        let input = FileStamp::read(&wav)?;
+        let source = PitchSource::new(&paths, PitchMethod::Rmcpe, false)?;
+        let marker = dir.path().join("source.json");
+        assert!(!source.matches(&marker, &input)?);
+        fs::write(&marker, serde_json::to_vec(&(&source, &input))?)?;
+        assert!(source.matches(&marker, &input)?);
+        assert!(!PitchSource::new(&paths, PitchMethod::Rmvpe, false)?.matches(&marker, &input)?);
+        assert!(!PitchSource::new(&paths, PitchMethod::Rmcpe, true)?.matches(&marker, &input)?);
+        fs::write(&fcpe, b"new weights")?;
+        assert!(!PitchSource::new(&paths, PitchMethod::Rmcpe, false)?.matches(&marker, &input)?);
+        fs::write(&wav, b"new input")?;
+        assert!(!source.matches(&marker, &FileStamp::read(&wav)?)?);
+        Ok(())
+    }
 }

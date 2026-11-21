@@ -1,0 +1,191 @@
+[
+  {
+    "method": "rmvpe",
+    "frames": 901,
+    "conditions": {
+      "silence": {
+        "n": 80,
+        "voiced_pct": 0.0
+      },
+      "bass_42": {
+        "n": 80,
+        "voiced_pct": 28.75,
+        "within50_all_ref_pct": 0.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 4058.64
+      },
+      "bass_65": {
+        "n": 80,
+        "voiced_pct": 42.5,
+        "within50_all_ref_pct": 42.5,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 2.22
+      },
+      "harmonic_110": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 2.04
+      },
+      "missing_fundamental_110": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 2.0
+      },
+      "vibrato_220_5Hz_55cent": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 4.87
+      },
+      "hiss": {
+        "n": 80,
+        "voiced_pct": 0.0
+      },
+      "harmonic_440_0dB_white": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 0.97
+      },
+      "high_1250": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 70.0,
+        "octave_error_count": 24,
+        "median_abs_cents_on_voiced": 8.8
+      }
+    }
+  },
+  {
+    "method": "fcpe",
+    "frames": 901,
+    "conditions": {
+      "silence": {
+        "n": 80,
+        "voiced_pct": 0.0
+      },
+      "bass_42": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 10.68
+      },
+      "bass_65": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 3.65
+      },
+      "harmonic_110": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 0.19
+      },
+      "missing_fundamental_110": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 0.0,
+        "octave_error_count": 80,
+        "median_abs_cents_on_voiced": 1200.33
+      },
+      "vibrato_220_5Hz_55cent": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 6.18
+      },
+      "hiss": {
+        "n": 80,
+        "voiced_pct": 0.0
+      },
+      "harmonic_440_0dB_white": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 5.4
+      },
+      "high_1250": {
+        "n": 80,
+        "voiced_pct": 0.0,
+        "within50_all_ref_pct": 0.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": null
+      }
+    }
+  },
+  {
+    "method": "rmcpe",
+    "frames": 901,
+    "conditions": {
+      "silence": {
+        "n": 80,
+        "voiced_pct": 0.0
+      },
+      "bass_42": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 10.91
+      },
+      "bass_65": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 3.5
+      },
+      "harmonic_110": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 2.04
+      },
+      "missing_fundamental_110": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 2.0
+      },
+      "vibrato_220_5Hz_55cent": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 5.18
+      },
+      "hiss": {
+        "n": 80,
+        "voiced_pct": 0.0
+      },
+      "harmonic_440_0dB_white": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 0.97
+      },
+      "high_1250": {
+        "n": 80,
+        "voiced_pct": 100.0,
+        "within50_all_ref_pct": 100.0,
+        "octave_error_count": 0,
+        "median_abs_cents_on_voiced": 8.6
+      }
+    }
+  }
+]

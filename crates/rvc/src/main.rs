@@ -260,9 +260,9 @@ struct InferOptions {
     rms_mix_rate: f32,
     #[arg(long, default_value_t = 0.33)]
     protect: f32,
-    /// How far breaths and fricatives follow the source's spectral shape and level (0-1).
-    #[arg(long, default_value_t = 1.0)]
-    aperiodic: f32,
+    /// Source breath and fricative envelope (0-1). Omit to use the model default.
+    #[arg(long)]
+    aperiodic: Option<f32>,
     /// Let the converted voice rise above the source's level (by default it is held
     /// under it, so pauses and fades are not sung out loud).
     #[arg(long)]
@@ -673,7 +673,7 @@ fn infer(paths: &Paths, model: &std::path::Path, args: InferOptions) -> Result<(
     for (source, target, format) in jobs {
         let result = (|| -> Result<()> {
             let samples = audio::read_mono(&source, audio::ANALYSIS_RATE)?;
-            let hires = if engine.uses_bands() {
+            let hires = if engine.needs_hires(settings) {
                 Some(audio::read_mono(&source, engine.rate())?)
             } else {
                 None

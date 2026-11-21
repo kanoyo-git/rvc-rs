@@ -7,11 +7,9 @@
 //! singing. Breaths and fricatives are turbulent noise shaped by the mouth: their
 //! spectral shape and loudness carry the articulation, not the singer's identity.
 //!
-//! On frames where the source has no pitch, this module reshapes the converted
-//! spectrum band by band so that its shape and its level relative to the voiced
-//! part follow the source. The noise itself (phase, fine texture) stays the
-//! model's. Voiced frames pass through unchanged: the analysis and synthesis
-//! windows reconstruct them exactly.
+//! Source frication controls the envelope of the synthesized noise. On voiced
+//! fricative edges only the upper bands are adjusted. Harmonic frames keep
+//! the target voice's spectrum even if the pitch tracker loses the note.
 
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
@@ -70,11 +68,14 @@ pub fn unvoice_fricatives(audio: &[f32], pitch: &mut [f32]) -> usize {
         let sum = |a: f32, b: f32| power[bin(a)..bin(b)].iter().sum::<f32>();
         let total = sum(80.0, 7_900.0) + 1e-12;
         energy.push(total);
-        fricative.push(sum(3_500.0, 7_900.0) / total > 0.5 && sum(80.0, 1_000.0) / total < 0.15);
+        let high = sum(3_500.0, 7_900.0) / total;
+        let low = sum(80.0, 1_000.0) / total;
+        fricative.push(high > 0.5 && low < 0.15
+            && strongest_high_flatness(&buffer[..power.len()], hz, 7_900.0) > 0.05);
         let band = &power[bin(300.0)..bin(7_900.0)];
         let mean = band.iter().sum::<f32>() / band.len() as f32 + 1e-20;
         let log_mean = band.iter().map(|p| (p + 1e-20).ln()).sum::<f32>() / band.len() as f32;
-        noisy.push(log_mean.exp() / mean > 0.25 && sum(80.0, 1_000.0) / total < 0.5);
+        noisy.push(log_mean.exp() / mean > 0.25 && low < 0.5);
     }
     let mut sorted = energy.clone();
     sorted.sort_by(f32::total_cmp);
@@ -104,7 +105,7 @@ pub fn bandwidth(audio: &[f32], rate: u32) -> f32 {
     let fft = planner.plan_fft_forward(size);
     let mut power = vec![0_f32; size / 2 + 1];
     let step = (audio.len() / 64).max(size);
-    for start in (0..audio.len() - size).step_by(step) {
+    for start in (0..=audio.len() - size).step_by(step) {
         let mut buffer: Vec<Complex<f32>> = audio[start..start + size]
             .iter()
             .enumerate()
@@ -197,39 +198,29 @@ pub fn transfer(output: &mut [f32], source: &Source<'_>, rate: u32, strength: f3
     let src_level: Vec<f32> = src_bands.iter().map(|p| total(p)).collect();
     let out_level: Vec<f32> = out_bands.iter().map(|p| total(p)).collect();
 
-    // Unvoiced weight per frame, softened over ±1 frame, and gated to frames
-    // that carry sound (within 45 dB of the loud part of the source).
+    // A missed F0 alone cannot distinguish a breath from a raspy sung note.
     let mut loud: Vec<f32> = src_level.clone();
     loud.sort_by(f32::total_cmp);
     let top = loud[loud.len() * 95 / 100].max(1e-12);
-    let unvoiced: Vec<f32> = (0..frames)
-        .map(|t| {
-            let pitch = source.pitch.get(t).copied().unwrap_or(0.0);
-            if pitch <= 0.0 && src_level[t] > top * 10_f32.powf(-4.5) { 1.0 } else { 0.0 }
-        })
-        .collect();
-    let weight: Vec<f32> = (0..frames)
-        .map(|t| {
-            let around = t.saturating_sub(1)..(t + 2).min(frames);
-            let n = around.len() as f32;
-            unvoiced[around].iter().sum::<f32>() / n
-        })
-        .collect();
-    // Frames that keep a pitch but whose source is dominated by hiss above 3 kHz: the
-    // voiced edges of "s", "sh" and "ch", and voiced fricatives. Only the bands above
-    // 3 kHz follow the source there, so the harmonics underneath stay the model's.
     let high_from = centers_from(&edges, 3_000.0);
-    let hissy: Vec<f32> = (0..frames)
+    let low_end = centers_from(&edges, 1_000.0);
+    let mode: Vec<Envelope> = (0..frames)
         .map(|t| {
-            let pitch = source.pitch.get(t).copied().unwrap_or(0.0);
-            let high: f32 = src_bands[t][high_from..].iter().zip(&usable[high_from..]).filter(|(_, u)| **u).map(|(p, _)| p).sum();
-            if pitch > 0.0 && src_level[t] > top * 10_f32.powf(-4.5) && high / src_level[t] > 0.4 { 1.0 } else { 0.0 }
+            let level = src_level[t];
+            if level <= (top * 10_f32.powf(-4.5)).max(1e-11) {
+                return Envelope::None;
+            }
+            let high = src_bands[t][high_from..].iter().zip(&usable[high_from..])
+                .filter(|(_, use_band)| **use_band).map(|(p, _)| p).sum::<f32>() / level;
+            let low = src_bands[t][..low_end].iter().sum::<f32>() / level;
+            let voiced = source.pitch.get(t).is_some_and(|&pitch| pitch > 0.0);
+            noise_envelope(&src_spec[t], hz, source.bandwidth, voiced, low, high, level / top)
         })
         .collect();
     // The voiced level of each signal anchors the relative loudness of breaths.
     let voiced_mean = |level: &[f32]| -> f32 {
         let (sum, n) = (0..frames)
-            .filter(|&t| unvoiced[t] == 0.0 && src_level[t] > top * 10_f32.powf(-2.0))
+            .filter(|&t| source.pitch.get(t).is_some_and(|&pitch| pitch > 0.0) && src_level[t] > top * 0.01)
             .fold((0_f32, 0usize), |(s, n), t| (s + level[t], n + 1));
         if n == 0 { 1.0 } else { sum / n as f32 }
     };
@@ -240,9 +231,7 @@ pub fn transfer(output: &mut [f32], source: &Source<'_>, rate: u32, strength: f3
     let mut norm = vec![0_f32; result.len()];
     for t in 0..frames {
         let mut spectrum = out_spec[t].clone();
-        let w = weight[t] * strength;
-        let partial = if w > 0.0 { 0.0 } else { hissy[t] * strength };
-        if partial > 0.0 {
+        if mode[t] == Envelope::High {
             let around = t.saturating_sub(1)..(t + 2).min(frames);
             let gains: Vec<f32> = (0..bands)
                 .map(|b| {
@@ -254,9 +243,12 @@ pub fn transfer(output: &mut [f32], source: &Source<'_>, rate: u32, strength: f3
                     (src / out.max(1e-12)).sqrt().clamp(1.0 / MAX_BAND_GAIN, MAX_BAND_GAIN)
                 })
                 .collect();
-            apply_band_gains(&mut spectrum, &gains, &centers, hz, partial);
+            apply_band_gains(&mut spectrum, &gains, &centers, hz, source.bandwidth, strength);
         }
-        if w > 0.0 {
+        if mode[t] == Envelope::Full {
+            let neighbors = &mode[t.saturating_sub(1)..(t + 2).min(frames)];
+            let weight = neighbors.iter().filter(|&&m| m == Envelope::Full).count() as f32
+                / neighbors.len() as f32 * strength;
             // Three-frame band powers make the per-frame shape estimate stable.
             let smoothed = |bank: &[Vec<f32>], b: usize| -> f32 {
                 let around = t.saturating_sub(1)..(t + 2).min(frames);
@@ -272,7 +264,8 @@ pub fn transfer(output: &mut [f32], source: &Source<'_>, rate: u32, strength: f3
             let gains: Vec<f32> = (0..bands)
                 .map(|b| {
                     if !usable[b] {
-                        return level;
+                        // A narrow source gives no evidence for boosting decoder hiss above its cutoff.
+                        return level.min(1.0);
                     }
                     let share = |bank: &[Vec<f32>], total: f32| smoothed(bank, b) / total;
                     let shape = (share(&src_bands, src_total) / share(&out_bands, out_total).max(1e-9))
@@ -281,7 +274,7 @@ pub fn transfer(output: &mut [f32], source: &Source<'_>, rate: u32, strength: f3
                     shape * level
                 })
                 .collect();
-            apply_band_gains(&mut spectrum, &gains, &centers, hz, w);
+            apply_band_gains(&mut spectrum, &gains, &centers, hz, source.bandwidth, weight);
         }
         // Inverse transform of the half spectrum.
         let mut full = vec![Complex::new(0.0, 0.0); size];
@@ -305,6 +298,53 @@ pub fn transfer(output: &mut [f32], source: &Source<'_>, rate: u32, strength: f3
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Envelope { None, High, Full }
+
+fn flatness(spectrum: &[Complex<f32>]) -> f32 {
+    if spectrum.is_empty() {
+        return 0.0;
+    }
+    let n = spectrum.len() as f32;
+    let (power, log_power) = spectrum.iter().fold((0.0, 0.0), |(sum, log), x| {
+        let p = x.norm_sqr().max(1e-20);
+        (sum + p, log + p.ln())
+    });
+    (log_power / n).exp() / (power / n)
+}
+
+/// Flatness in the strongest available 1 kHz interval. Across the entire
+/// upper band the spectral slope of a genuine "sh" can look almost tonal.
+fn strongest_high_flatness(spectrum: &[Complex<f32>], hz: f32, bandwidth: f32) -> f32 {
+    if bandwidth <= 3_000.0 {
+        return 0.0;
+    }
+    let bin = |freq: f32| ((freq / hz).ceil() as usize).min(spectrum.len());
+    let upper = &spectrum[bin(3_000.0)..bin(bandwidth.min(16_000.0))];
+    let width = (1_000.0 / hz).round().max(1.0) as usize;
+    upper.chunks(width)
+        .filter(|s| s.len() >= width / 2)
+        .map(|s| (s.iter().map(|x| x.norm_sqr()).sum::<f32>(), s))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or(0.0, |(_, s)| flatness(s))
+}
+
+fn noise_envelope(
+    spectrum: &[Complex<f32>], hz: f32, bandwidth: f32, voiced: bool,
+    low: f32, high: f32, relative_power: f32,
+) -> Envelope {
+    let bin = |freq: f32| ((freq / hz).ceil() as usize).min(spectrum.len());
+    if high > 0.4 && strongest_high_flatness(spectrum, hz, bandwidth) > 0.15 {
+        return if !voiced && low < 0.15 { Envelope::Full } else { Envelope::High };
+    }
+    if !voiced && relative_power < 10_f32.powf(-1.2) && low < 0.5 && bandwidth > 300.0
+        && flatness(&spectrum[bin(300.0)..bin(bandwidth.min(8_000.0))]) > 0.25
+    {
+        return Envelope::Full;
+    }
+    Envelope::None
+}
+
 /// Index of the first third-octave band whose center lies at or above `hz`.
 fn centers_from(edges: &[f32], hz: f32) -> usize {
     edges.windows(2).position(|e| (e[0] * e[1]).sqrt() >= hz).unwrap_or(edges.len() - 1)
@@ -312,7 +352,7 @@ fn centers_from(edges: &[f32], hz: f32) -> usize {
 
 /// Scale `spectrum` by per-band `gains`, interpolated in log-frequency between band
 /// centers, raised to the power `weight`.
-fn apply_band_gains(spectrum: &mut [Complex<f32>], gains: &[f32], centers: &[f32], hz: f32, weight: f32) {
+fn apply_band_gains(spectrum: &mut [Complex<f32>], gains: &[f32], centers: &[f32], hz: f32, bandwidth: f32, weight: f32) {
     let bands = gains.len();
     for (k, value) in spectrum.iter_mut().enumerate() {
         let f = (k as f32 * hz).max(1.0);
@@ -325,7 +365,8 @@ fn apply_band_gains(spectrum: &mut [Complex<f32>], gains: &[f32], centers: &[f32
             let x = (f.ln() - centers[b - 1].ln()) / (centers[b].ln() - centers[b - 1].ln());
             gains[b - 1].ln() * (1.0 - x) + gains[b].ln() * x
         };
-        *value *= (log_gain * weight).exp();
+        let gain = if f > bandwidth { log_gain.min(0.0) } else { log_gain };
+        *value *= (gain * weight).exp();
     }
 }
 
@@ -382,6 +423,18 @@ mod tests {
     }
 
     #[test]
+    fn a_strong_upper_harmonic_cannot_unvoice_a_sung_note() {
+        let n = 16_000;
+        let note: Vec<_> = (0..n).map(|i| {
+            let phase = std::f32::consts::TAU * 220.0 * i as f32 / n as f32;
+            0.1 * phase.sin() + 0.7 * (phase * 20.0).sin()
+        }).collect();
+        let mut pitch = vec![220.0; 100];
+        unvoice_fricatives(&note, &mut pitch);
+        assert!(pitch[2..98].iter().all(|&f| f == 220.0));
+    }
+
+    #[test]
     fn voiced_frames_pass_through_unchanged() {
         let rate = 40_000;
         let x: Vec<f32> = (0..rate as usize)
@@ -393,6 +446,29 @@ mod tests {
         transfer(&mut y, &source, rate, 1.0);
         let error = x.iter().zip(&y).fold(0_f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(error < 1e-4, "{error}");
+    }
+
+    #[test]
+    fn a_bright_note_keeps_the_converted_timbre_when_pitch_drops_out() {
+        let rate = 40_000;
+        let tone = |hz: f32, i: usize| (i as f32 * (std::f32::consts::TAU * hz / rate as f32)).sin();
+        let reference: Vec<_> = (0..rate as usize).map(|i| 0.15 * tone(220.0, i) + 0.4 * tone(4400.0, i)).collect();
+        let rendered: Vec<_> = (0..rate as usize).map(|i| 0.25 * tone(330.0, i) + 0.08 * tone(3960.0, i)).collect();
+        let mut pitch = vec![220.0; 100];
+        pitch[50..].fill(0.0);
+        let mut output = rendered.clone();
+        transfer(&mut output, &Source { audio: &reference, pitch: &pitch, bandwidth: 20_000.0 }, rate, 1.0);
+        let error = (2_000..38_000).map(|i| (rendered[i] - output[i]).abs()).fold(0_f32, f32::max);
+        assert!(error < 1e-5, "a harmonic with or without detected pitch took source color: {error}");
+    }
+
+    #[test]
+    fn gain_interpolation_cannot_amplify_an_unobserved_octave() {
+        let mut spectrum = vec![Complex::new(1.0, 0.0); 21];
+        apply_band_gains(&mut spectrum, &[4.0, 1.0], &[6_800.0, 9_500.0], 1_000.0, 8_000.0, 1.0);
+        assert!(spectrum[7].re > 1.0);
+        assert_eq!(spectrum[9].re, 1.0);
+        assert_eq!(spectrum[15].re, 1.0);
     }
 
     #[test]

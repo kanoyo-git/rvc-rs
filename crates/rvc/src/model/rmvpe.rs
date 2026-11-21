@@ -151,15 +151,6 @@ impl Rmvpe {
         })
     }
 
-    pub(super) fn infer(
-        &self,
-        samples: &[f32],
-        threshold: f32,
-        graph_pool: Option<&Cache>,
-    ) -> Result<Vec<f32>> {
-        decode(&self.infer_salience(samples, graph_pool)?, threshold)
-    }
-
     pub(super) fn infer_salience(
         &self,
         samples: &[f32],

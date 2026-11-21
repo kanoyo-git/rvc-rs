@@ -47,6 +47,8 @@ pub struct Request {
     /// Semitones for every layer.
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     pub pitch: f32,
+    #[arg(long, value_enum, default_value = "rmvpe")]
+    pub f0_method: model::PitchMethod,
     #[arg(long)]
     pub speaker_id: Option<i64>,
     /// The inputs are already vocal stems: skip the instrumental split.
@@ -62,9 +64,9 @@ pub struct Request {
     /// Skip the reverb rebuild and leave the converted vocals dry.
     #[arg(long)]
     pub dry: bool,
-    /// How far breaths and fricatives follow the source's spectral shape and level (0-1).
-    #[arg(long, default_value_t = 1.0)]
-    pub aperiodic: f32,
+    /// Source breath and fricative envelope (0-1). Omit to use the model default.
+    #[arg(long)]
+    pub aperiodic: Option<f32>,
     /// Lower by this many dB the quiet frames the voice gate reads as not voice
     /// (separation residue, beat bleed); 0 = off.
     #[arg(long, default_value_t = 0.0)]
@@ -146,7 +148,7 @@ pub fn render(
         }
         crate::assets::separation(paths, preset, &mut progress)?;
     }
-    crate::assets::voice(paths, &request.model, model::PitchMethod::Rmvpe, &mut progress)?;
+    crate::assets::voice(paths, &request.model, request.f0_method, &mut progress)?;
     let mut step = |message: &str| -> Result<()> {
         ensure!(progress(message).is_continue(), "cover cancelled");
         Ok(())
@@ -172,6 +174,7 @@ pub fn render(
     )?;
     let settings = ConversionSettings {
         pitch: request.pitch,
+        f0_method: request.f0_method,
         index_rate: request.index_rate,
         aperiodic: request.aperiodic,
         voice_gate: request.voice_gate,
@@ -189,7 +192,7 @@ pub fn render(
     let convert = |dry: &[f32], settings: ConversionSettings| -> Result<Vec<f32>> {
         let analysis = audio::resample(dry, RATE, audio::ANALYSIS_RATE);
         let hires = engine
-            .uses_bands()
+            .needs_hires(settings)
             .then(|| audio::resample(dry, RATE, engine.rate()));
         let converted = engine.convert_hires(&analysis, hires.as_deref(), settings)?;
         let mut out = audio::resample(&converted.samples, converted.rate, RATE);

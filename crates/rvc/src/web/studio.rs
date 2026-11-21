@@ -156,9 +156,10 @@ async fn options(State(state): State<Shared>) -> WebResult<Json<Value>> {
         // Pitch weights download on first use.
         "pitch": {
             "pm": true,
-            "rmvpe": true,
+            "rmvpe": PitchMethod::Rmvpe.supported(),
             "nmvpe": true,
-            "fcpe": true,
+            "fcpe": PitchMethod::Fcpe.supported(),
+            "rmcpe": PitchMethod::Rmcpe.supported(),
         },
         "realtime": cfg!(feature = "realtime"),
         "index": cfg!(feature = "index-training"),
@@ -588,10 +589,6 @@ impl Extra {
     }
 }
 
-fn full_strength() -> f32 {
-    1.0
-}
-
 fn enabled() -> bool {
     true
 }
@@ -610,6 +607,8 @@ struct CoverJob {
     index_rate: f32,
     #[serde(default)]
     pitch: f32,
+    #[serde(default)]
+    f0_method: PitchMethod,
     /// A song or a folder of songs on the server; uploads are used when empty.
     #[serde(default)]
     input: Option<PathBuf>,
@@ -627,8 +626,8 @@ struct CoverJob {
     backing: cover::Backing,
     #[serde(default)]
     dry: bool,
-    #[serde(default = "full_strength")]
-    aperiodic: f32,
+    #[serde(default)]
+    aperiodic: Option<f32>,
     #[serde(default)]
     voice_gate: f32,
     #[serde(default)]
@@ -704,6 +703,7 @@ impl CoverJob {
             index: self.index,
             index_rate: self.index_rate,
             pitch: self.pitch,
+            f0_method: self.f0_method,
             speaker_id: self.speaker_id,
             vocals_only: self.vocals_only,
             instrumental: instrumental.into_iter().collect(),

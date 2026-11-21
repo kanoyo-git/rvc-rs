@@ -126,6 +126,8 @@ fn settings(controls: LiveControls) -> ConversionSettings {
         f0_method: match controls.f0_method {
             1 => PitchMethod::Fcpe,
             2 => PitchMethod::Pm,
+            3 => PitchMethod::Rmcpe,
+            4 => PitchMethod::Nmvpe,
             _ => PitchMethod::Rmvpe,
         },
         ..Default::default()

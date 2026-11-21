@@ -394,13 +394,17 @@ fn embedder_size(embedder: crate::catalog::Embedder) -> Option<u64> {
 }
 
 fn plan_pitch(paths: &Paths, method: PitchMethod, out: &mut Vec<Missing>) {
-    if method.available(paths) {
+    if !method.supported() || method.available(paths) {
         return;
     }
     match method {
         PitchMethod::Rmvpe => out.push(Missing::remote("rmvpe.pt", &RMVPE)),
         PitchMethod::Nmvpe => out.push(Missing::remote("nmvpe.pt", &NMVPE)),
         PitchMethod::Fcpe => out.push(Missing::remote("fcpe_c_v001.pt", &FCPE_WHEEL)),
+        PitchMethod::Rmcpe => {
+            plan_pitch(paths, PitchMethod::Rmvpe, out);
+            plan_pitch(paths, PitchMethod::Fcpe, out);
+        }
         PitchMethod::Pm => {}
     }
 }
@@ -602,6 +606,10 @@ pub fn pitch(
     method: PitchMethod,
     report: &mut impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<()> {
+    ensure!(
+        method.supported(),
+        "the selected ONNX pitch provider requires an ONNX-enabled build"
+    );
     if method.available(paths) {
         return Ok(());
     }
@@ -609,6 +617,10 @@ pub fn pitch(
         PitchMethod::Rmvpe => fetch(&paths.rmvpe.join("rmvpe.pt"), &RMVPE, report),
         PitchMethod::Nmvpe => fetch(&paths.nmvpe(), &NMVPE, report),
         PitchMethod::Fcpe => fcpe(paths, report),
+        PitchMethod::Rmcpe => {
+            pitch(paths, PitchMethod::Rmvpe, report)?;
+            pitch(paths, PitchMethod::Fcpe, report)
+        }
         PitchMethod::Pm => Ok(()),
     }
 }

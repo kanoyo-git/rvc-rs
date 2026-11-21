@@ -13,6 +13,7 @@ let experiments = { runs: [], resumable: [], all: [] };
 const fileList = (id) => [...document.getElementById(id).files];
 const fileName = (path) => String(path).split(/[\\/]/).pop();
 const number = (id) => Number(value(id));
+const optionalNumber = (id) => value(id) === "" ? null : number(id);
 // Native errors can carry a whole libtorch backtrace: keep the part a person can act on.
 const tidy = (message) => String(message).split(/\n(?:Exception raised from|frame #\d)/)[0].trim();
 const explain = (error, target) => {
@@ -385,7 +386,7 @@ function conversion() {
     settings: {
       pitch: number("iPitch"), f0_method: radio("iF0"), resample_sr: number("iResample"),
       rms_mix_rate: number("iRms"), protect: number("iProtect"), index_rate: useIndex ? number("iIndexRate") : 0,
-      formant: number("iFormant"), aperiodic: number("iAperiodic"), level_guard: checked("iLevelGuard"),
+      formant: number("iFormant"), aperiodic: optionalNumber("iAperiodic"), level_guard: checked("iLevelGuard"),
       voice_gate: inferVoice.data?.gate ? number("iGate") : 0, precision: value("iPrecision") || "auto",
     },
     auto_register: inferVoice.data.info.uses_f0 && checked("iAutoRegister"),
@@ -492,8 +493,8 @@ action("runCover", "cLog", async output => {
   const result = await runJob({
     operation: "cover", ...coverVoice.request(),
     index_rate: coverVoice.usesIndex() ? number("cIndexRate") : 0,
-    pitch: number("cPitch"), vocals_only: vocals, backing: radio("cBacking"), dry: !checked("cReverb"),
-    vocal_gain: number("cVocalGain"), aperiodic: number("cAperiodic"),
+    pitch: number("cPitch"), f0_method: value("cF0"), vocals_only: vocals, backing: radio("cBacking"), dry: !checked("cReverb"),
+    vocal_gain: number("cVocalGain"), aperiodic: optionalNumber("cAperiodic"),
     voice_gate: coverVoice.data?.gate ? number("cGate") : 0, format: radio("cFmt"), device: value("cDevice") || "auto",
     input: input || null, output: value("cOut") || null,
     instrumental: vocals && !instFile ? value("cInstPath") || null : null, instrumental_upload: Boolean(instFile),
@@ -1113,6 +1114,8 @@ async function start() {
     }
   }
   const allPitch = Object.values(options.pitch).every(Boolean);
+  for (const option of $("#cF0").options) option.disabled = !options.pitch[option.value];
+  $("#cF0").value = options.pitch.rmvpe ? "rmvpe" : "pm";
   $$(".pitch-availability").forEach(node => { node.hidden = allPitch; });
   for (const id of ["runIndex", "runAll"]) $("#" + id).hidden = !options.index;
   $("#coverMissing").hidden = options.cover;

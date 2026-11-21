@@ -107,6 +107,7 @@
                 <label><input type="radio" name="iF0" value="rmvpe" /><span>rmvpe</span></label>
                 <label><input type="radio" name="iF0" value="nmvpe" /><span>nmvpe</span></label>
                 <label><input type="radio" name="iF0" value="fcpe" /><span>fcpe</span></label>
+                <label><input type="radio" name="iF0" value="rmcpe" /><span>RMCPE</span></label>
               </div>
               <small class="hint pitch-availability" data-i18n="pitchWeightsMissing">Install weights on the server to enable other pitch methods</small>
                   </div>
@@ -130,7 +131,7 @@
                 <small class="hint" data-i18n="formantHint"></small>
               </label>
                       <label class="field"><span class="label" data-i18n="aperiodic"></span>
-                <span class="range-row"><input id="iAperiodic" type="range" min="0" max="1" step="0.05" value="1" /><output>1</output></span>
+                <input id="iAperiodic" type="number" min="0" max="1" step="0.05" data-i18n-attr="placeholder:automatic" />
                 <small class="hint" data-i18n="aperiodicHint"></small>
               </label>
                       <label class="field"><span class="label" data-i18n="voiceGate"></span>
@@ -241,6 +242,7 @@
                 <header class="card-head"><h2 data-i18n="settings"></h2></header>
                 <div class="stack">
                   <label class="field"><span class="label" data-i18n="pitch"></span><input id="cPitch" type="number" min="-24" max="24" step="1" value="0" /></label>
+                  <label class="field"><span class="label" data-i18n="f0Method"></span><select id="cF0"><option value="rmvpe">RMVPE</option><option value="rmcpe">RMCPE</option><option value="fcpe">FCPE</option><option value="nmvpe">NMVPE</option><option value="pm">PM</option></select></label>
                   <label class="field"><span class="label" data-i18n="indexRate"></span>
                 <span class="range-row"><input id="cIndexRate" type="range" min="0" max="1" step="0.01" value="0.5" /><output>0.5</output></span>
                 <small class="hint" data-i18n="indexRateHint"></small>
@@ -262,7 +264,7 @@
                     <summary data-i18n="fineTuning"></summary>
                     <div class="stack">
                       <label class="field"><span class="label" data-i18n="aperiodic"></span>
-                <span class="range-row"><input id="cAperiodic" type="range" min="0" max="1" step="0.05" value="1" /><output>1</output></span>
+                <input id="cAperiodic" type="number" min="0" max="1" step="0.05" data-i18n-attr="placeholder:automatic" />
                 <small class="hint" data-i18n="aperiodicHint"></small>
               </label>
                       <label class="field"><span class="label" data-i18n="voiceGate"></span>
@@ -339,7 +341,7 @@
                   <div class="grid">
                     <label class="field"><span class="label" data-i18n="pitch"></span><input name="pitch" type="number" min="-48" max="48" step="0.1" value="0" required /></label>
                     <label class="field"><span class="label" data-i18n="formant"></span><input name="formant" type="number" min="-24" max="24" step="0.1" value="0" required /></label>
-                    <label class="field"><span class="label" data-i18n="f0Method"></span><select name="f0_method"><option value="pm">pm</option><option value="rmvpe">rmvpe</option><option value="nmvpe">nmvpe</option><option value="fcpe">fcpe</option></select></label>
+                    <label class="field"><span class="label" data-i18n="f0Method"></span><select name="f0_method"><option value="pm">pm</option><option value="rmvpe">rmvpe</option><option value="nmvpe">nmvpe</option><option value="fcpe">fcpe</option><option value="rmcpe">RMCPE</option></select></label>
                     <label class="field"><span class="label" data-i18n="silenceDb"></span><input name="threshold_db" type="number" min="-60" max="0" value="-60" required /></label>
                   </div>
                   <label class="field"><span class="label" data-i18n="indexRate"></span><span class="range-row"><input name="index_rate" type="range" min="0" max="1" step="0.01" value="0.75" /><output>0.75</output></span></label>
@@ -504,6 +506,7 @@
                 <label><input type="radio" name="tf0" value="rmvpe" /><span>rmvpe</span></label>
                 <label><input type="radio" name="tf0" value="nmvpe" /><span>nmvpe</span></label>
                 <label><input type="radio" name="tf0" value="fcpe" /><span>fcpe</span></label>
+                <label><input type="radio" name="tf0" value="rmcpe" /><span>RMCPE</span></label>
               </div>
               <small class="hint pitch-availability" data-i18n="pitchWeightsMissing">Install weights on the server to enable other pitch methods</small>
                   </div>
@@ -685,6 +688,7 @@
                 <label><input type="radio" name="laF0" value="rmvpe" /><span>rmvpe</span></label>
                 <label><input type="radio" name="laF0" value="nmvpe" /><span>nmvpe</span></label>
                 <label><input type="radio" name="laF0" value="fcpe" /><span>fcpe</span></label>
+                <label><input type="radio" name="laF0" value="rmcpe" /><span>RMCPE</span></label>
               </div>
               <small class="hint pitch-availability" data-i18n="pitchWeightsMissing">Install weights on the server to enable other pitch methods</small>
                     </div>

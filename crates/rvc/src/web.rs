@@ -1076,7 +1076,7 @@ fn convert_voice(
         .as_ref()
         .context("voice engine was not loaded")?
         .engine;
-    let hires = match source.filter(|_| engine.uses_bands()) {
+    let hires = match source.filter(|_| engine.needs_hires(request.settings)) {
         Some(path) => Some(audio::read_mono(path, engine.rate())?),
         None => None,
     };

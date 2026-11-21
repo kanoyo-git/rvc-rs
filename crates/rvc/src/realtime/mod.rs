@@ -227,6 +227,7 @@ pub fn profile(paths: &Paths) -> Result<Request> {
             f0_method: match field("f0method") {
                 Some("pm") => model::PitchMethod::Pm,
                 Some("fcpe") => model::PitchMethod::Fcpe,
+                Some("rmcpe") => model::PitchMethod::Rmcpe,
                 Some("nmvpe") => model::PitchMethod::Nmvpe,
                 _ => model::PitchMethod::Rmvpe,
             },

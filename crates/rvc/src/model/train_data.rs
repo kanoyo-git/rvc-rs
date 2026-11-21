@@ -199,6 +199,15 @@ pub struct Prepared {
 
 pub fn prepare(request: &PrepareRequest<'_>) -> Result<Prepared> {
     let experiment = std::path::absolute(request.experiment_dir)?;
+    if request.uses_f0 {
+        ensure!(
+            !experiment
+                .join(RAW_F0)
+                .join(super::extract::PITCH_PENDING)
+                .try_exists()?,
+            "pitch extraction was interrupted; finish F0 extraction before training"
+        );
+    }
     let mut config = Config::load(&experiment, request.version, request.sample_rate)?;
     let filelist = experiment.join("filelist.txt");
     if !request.rebuild_filelist

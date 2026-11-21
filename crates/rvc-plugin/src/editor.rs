@@ -25,7 +25,8 @@ use keyboard_types::{Key as NativeKey, KeyState, Modifiers, NamedKey};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 
 use crate::daw::{
-    BLOCK_MS, ENGINE, ModelPaths, PARAMETER_COUNT, PARAMETERS, PluginControls, WorkerStatus,
+    BLOCK_MS, ENGINE, ModelPaths, PARAMETER_COUNT, PARAMETERS, PITCH_METHODS, PluginControls,
+    WorkerStatus, pitch_method_index,
 };
 
 pub(crate) const WIDTH: u32 = 780;
@@ -480,7 +481,7 @@ impl Panel {
                 }
                 ui.columns(columns, |columns| {
                     self.slider(&mut columns[0], 11, values[11]);
-                    self.pitch_method(&mut columns[1], values[9] as usize);
+                    self.pitch_method(&mut columns[1], values[9]);
                 });
             });
         });
@@ -538,19 +539,18 @@ impl Panel {
         }
     }
 
-    fn pitch_method(&self, ui: &mut egui::Ui, previous: usize) {
+    fn pitch_method(&self, ui: &mut egui::Ui, previous: f32) {
         let mut algorithm = previous;
-        let algorithms = ["RMVPE", "FCPE", "PM"];
         ui.label(RichText::new("Pitch extraction").strong());
         egui::ComboBox::from_id_salt("rvc-f0-method")
-            .selected_text(algorithms[previous])
+            .selected_text(PITCH_METHODS[pitch_method_index(previous)].1)
             .show_ui(ui, |ui| {
-                for (index, name) in algorithms.into_iter().enumerate() {
-                    ui.selectable_value(&mut algorithm, index, name);
+                for (value, name) in PITCH_METHODS {
+                    ui.selectable_value(&mut algorithm, value, name);
                 }
             });
         if algorithm != previous {
-            self.model.set_plain(9, algorithm as f32);
+            self.model.set_plain(9, algorithm);
         }
     }
 }

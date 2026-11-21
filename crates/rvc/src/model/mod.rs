@@ -19,6 +19,7 @@ mod optimizer;
 mod pitch;
 pub(crate) mod register;
 mod retrieval;
+mod rmcpe;
 mod rmvpe;
 #[cfg(feature = "onnx")]
 mod rmvpe_onnx;
@@ -60,47 +61,59 @@ pub enum PitchMethod {
     Rmvpe,
     Pm,
     Fcpe,
+    Rmcpe,
     Nmvpe,
 }
 
 impl PitchMethod {
+    pub(crate) fn supported(self) -> bool {
+        match self {
+            Self::Rmvpe => cfg!(feature = "onnx") || onnx_selection("RVC_RMVPE_ONNX").is_none(),
+            Self::Fcpe => cfg!(feature = "onnx") || onnx_selection("RVC_FCPE_ONNX").is_none(),
+            Self::Rmcpe => Self::Rmvpe.supported() && Self::Fcpe.supported(),
+            Self::Pm | Self::Nmvpe => true,
+        }
+    }
+
     pub(crate) fn available(self, paths: &Paths) -> bool {
+        if !self.supported() {
+            return false;
+        }
         match self {
             Self::Pm => true,
             Self::Rmvpe => {
                 let checkpoint = paths.rmvpe.join("rmvpe.pt").is_file();
                 if onnx_selection("RVC_RMVPE_ONNX").is_some() {
-                    cfg!(feature = "onnx")
-                        && (checkpoint || paths.rmvpe.join("rmvpe.onnx").is_file())
+                    checkpoint || paths.rmvpe.join("rmvpe.onnx").is_file()
                 } else {
                     checkpoint
                 }
             }
-            Self::Fcpe => {
-                (cfg!(feature = "onnx") || onnx_selection("RVC_FCPE_ONNX").is_none())
-                    && paths.root.join(FCPE_CHECKPOINT).is_file()
-            }
+            Self::Fcpe => paths.root.join(FCPE_CHECKPOINT).is_file(),
+            Self::Rmcpe => Self::Rmvpe.available(paths) && Self::Fcpe.available(paths),
             Self::Nmvpe => paths.nmvpe().is_file(),
         }
     }
 }
 
-enum Pitch {
-    Rmvpe(Rmvpe),
-    #[cfg(feature = "onnx")]
-    RmvpeOnnx(rmvpe_onnx::RmvpeOnnx),
-    Pm,
-    Fcpe(fcpe::Fcpe),
-    Nmvpe(nmvpe::Nmvpe),
+fn rmvpe_threshold() -> f32 {
+    std::env::var("RVC_RMVPE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.03)
 }
 
-impl Pitch {
-    fn load(method: PitchMethod, paths: &Paths, device: Device, kind: Kind) -> Result<Self> {
-        if method == PitchMethod::Rmvpe
-            && let Some(provider) = onnx_selection("RVC_RMVPE_ONNX")
-        {
+enum RmvpeBackend {
+    Torch(Rmvpe),
+    #[cfg(feature = "onnx")]
+    Onnx(rmvpe_onnx::RmvpeOnnx),
+}
+
+impl RmvpeBackend {
+    fn load(paths: &Paths, device: Device, kind: Kind) -> Result<Self> {
+        if let Some(provider) = onnx_selection("RVC_RMVPE_ONNX") {
             #[cfg(feature = "onnx")]
-            return Ok(Self::RmvpeOnnx(rmvpe_onnx::RmvpeOnnx::load(
+            return Ok(Self::Onnx(rmvpe_onnx::RmvpeOnnx::load(
                 &paths.rmvpe,
                 provider.to_str().context("RVC_RMVPE_ONNX must be text")?,
             )?));
@@ -110,17 +123,50 @@ impl Pitch {
                 provider.to_string_lossy()
             );
         }
+        Ok(Self::Torch(Rmvpe::load(
+            &paths.rmvpe.join("rmvpe.pt"),
+            device,
+            kind,
+        )?))
+    }
+
+    fn salience(&self, audio: &[f32], stream: Option<&cuda_graph::Cache>) -> Result<Vec<f32>> {
+        match self {
+            Self::Torch(model) => model.infer_salience(audio, stream),
+            #[cfg(feature = "onnx")]
+            Self::Onnx(model) => model.infer_salience(audio),
+        }
+    }
+
+    #[cfg(feature = "cuda-graph")]
+    fn clear_graph(&mut self) {
+        match self {
+            Self::Torch(model) => model.graph.get_mut().clear(),
+            #[cfg(feature = "onnx")]
+            Self::Onnx(_) => {}
+        }
+    }
+}
+
+enum Pitch {
+    Rmvpe(RmvpeBackend),
+    Pm,
+    Fcpe(fcpe::Fcpe),
+    Rmcpe(Box<rmcpe::Rmcpe>),
+    Nmvpe(nmvpe::Nmvpe),
+}
+
+impl Pitch {
+    fn load(method: PitchMethod, paths: &Paths, device: Device, kind: Kind) -> Result<Self> {
+        let fcpe = || fcpe::Fcpe::load(&paths.root.join(FCPE_CHECKPOINT), device);
         match method {
-            PitchMethod::Rmvpe => Ok(Self::Rmvpe(Rmvpe::load(
-                &paths.rmvpe.join("rmvpe.pt"),
-                device,
-                kind,
-            )?)),
+            PitchMethod::Rmvpe => Ok(Self::Rmvpe(RmvpeBackend::load(paths, device, kind)?)),
             PitchMethod::Pm => Ok(Self::Pm),
-            PitchMethod::Fcpe => Ok(Self::Fcpe(fcpe::Fcpe::load(
-                &paths.root.join(FCPE_CHECKPOINT),
-                device,
-            )?)),
+            PitchMethod::Fcpe => Ok(Self::Fcpe(fcpe()?)),
+            PitchMethod::Rmcpe => Ok(Self::Rmcpe(Box::new(rmcpe::Rmcpe::new(
+                RmvpeBackend::load(paths, device, kind)?,
+                fcpe()?,
+            )?))),
             PitchMethod::Nmvpe => Ok(Self::Nmvpe(nmvpe::Nmvpe::load(
                 &paths.nmvpe(),
                 device,
@@ -130,17 +176,11 @@ impl Pitch {
     }
 
     fn extract(&self, audio: &[f32], stream: Option<&cuda_graph::Cache>) -> Result<Vec<f32>> {
-        // Experiments: RVC_RMVPE_THRESHOLD overrides the voicing threshold (0.03).
-        let threshold = std::env::var("RVC_RMVPE_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.03);
         match self {
-            Self::Rmvpe(rmvpe) => rmvpe.infer(audio, threshold, stream),
-            #[cfg(feature = "onnx")]
-            Self::RmvpeOnnx(rmvpe) => rmvpe.infer(audio, threshold),
+            Self::Rmvpe(model) => rmvpe::decode(&model.salience(audio, stream)?, rmvpe_threshold()),
             Self::Pm => Ok(pitch::autocorrelation(audio, stream.is_some())),
             Self::Fcpe(fcpe) => fcpe.infer(audio, 0.006, stream),
+            Self::Rmcpe(model) => model.infer(audio, stream),
             Self::Nmvpe(nmvpe) => nmvpe.infer(audio, stream),
         }
     }
@@ -148,9 +188,8 @@ impl Pitch {
     #[cfg(feature = "cuda-graph")]
     fn clear_graph(&mut self) {
         match self {
-            Self::Rmvpe(rmvpe) => rmvpe.graph.get_mut().clear(),
-            #[cfg(feature = "onnx")]
-            Self::RmvpeOnnx(_) => {}
+            Self::Rmvpe(model) => model.clear_graph(),
+            Self::Rmcpe(model) => model.clear_graph(),
             Self::Fcpe(fcpe) => fcpe.graph.get_mut().clear(),
             Self::Nmvpe(nmvpe) => nmvpe.network.graph.get_mut().clear(),
             Self::Pm => {}
@@ -202,8 +241,8 @@ pub struct ConversionSettings {
     pub formant: f32,
     pub precision: Precision,
     /// How far breaths and fricatives follow the source's spectral shape and
-    /// loudness (0 = as rendered, 1 = fully matched); see [`aperiodic`].
-    pub aperiodic: f32,
+    /// loudness (0 = as rendered, 1 = fully matched). The model chooses the default.
+    pub aperiodic: Option<f32>,
     /// Keep the converted voice under the source's level (+2 dB) frame by frame, so
     /// faint parts (pauses, fades, echoes) are not sung out loud.
     pub level_guard: bool,
@@ -224,7 +263,7 @@ impl Default for ConversionSettings {
             protect: 0.33,
             formant: 0.0,
             precision: Precision::Auto,
-            aperiodic: 1.0,
+            aperiodic: None,
             level_guard: true,
             voice_gate: 0.0,
         }
@@ -232,6 +271,12 @@ impl Default for ConversionSettings {
 }
 
 impl ConversionSettings {
+    fn envelope_strength(self, unvoiced: Unvoiced, uses_bands: bool) -> f32 {
+        // Stock RVC renders its own consonants. Models trained with explicit
+        // unvoiced boundaries or source bands can use source frication by default.
+        self.aperiodic.unwrap_or(if uses_bands || unvoiced == Unvoiced::Zero { 1.0 } else { 0.0 })
+    }
+
     pub fn validate(self) -> Result<()> {
         ensure!(
             (0.0..=1.0).contains(&self.index_rate),
@@ -246,7 +291,7 @@ impl ConversionSettings {
             "--protect must be between 0 and 0.5"
         );
         ensure!(
-            (0.0..=1.0).contains(&self.aperiodic),
+            self.aperiodic.is_none_or(|strength| (0.0..=1.0).contains(&strength)),
             "--aperiodic must be between 0 and 1"
         );
         ensure!(
@@ -370,10 +415,19 @@ impl Rvc {
         self.convert_hires(samples, None, settings)
     }
 
-    /// Whether the generator reads the source above 8 kHz: pass the recording at
-    /// [`Self::rate`] to [`Self::convert_hires`] so sibilants keep their color.
+    /// Whether the generator was trained with source band features.
     pub fn uses_bands(&self) -> bool {
         self.synth.uses_bands()
+    }
+
+    /// Whether file conversion can use the original recording at [`Self::rate`].
+    /// Fricative envelope transfer also needs the top octave on models without band features.
+    pub fn needs_hires(&self, settings: ConversionSettings) -> bool {
+        self.uses_bands() || (self.f0.is_some() && self.envelope_strength(settings) > 0.0)
+    }
+
+    fn envelope_strength(&self, settings: ConversionSettings) -> f32 {
+        settings.envelope_strength(self.synth.info.format.f0_unvoiced, self.uses_bands())
     }
 
     /// Convert 16 kHz `samples`, with the same recording at the model rate in `hires`.
@@ -445,6 +499,7 @@ impl Rvc {
     ) -> Result<Audio> {
         let mut measure = phase_timer(self.device);
         let rate = self.rate();
+        let aperiodic = self.envelope_strength(settings);
         let low_memory = match self.device {
             Device::Cuda(index) => {
                 weights::cuda_profile(index).is_some_and(|profile| profile.memory_gib < 5.0)
@@ -479,7 +534,7 @@ impl Rvc {
         };
         if let Some(pitch) = &mut pitch {
             pitch.resize(source_frames, 0.0);
-            if settings.aperiodic > 0.0 {
+            if aperiodic > 0.0 {
                 aperiodic::unvoice_fricatives(&padded, pitch);
             }
             if let Some(path) = std::env::var_os("RVC_F0_OVERRIDE") {
@@ -567,7 +622,7 @@ impl Rvc {
             result.extend(output);
             start = cut;
         }
-        if settings.aperiodic > 0.0
+        if aperiodic > 0.0
             && let Some(pitch) = &pitch
         {
             let resampled;
@@ -584,7 +639,7 @@ impl Rvc {
                 pitch: &pitch[offset..],
                 bandwidth: aperiodic::bandwidth(source, rate),
             };
-            aperiodic::transfer(&mut result, &source, rate, settings.aperiodic);
+            aperiodic::transfer(&mut result, &source, rate, aperiodic);
             measure("aperiodic");
         }
         if settings.rms_mix_rate != 1.0 {
@@ -943,7 +998,7 @@ impl Rvc {
 fn pitch_input_len(method: PitchMethod, samples: usize, block: usize) -> usize {
     let tail = block * FRAME + 800;
     let tail = match method {
-        PitchMethod::Rmvpe | PitchMethod::Nmvpe => tail.div_ceil(5_120) * 5_120 - FRAME,
+        PitchMethod::Rmvpe | PitchMethod::Nmvpe | PitchMethod::Rmcpe => tail.div_ceil(5_120) * 5_120 - FRAME,
         PitchMethod::Pm | PitchMethod::Fcpe => tail,
     };
     tail.min(samples)
@@ -1122,5 +1177,24 @@ fn mix_rms(input: &[f32], input_rate: u32, output: &mut [f32], output_rate: u32,
     for (i, sample) in output.iter_mut().enumerate() {
         let ratio = interpolate(&input_rms, i) / interpolate(&output_rms, i).max(1e-6);
         *sample *= ratio.powf(1.0 - f64::from(mix)) as f32;
+    }
+}
+
+#[cfg(test)]
+mod conversion_settings_tests {
+    use super::{ConversionSettings, Unvoiced};
+
+    #[test]
+    fn fricative_envelope_defaults_follow_the_model_and_honor_saved_values() {
+        let auto: ConversionSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(auto.envelope_strength(Unvoiced::Interpolate, false), 0.0);
+        assert_eq!(auto.envelope_strength(Unvoiced::Zero, false), 1.0);
+        assert_eq!(auto.envelope_strength(Unvoiced::Interpolate, true), 1.0);
+        for (value, expected) in [("0", 0.0), ("0.5", 0.5), ("1", 1.0)] {
+            let settings: ConversionSettings = serde_json::from_str(&format!(r#"{{"aperiodic":{value}}}"#)).unwrap();
+            for mode in [Unvoiced::Interpolate, Unvoiced::Zero] {
+                assert_eq!(settings.envelope_strength(mode, false), expected);
+            }
+        }
     }
 }

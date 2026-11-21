@@ -24,6 +24,21 @@ pub const PARAMETER_COUNT: usize = 12;
 pub const ENGINE: usize = 0;
 pub const BLOCK_MS: usize = 6;
 const F0_METHOD: usize = 9;
+// Existing session values 0, 1, 2 and their normalized automation stay stable.
+pub(crate) const PITCH_METHODS: [(f32, &str); 5] = [
+    (0., "RMVPE"),
+    (1., "FCPE"),
+    (2., "PM"),
+    (0.5, "RMCPE"),
+    (1.5, "NMVPE"),
+];
+
+pub(crate) fn pitch_method_index(value: f32) -> usize {
+    PITCH_METHODS
+        .iter()
+        .position(|&(stored, _)| stored == value)
+        .unwrap_or(0)
+}
 const SAMPLE_RATE_MIN: u32 = 8_000;
 const SAMPLE_RATE_MAX: u32 = 384_000;
 const MAX_DAW_LATENCY: usize = SAMPLE_RATE_MAX as usize * 2;
@@ -66,7 +81,7 @@ pub const PARAMETERS: [Parameter; PARAMETER_COUNT] = [
     parameter("Block", "ms", 20., 1_000., 1., 130.),
     parameter("Crossfade", "ms", 10., 100., 1., 80.),
     parameter("Context", "ms", 500., 3_000., 1., 2_000.),
-    parameter("F0 Method", "", 0., 2., 1., 0.),
+    parameter("F0 Method", "", 0., 2., 0.5, 0.),
     parameter("Mix", "%", 0., 100., 0.1, 100.),
     parameter("Output", "dB", -18., 12., 0.1, 0.),
 ];
@@ -91,7 +106,7 @@ impl Parameter {
     }
 
     pub(crate) fn step_count(self) -> i32 {
-        if self.step >= 1.0 {
+        if self.step >= 0.5 {
             ((self.max - self.min) / self.step) as i32
         } else {
             0
@@ -103,7 +118,7 @@ impl Parameter {
             return if value >= 0.5 { "On" } else { "Off" }.into();
         }
         if index == F0_METHOD {
-            return ["RMVPE", "FCPE", "PM"][value as usize].into();
+            return PITCH_METHODS[pitch_method_index(value)].1.into();
         }
         let digits = if self.step >= 1.0 {
             0
@@ -355,7 +370,7 @@ impl PluginControls {
             index_rate: self.value(3),
             rms_mix: self.value(4),
             threshold_db: self.value(5),
-            f0_method: self.value(F0_METHOD) as usize,
+            f0_method: pitch_method_index(self.value(F0_METHOD)),
         }
     }
 

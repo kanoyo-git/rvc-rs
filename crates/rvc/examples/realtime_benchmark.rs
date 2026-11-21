@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rvc::catalog::Paths;
-use rvc::model::{ConversionSettings, Rvc, weights};
+use rvc::model::{ConversionSettings, PitchMethod, Rvc, weights};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -19,6 +19,8 @@ struct Args {
     input: PathBuf,
     #[arg(long, default_value = "cpu")]
     device: String,
+    #[arg(long, value_enum, default_value = "rmvpe")]
+    f0_method: PitchMethod,
     #[arg(long, default_value_t = 20)]
     blocks: usize,
     #[arg(long, default_value_t = 3)]
@@ -50,6 +52,7 @@ fn main() -> Result<()> {
     let device = weights::device(&args.device)?;
     let settings = ConversionSettings {
         index_rate: 0.0,
+        f0_method: args.f0_method,
         ..Default::default()
     };
     let mut engine = Rvc::load(&paths, &model, None, None, settings, device)?;
@@ -83,6 +86,7 @@ fn main() -> Result<()> {
         "{}",
         json!({
             "device": args.device,
+            "f0_method": args.f0_method,
             "block_ms": BLOCK * 10,
             "samples_per_output": RENDER * engine.rate() as usize / 100,
             "peak": peak,

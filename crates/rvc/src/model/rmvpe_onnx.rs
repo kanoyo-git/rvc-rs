@@ -7,7 +7,7 @@ use super::onnx::{
     GraphSession, Provider, TensorInput,
     graph::{Attribute, Builder, Dimension, Layers},
 };
-use super::rmvpe::{BINS, GRU_WIDTH, MEL_BANDS, MelSpectrogram, decode};
+use super::rmvpe::{BINS, GRU_WIDTH, MEL_BANDS, MelSpectrogram};
 use super::weights::Weights;
 
 pub(super) struct RmvpeOnnx {
@@ -45,7 +45,7 @@ impl RmvpeOnnx {
         })
     }
 
-    pub(super) fn infer(&self, samples: &[f32], threshold: f32) -> Result<Vec<f32>> {
+    pub(super) fn infer_salience(&self, samples: &[f32]) -> Result<Vec<f32>> {
         let input = self.features.input(samples)?;
         let (mel, frames) = self.features.extract(&input, Kind::Float, Device::Cpu)?;
         let padded = mel.size()[2];
@@ -57,7 +57,7 @@ impl RmvpeOnnx {
             **shape == [1, padded, BINS as i64],
             "invalid RMVPE ONNX output shape {shape:?}"
         );
-        decode(&salience[..frames as usize * BINS], threshold)
+        Ok(salience[..frames as usize * BINS].to_vec())
     }
 }
 

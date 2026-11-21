@@ -147,7 +147,7 @@ impl IPluginFactory2Trait for Factory {
                     classFlags: ComponentFlags_::kSimpleModeSupported as u32,
                     subCategories: narrow("Fx"),
                     vendor: narrow(VENDOR),
-                    version: narrow("0.1.0"),
+                    version: narrow(env!("CARGO_PKG_VERSION")),
                     sdkVersion: narrow("VST 3.8.0"),
                 },
             )
@@ -625,12 +625,13 @@ impl IEditControllerTrait for Component {
                 _ => return kInvalidArgument,
             }
         } else if id == 9 {
-            match value.to_ascii_lowercase().as_str() {
-                "rmvpe" => 0.0,
-                "fcpe" => 0.5,
-                "pm" => 1.0,
-                _ => return kInvalidArgument,
-            }
+            let Some(&(plain, _)) = daw::PITCH_METHODS
+                .iter()
+                .find(|(_, name)| name.eq_ignore_ascii_case(value))
+            else {
+                return kInvalidArgument;
+            };
+            f64::from(PARAMETERS[9].normalize(plain))
         } else {
             let Some(spec) = PARAMETERS.get(id as usize) else {
                 return kInvalidArgument;
@@ -807,6 +808,17 @@ mod tests {
     use anyhow::{Context, Result, ensure};
 
     use super::*;
+
+    #[test]
+    fn existing_host_pitch_automation_and_new_midpoints_round_trip() {
+        let spec = PARAMETERS[9];
+        for (normalized, index) in [(0.0, 0), (0.5, 1), (1.0, 2), (0.25, 3), (0.75, 4)] {
+            let value = spec.denormalize(normalized);
+            assert_eq!(daw::pitch_method_index(value), index);
+            assert_eq!(spec.normalize(daw::PITCH_METHODS[index].0), normalized);
+        }
+        assert_eq!(spec.step_count(), 4);
+    }
 
     #[test]
     fn vst3_class_processes_a_real_worker_and_keeps_legacy_state() -> Result<()> {
