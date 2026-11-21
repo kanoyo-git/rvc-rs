@@ -64,9 +64,22 @@ pub fn preprocess(
 pub fn preprocess_with_cancel(
     request: &PreprocessRequest<'_>,
     is_cancelled: impl Fn() -> bool + Sync,
+    report: impl FnMut(&str),
+) -> Result<PreprocessReport> {
+    preprocess_with_denoise(request, 0.0, is_cancelled, report)
+}
+
+pub(crate) fn preprocess_with_denoise(
+    request: &PreprocessRequest<'_>,
+    denoise: f32,
+    is_cancelled: impl Fn() -> bool + Sync,
     mut report: impl FnMut(&str),
 ) -> Result<PreprocessReport> {
     ensure!(!is_cancelled(), "dataset preprocessing cancelled");
+    ensure!(
+        (0.0..=1.0).contains(&denoise),
+        "denoise strength must be between 0 and 1"
+    );
     let sample_rate = request.sample_rate;
     let segment = request.segment_seconds;
     ensure!(
@@ -97,6 +110,7 @@ pub fn preprocess_with_cancel(
         samples_per_segment: (f64::from(sample_rate) * segment) as usize,
         tail_limit: f64::from(sample_rate) * (segment + OVERLAP_SECONDS),
         step,
+        denoise,
     };
     let total = sources.len();
     let workers = request.workers.clamp(1, total);
@@ -206,11 +220,12 @@ struct Segmenter<'a> {
     samples_per_segment: usize,
     tail_limit: f64,
     step: f64,
+    denoise: f32,
 }
 
 impl Segmenter<'_> {
     fn preprocess_file(&self, path: &Path, output_key: &str) -> Result<usize> {
-        let samples = audio::read_mono(path, self.sample_rate)?;
+        let samples = audio::read_denoised(path, self.sample_rate, self.denoise)?;
         let filtered = self.filter.apply(&samples);
         let mut output_id = 0;
         let mut final_tail = None;

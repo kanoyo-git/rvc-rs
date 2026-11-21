@@ -11,12 +11,12 @@ required-features = ["realtime"]
 
 [features]
 default = ["inference", "realtime", "index-training"]
-inference = ["dep:tch", "dep:cc", "dep:ndarray", "dep:ndarray-npy", "dep:rustfft", "dep:rand", "dep:serde_yaml", "dep:sha2", "dep:base64", "dep:uuid", "dep:libloading", "dep:tower-http", "dep:tokio-util", "tokio/fs", "tokio/io-util", "tokio/process"]
+inference = ["dep:tch", "dep:cc", "dep:ndarray", "dep:ndarray-npy", "dep:rustfft", "dep:rand", "dep:serde_yaml", "dep:sha2", "dep:base64", "dep:uuid", "dep:libloading", "dep:prost", "dep:tower-http", "dep:tokio-util", "tokio/fs", "tokio/io-util", "tokio/process"]
 realtime = ["inference", "dep:cpal", "dep:rtrb", "dep:windows"]
 asio = ["realtime", "cpal/asio"]
 cuda-graph = ["inference"]
 index-training = ["dep:faiss", "dep:ndarray", "dep:ndarray-npy", "dep:rand", "dep:same-file"]
-onnx = ["inference", "dep:ort", "dep:prost"]
+onnx = ["inference", "dep:ort"]
 onnx-f0 = ["onnx"]
 
 [dependencies]
@@ -47,7 +47,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 tower-http = { version = "0.6", features = ["fs"], optional = true }
-uuid = { version = "1", features = ["v4"], optional = true }
+uuid = { version = "1", features = ["v4", "serde"], optional = true }
 walkdir = "2"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 

@@ -1,7 +1,5 @@
 #[cfg(feature = "inference")]
 mod pymss;
-#[cfg(feature = "inference")]
-mod web;
 
 use std::path::PathBuf;
 
@@ -15,7 +13,7 @@ use rvc::realtime;
 use rvc::train_index;
 use rvc::{audio, catalog, dataset};
 #[cfg(feature = "inference")]
-use rvc::{model, separation};
+use rvc::{model, separation, web};
 
 #[derive(Parser)]
 #[command(version, about = "Retrieval-based Voice Conversion")]
@@ -45,6 +43,10 @@ enum Command {
         /// Path to the Gradio-compatible frpc executable.
         #[arg(long, requires = "colab")]
         share_client: Option<PathBuf>,
+        /// Accept requests from a tunnel you started (cloudflared, localtunnel) at this
+        /// https:// address, behind the same password login as --colab.
+        #[arg(long, conflicts_with = "colab")]
+        public_url: Option<String>,
     },
     /// Convert one file or a directory of recordings.
     Infer {
@@ -128,13 +130,67 @@ enum Command {
         version: String,
         #[arg(long, value_enum)]
         f0_method: Option<model::PitchMethod>,
+        #[arg(long, value_enum)]
+        embedder: Option<catalog::Embedder>,
         #[arg(long, default_value = "auto")]
         device: String,
         #[arg(long, value_delimiter = ',')]
         gpus: Vec<usize>,
         #[arg(long)]
         overwrite: bool,
+        /// Clear F0 on voiceless fricative frames ("s", "sh", breaths), as conversion does.
+        #[arg(long)]
+        unvoice_fricatives: bool,
     },
+    /// Write a copy of an experiment's clips with doubles, harmonies and reverb layered on,
+    /// for `train --layer-aug` (run `extract` on the output experiment first).
+    #[cfg(feature = "inference")]
+    LayerAug {
+        #[arg(long)]
+        experiment: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 40_000)]
+        sample_rate: u32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Also run every clip through a random chain of production effects
+        /// (saturation, compression, telephone EQ, chorus, bit reduction).
+        #[arg(long)]
+        fx: bool,
+        /// Long-term spectrum (JSON from `fx-profile`) that the effects' EQ pulls clips toward.
+        #[arg(long, requires = "fx")]
+        fx_profile: Option<PathBuf>,
+        /// Skip doubles, backing and reverb.
+        #[arg(long)]
+        no_layers: bool,
+        /// Folder of separation-residue clips (and `inst*` instrumentals) to mix under
+        /// the inputs, pauses included.
+        #[arg(long)]
+        bleed: Option<PathBuf>,
+    },
+    /// Measure the long-term average spectrum of vocals (a file or a folder) for
+    /// `layer-aug --fx-profile`.
+    #[cfg(feature = "inference")]
+    FxProfile {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Convert a song layer by layer: split lead, backing and reverb, convert each dry
+    /// layer on its own and rebuild the mix.
+    #[cfg(feature = "inference")]
+    Cover(rvc::cover::Request),
+    /// Install a supported content embedder under assets.
+    #[cfg(feature = "inference")]
+    InstallEmbedder {
+        #[arg(value_enum)]
+        embedder: catalog::Embedder,
+    },
+    /// Build an NVC-TS pool from a JSON map of speakers to audio files or directories.
+    #[cfg(feature = "inference")]
+    BuildFeaturePool(model::timbre::PoolRequest),
     /// Separate vocals or remove reverb with the PyMSS presets.
     #[cfg(feature = "inference")]
     Separate {
@@ -204,6 +260,17 @@ struct InferOptions {
     rms_mix_rate: f32,
     #[arg(long, default_value_t = 0.33)]
     protect: f32,
+    /// How far breaths and fricatives follow the source's spectral shape and level (0-1).
+    #[arg(long, default_value_t = 1.0)]
+    aperiodic: f32,
+    /// Let the converted voice rise above the source's level (by default it is held
+    /// under it, so pauses and fades are not sung out loud).
+    #[arg(long)]
+    no_level_guard: bool,
+    /// Lower by this many dB the quiet frames the voice gate reads as not voice
+    /// (separation residue, beat bleed); 0 = off.
+    #[arg(long, default_value_t = 0.0)]
+    voice_gate: f32,
     #[arg(long, value_enum)]
     format: Option<audio::Format>,
     #[arg(long)]
@@ -228,13 +295,18 @@ fn main() -> Result<()> {
             panel,
             colab,
             share_client,
+            public_url,
         } => web::serve(
             paths,
             listen,
             port,
             open,
             panel,
-            colab.then(|| share_client.unwrap_or_else(web::share_client)),
+            match (colab, public_url) {
+                (true, _) => Some(web::Share::Relay(share_client.unwrap_or_else(web::share_client))),
+                (false, Some(url)) => Some(web::Share::Url(url)),
+                (false, None) => None,
+            },
         )?,
         #[cfg(feature = "inference")]
         Command::Pymss(cli) => pymss::run(&paths, cli)?,
@@ -336,6 +408,7 @@ fn main() -> Result<()> {
                     signal.store(true, Ordering::Relaxed);
                 }
             });
+            rvc::assets::training(&paths, &request, &mut rvc::assets::stderr())?;
             let report = model::train::run(&paths, request, |line| {
                 eprintln!("{line}");
                 if cancelled.load(Ordering::Relaxed) {
@@ -345,6 +418,49 @@ fn main() -> Result<()> {
                 }
             })?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "inference")]
+        Command::LayerAug {
+            experiment,
+            output,
+            sample_rate,
+            seed,
+            fx,
+            fx_profile,
+            no_layers,
+            bleed,
+        } => {
+            let target = fx_profile
+                .map(|path| model::fx::read_profile(&paths.root.join(path)))
+                .transpose()?;
+            let options = model::layers::Options {
+                layers: !no_layers,
+                fx: fx.then_some(target),
+                bleed: bleed.map(|dir| paths.root.join(dir)),
+            };
+            let report = model::layers::generate_with(
+                &paths.root.join(experiment),
+                &paths.root.join(output),
+                sample_rate,
+                seed,
+                &options,
+            )?;
+            println!(
+                "{} clips: {} doubled, {} with backing, {} with reverb, {} through production effects, {} with bleed",
+                report.clips, report.doubled, report.backed, report.reverberated, report.processed, report.bled
+            );
+        }
+        #[cfg(feature = "inference")]
+        Command::FxProfile { input, output } => {
+            let (files, profile) = model::fx::measure(&paths.root.join(input))?;
+            std::fs::write(paths.root.join(&output), serde_json::to_string(&profile)?)?;
+            println!("{files} files -> {}", output.display());
+        }
+        #[cfg(feature = "inference")]
+        Command::Cover(request) => {
+            for path in rvc::cover::run(&paths, &request)? {
+                println!("{}", path.display());
+            }
         }
         Command::ScanSpeakers { input, experiment } => {
             let manifest = dataset::scan_speakers(&paths.root.join(input))?;
@@ -392,10 +508,15 @@ fn main() -> Result<()> {
             experiment,
             version,
             f0_method,
+            embedder,
             device,
             gpus,
             overwrite,
+            unvoice_fricatives,
         } => {
+            if let Some(method) = f0_method {
+                rvc::assets::pitch(&paths, method, &mut rvc::assets::stderr())?;
+            }
             let devices = model::extract::selected_devices(&device, &gpus)?;
             let request = model::extract::Request {
                 experiment: &paths.root.join(experiment),
@@ -403,12 +524,30 @@ fn main() -> Result<()> {
                 f0: f0_method,
                 device: devices[0],
                 overwrite,
+                unvoice_fricatives,
             };
-            let report = model::extract::run_on_devices(&paths, request, &devices, |line| {
+            let report =
+                model::extract::run_with_embedder(&paths, request, &devices, embedder, |line| {
+                    eprintln!("{line}");
+                    std::ops::ControlFlow::Continue(())
+                })?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "inference")]
+        Command::InstallEmbedder { embedder } => {
+            let directory = embedder.install(&paths, |line| {
                 eprintln!("{line}");
                 std::ops::ControlFlow::Continue(())
             })?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            println!("{}", directory.display());
+        }
+        #[cfg(feature = "inference")]
+        Command::BuildFeaturePool(request) => {
+            let result = model::timbre::build_pool(&paths, request, |line| {
+                eprintln!("{line}");
+                std::ops::ControlFlow::Continue(())
+            })?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         #[cfg(feature = "inference")]
         Command::Separate {
@@ -424,6 +563,7 @@ fn main() -> Result<()> {
             if list_presets {
                 println!("{}", serde_json::to_string_pretty(&separation::PRESETS)?);
             } else {
+                rvc::assets::separation(&paths, &preset, &mut rvc::assets::stderr())?;
                 let options = separation::Options {
                     preset: &preset,
                     device: separation::device(&device)?,
@@ -496,14 +636,18 @@ fn infer(paths: &Paths, model: &std::path::Path, args: InferOptions) -> Result<(
         resample_sr: args.resample_sr,
         rms_mix_rate: args.rms_mix_rate,
         protect: args.protect,
+        aperiodic: args.aperiodic,
         precision: args.precision,
+        level_guard: !args.no_level_guard,
+        voice_gate: args.voice_gate,
         ..Default::default()
     };
     settings.validate()?;
     let info = ModelInfo::read(model)?;
     let speaker = info.speaker(args.speaker_id)?;
     let index = paths.require_index(model, speaker, args.index.as_deref(), args.index_rate)?;
-    let jobs = conversion_jobs(input, output, args.format, args.recursive)?;
+    rvc::assets::voice(paths, model, args.f0_method, &mut rvc::assets::stderr())?;
+    let jobs = audio::conversion_jobs(input, output, args.format, args.recursive)?;
     let mut targets = std::collections::HashSet::new();
     for (_, path, _) in &jobs {
         ensure!(
@@ -529,7 +673,12 @@ fn infer(paths: &Paths, model: &std::path::Path, args: InferOptions) -> Result<(
     for (source, target, format) in jobs {
         let result = (|| -> Result<()> {
             let samples = audio::read_mono(&source, audio::ANALYSIS_RATE)?;
-            let converted = engine.convert(&samples, settings)?;
+            let hires = if engine.uses_bands() {
+                Some(audio::read_mono(&source, engine.rate())?)
+            } else {
+                None
+            };
+            let converted = engine.convert_hires(&samples, hires.as_deref(), settings)?;
             audio::write_audio(
                 &target,
                 &converted.samples,
@@ -547,50 +696,4 @@ fn infer(paths: &Paths, model: &std::path::Path, args: InferOptions) -> Result<(
     }
     ensure!(failed == 0, "{failed} conversion(s) failed");
     Ok(())
-}
-
-#[cfg(feature = "inference")]
-fn conversion_jobs(
-    input: PathBuf,
-    output: PathBuf,
-    format: Option<audio::Format>,
-    recursive: bool,
-) -> Result<Vec<(PathBuf, PathBuf, audio::Format)>> {
-    use anyhow::Context;
-
-    ensure!(input.exists(), "Input not found: {}", input.display());
-    if input.is_file() {
-        let extension = if output.is_dir() {
-            None
-        } else {
-            output
-                .extension()
-                .map(audio::Format::from_extension)
-                .transpose()?
-        };
-        let format = format.or(extension).unwrap_or_default();
-        let target = if extension.is_some() && !output.is_dir() {
-            output.with_extension(format.extension())
-        } else {
-            output
-                .join(input.file_name().context("missing input file name")?)
-                .with_extension(format.extension())
-        };
-        return Ok(vec![(input, target, format)]);
-    }
-    let format = format.unwrap_or_default();
-    let files = audio::files(&input, recursive)?;
-    ensure!(
-        !files.is_empty(),
-        "No supported audio files found in: {}",
-        input.display()
-    );
-    files
-        .into_iter()
-        .map(|file| {
-            let relative = file.strip_prefix(&input)?;
-            let target = output.join(relative).with_extension(format.extension());
-            Ok((file, target, format))
-        })
-        .collect()
 }

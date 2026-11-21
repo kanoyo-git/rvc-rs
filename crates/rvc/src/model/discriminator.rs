@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, ensure};
 use tch::{Device, Kind, Tensor, no_grad};
 
+use super::weights::leaky;
+
 const PERIODS: [i64; 8] = [2, 3, 5, 7, 11, 17, 23, 37];
 
 pub struct DiscriminatorOutput {
@@ -14,6 +16,29 @@ pub struct DiscriminatorOutput {
 
 pub struct Discriminator {
     branches: Vec<Branch>,
+    resolutions: Vec<ResolutionBranch>,
+}
+
+/// STFT settings (FFT size, hop, window) of the optional multi-resolution branches.
+const RESOLUTIONS: [(i64, i64, i64); 3] = [(1024, 200, 1024), (2048, 400, 2048), (512, 100, 512)];
+const RESOLUTION_PREFIX: &str = "resolution_discriminators";
+
+/// A spectrogram discriminator (UnivNet/BigVGAN MRD) over one STFT resolution.
+struct ResolutionBranch {
+    fft: i64,
+    hop: i64,
+    window: Tensor,
+    layers: Vec<Conv2d>,
+}
+
+/// Weight-normalized 2-D convolution.
+struct Conv2d {
+    name: String,
+    stride: [i64; 2],
+    padding: [i64; 2],
+    bias: Tensor,
+    gain: Tensor,
+    direction: Tensor,
 }
 
 struct Branch {
@@ -52,25 +77,59 @@ enum ConvWeight {
 }
 
 impl Discriminator {
-    pub fn new(v2: bool, spectral: bool, device: Device) -> Result<Self> {
-        Self::build(v2, spectral, device, None)
+    /// `resolution` adds multi-resolution spectrogram branches to MPD/MSD.
+    pub fn new(v2: bool, spectral: bool, resolution: bool, device: Device) -> Result<Self> {
+        Self::build(v2, spectral, resolution, device, None)
     }
 
+    /// Branches missing from `weights` (for example MRD with a stock RVC
+    /// discriminator) start from random weights. Saved MRD weights enable MRD.
     pub fn from_weights(
         v2: bool,
         spectral: bool,
+        resolution: bool,
         device: Device,
         weights: HashMap<String, Tensor>,
     ) -> Result<Self> {
-        Self::build(v2, spectral, device, Some(weights))
+        Self::build(v2, spectral, resolution, device, Some(weights))
+    }
+
+    pub fn has_resolution_branches(&self) -> bool {
+        !self.resolutions.is_empty()
+    }
+
+    fn spectral(&self) -> bool {
+        self.branches.iter().any(|branch| {
+            branch
+                .layers
+                .iter()
+                .any(|layer| matches!(layer.weight, ConvWeight::Spectral { .. }))
+        })
     }
 
     fn build(
         v2: bool,
         spectral: bool,
+        resolution: bool,
         device: Device,
         mut weights: Option<HashMap<String, Tensor>>,
     ) -> Result<Self> {
+        let saved_resolution = weights
+            .as_ref()
+            .is_some_and(|weights| weights.keys().any(|key| key.starts_with(RESOLUTION_PREFIX)));
+        let mut resolutions = Vec::new();
+        if resolution || saved_resolution {
+            for (index, &(fft, hop, window)) in RESOLUTIONS.iter().enumerate() {
+                resolutions.push(ResolutionBranch::build(
+                    index,
+                    fft,
+                    hop,
+                    window,
+                    device,
+                    weights.as_mut().filter(|_| saved_resolution),
+                )?);
+            }
+        }
         let periods = &PERIODS[..if v2 { 8 } else { 6 }];
         let mut branches = Vec::with_capacity(periods.len() + 1);
         for (index, period) in std::iter::once(None)
@@ -102,7 +161,10 @@ impl Discriminator {
                 "discriminator checkpoint contains unexpected tensors"
             );
         }
-        Ok(Self { branches })
+        Ok(Self {
+            branches,
+            resolutions,
+        })
     }
 
     /// Grad-enabled tensor handles in the original parameter registration order.
@@ -119,6 +181,11 @@ impl Discriminator {
         for branch in &self.branches {
             for layer in &branch.layers {
                 layer.append_state(&mut tensors, include_buffers);
+            }
+        }
+        for branch in &self.resolutions {
+            for layer in &branch.layers {
+                layer.append_state(&mut tensors);
             }
         }
         tensors
@@ -139,13 +206,63 @@ impl Discriminator {
             scores: Vec::new(),
             features: Vec::new(),
         };
+        let mut record = |(score, features): (Tensor, Vec<Tensor>), positive_half: bool| {
+            let output = if positive_half {
+                &mut positive
+            } else {
+                &mut negative
+            };
+            output.scores.push(score);
+            output.features.push(features);
+        };
+        // Weight-normalized branches have no per-call state, so one pass over the
+        // concatenated batch equals separate real and generated passes with half
+        // the kernel launches. Spectral normalization updates its power-iteration
+        // buffers on every call and keeps the original two passes.
+        let joint = !self.spectral() && real.size() == generated.size();
+        let both = if joint {
+            Some(Tensor::f_cat(&[real, generated], 0)?)
+        } else {
+            None
+        };
+        let batch = real.size()[0];
+        let split = |(score, features): (Tensor, Vec<Tensor>)| -> Result<_> {
+            let half = |tensor: &Tensor, start| tensor.f_narrow(0, start, batch);
+            let real = (
+                half(&score, 0)?,
+                features
+                    .iter()
+                    .map(|feature| half(feature, 0))
+                    .collect::<tch::Result<Vec<_>>>()?,
+            );
+            let generated = (
+                half(&score, batch)?,
+                features
+                    .iter()
+                    .map(|feature| half(feature, batch))
+                    .collect::<tch::Result<Vec<_>>>()?,
+            );
+            Ok((real, generated))
+        };
         for branch in &mut self.branches {
-            let (score, features) = branch.forward(real, training)?;
-            positive.scores.push(score);
-            positive.features.push(features);
-            let (score, features) = branch.forward(generated, training)?;
-            negative.scores.push(score);
-            negative.features.push(features);
+            if let Some(both) = &both {
+                let (real, generated) = split(branch.forward(both, training)?)?;
+                record(real, true);
+                record(generated, false);
+            } else {
+                record(branch.forward(real, training)?, true);
+                record(branch.forward(generated, training)?, false);
+            }
+        }
+        for branch in &self.resolutions {
+            if let Some(both) = &both {
+                let (real, generated) = split(branch.forward(both)?)?;
+                record(real, true);
+                record(generated, false);
+            } else {
+                record(branch.forward(real)?, true);
+                record(branch.forward(generated)?, false);
+            }
         }
         Ok((positive, negative))
     }
@@ -175,15 +292,164 @@ impl Branch {
             .split_last_mut()
             .context("missing discriminator post convolution")?;
         for layer in convolutions {
-            let filtered = layer.forward(&hidden, training)?;
-            let negative = filtered.f_mul_scalar(0.1)?;
-            hidden = filtered.f_where_self(&filtered.f_gt(0.0)?, &negative)?;
+            hidden = leaky(&layer.forward(&hidden, training)?, 0.1);
             features.push(hidden.shallow_clone());
         }
         hidden = post.forward(&hidden, training)?;
         let score = hidden.f_flatten(1, -1)?;
         features.push(hidden);
         Ok((score, features))
+    }
+}
+
+impl ResolutionBranch {
+    fn build(
+        index: usize,
+        fft: i64,
+        hop: i64,
+        window: i64,
+        device: Device,
+        mut weights: Option<&mut HashMap<String, Tensor>>,
+    ) -> Result<Self> {
+        // (in, out, kernel, stride, padding) over [frequency, time].
+        type Spec = (i64, i64, [i64; 2], [i64; 2], [i64; 2]);
+        let specs: [Spec; 6] = [
+            (1, 32, [3, 9], [1, 1], [1, 4]),
+            (32, 32, [3, 9], [1, 2], [1, 4]),
+            (32, 32, [3, 9], [1, 2], [1, 4]),
+            (32, 32, [3, 9], [1, 2], [1, 4]),
+            (32, 32, [3, 3], [1, 1], [1, 1]),
+            (32, 1, [3, 3], [1, 1], [1, 1]),
+        ];
+        let mut layers = Vec::with_capacity(specs.len());
+        for (layer_index, (channels_in, channels_out, kernel, stride, padding)) in
+            specs.into_iter().enumerate()
+        {
+            let suffix = if layer_index + 1 == specs.len() {
+                "conv_post".to_owned()
+            } else {
+                format!("convs.{layer_index}")
+            };
+            let name = format!("{RESOLUTION_PREFIX}.{index}.{suffix}");
+            let shape = [channels_out, channels_in, kernel[0], kernel[1]];
+            let (bias, gain, direction) = if let Some(weights) = weights.as_deref_mut() {
+                (
+                    read_tensor(weights, &name, "bias", &[channels_out], device, true)?,
+                    read_tensor(
+                        weights,
+                        &name,
+                        "weight_g",
+                        &[channels_out, 1, 1, 1],
+                        device,
+                        true,
+                    )?,
+                    read_tensor(weights, &name, "weight_v", &shape, device, true)?,
+                )
+            } else {
+                let fan_in = channels_in * kernel[0] * kernel[1];
+                let bound = 1.0 / (fan_in as f64).sqrt();
+                let options = (Kind::Float, device);
+                let direction = Tensor::f_empty(shape, options)?.f_uniform_(-bound, bound)?;
+                let gain = direction
+                    .f_reshape([channels_out, fan_in])?
+                    .f_norm_scalaropt_dim(2.0, [1], false)?
+                    .f_reshape([channels_out, 1, 1, 1])?
+                    .f_set_requires_grad(true)?;
+                let bias = Tensor::f_empty([channels_out], options)?
+                    .f_uniform_(-bound, bound)?
+                    .f_set_requires_grad(true)?;
+                (bias, gain, direction.f_set_requires_grad(true)?)
+            };
+            layers.push(Conv2d {
+                name,
+                stride,
+                padding,
+                bias,
+                gain,
+                direction,
+            });
+        }
+        let spectral_device = if device == Device::Mps {
+            Device::Cpu
+        } else {
+            device
+        };
+        Ok(Self {
+            fft,
+            hop,
+            window: Tensor::f_hann_window_periodic(window, true, (Kind::Float, spectral_device))?,
+            layers,
+        })
+    }
+
+    fn forward(&self, audio: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        let kind = audio.kind();
+        let waveform = audio
+            .f_squeeze_dim(1)?
+            .f_to_kind(Kind::Float)?
+            .f_to_device(self.window.device())?;
+        let pad = (self.fft - self.hop) / 2;
+        let spectrum = waveform.f_reflection_pad1d([pad, pad])?.f_stft_center(
+            self.fft,
+            self.hop,
+            self.window.size()[0],
+            Some(&self.window),
+            false,
+            "reflect",
+            false,
+            true,
+            true,
+            false,
+        )?;
+        let magnitude = spectrum
+            .f_real()?
+            .f_square()?
+            .f_add(&spectrum.f_imag()?.f_square()?)?
+            .f_clamp_min(1e-9)?
+            .f_sqrt()?
+            .f_to_device(audio.device())?;
+        // [batch, 1, frequency, time]
+        let mut hidden = magnitude.f_unsqueeze(1)?;
+        if kind != Kind::Float && matches!(kind, Kind::Half | Kind::BFloat16) {
+            hidden = hidden.f_to_kind(kind)?;
+        }
+        let mut features = Vec::with_capacity(self.layers.len());
+        let (post, convolutions) = self
+            .layers
+            .split_last()
+            .context("missing resolution discriminator post convolution")?;
+        for layer in convolutions {
+            hidden = leaky(&layer.forward(&hidden)?, 0.1);
+            features.push(hidden.shallow_clone());
+        }
+        hidden = post.forward(&hidden)?;
+        let score = hidden.f_flatten(1, -1)?;
+        features.push(hidden);
+        Ok((score, features))
+    }
+}
+
+impl Conv2d {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let weight = Tensor::f_internal_weight_norm(&self.direction, &self.gain, 0)?;
+        Ok(input.f_conv2d(
+            &weight,
+            Some(&self.bias),
+            self.stride,
+            self.padding,
+            [1, 1],
+            1,
+        )?)
+    }
+
+    fn append_state(&self, tensors: &mut Vec<(String, Tensor)>) {
+        for (suffix, tensor) in [
+            ("bias", &self.bias),
+            ("weight_g", &self.gain),
+            ("weight_v", &self.direction),
+        ] {
+            tensors.push((format!("{}.{suffix}", self.name), tensor.shallow_clone()));
+        }
     }
 }
 
@@ -408,4 +674,50 @@ fn periodic_convs() -> Vec<Geometry> {
         period: true,
     })
     .collect()
+}
+
+#[cfg(test)]
+mod joint_tests {
+    use super::*;
+
+    /// The concatenated real/generated pass equals two separate passes.
+    #[test]
+    fn joint_pass_matches_separate_passes() -> Result<()> {
+        tch::manual_seed(3);
+        let device = Device::Cpu;
+        let mut discriminator = Discriminator::new(true, false, true, device)?;
+        let real = Tensor::f_randn([2, 1, 4000], (Kind::Float, device))?;
+        let generated = Tensor::f_randn([2, 1, 4000], (Kind::Float, device))?;
+        let (positive, negative) = discriminator.forward(&real, &generated, true)?;
+        let mut expected = Vec::new();
+        for branch in &mut discriminator.branches {
+            expected.push((
+                branch.forward(&real, true)?,
+                branch.forward(&generated, true)?,
+            ));
+        }
+        for branch in &discriminator.resolutions {
+            expected.push((branch.forward(&real)?, branch.forward(&generated)?));
+        }
+        assert_eq!(expected.len(), positive.scores.len());
+        let close = |a: &Tensor, b: &Tensor| -> Result<()> {
+            assert_eq!(a.size(), b.size());
+            // Batched and single convolutions may reduce in a different order.
+            let error = (a - b).f_abs()?.f_max()?.f_double_value(&[])?;
+            let scale = b.f_abs()?.f_max()?.f_double_value(&[])?.max(1.0);
+            assert!(error < 1e-4 * scale, "max difference {error}");
+            Ok(())
+        };
+        for (index, (real_out, generated_out)) in expected.iter().enumerate() {
+            close(&positive.scores[index], &real_out.0)?;
+            close(&negative.scores[index], &generated_out.0)?;
+            for (a, b) in positive.features[index].iter().zip(&real_out.1) {
+                close(a, b)?;
+            }
+            for (a, b) in negative.features[index].iter().zip(&generated_out.1) {
+                close(a, b)?;
+            }
+        }
+        Ok(())
+    }
 }

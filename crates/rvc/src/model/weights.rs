@@ -45,6 +45,17 @@ impl Weights {
         self.tensors.contains_key(name)
     }
 
+    pub(super) fn matching(&self, matches: impl Fn(&str) -> bool) -> Vec<(&str, &Tensor)> {
+        let mut items: Vec<_> = self
+            .tensors
+            .iter()
+            .filter(|(name, _)| matches(name))
+            .map(|(name, value)| (name.as_str(), value))
+            .collect();
+        items.sort_unstable_by_key(|&(name, _)| name);
+        items
+    }
+
     #[cfg(feature = "onnx")]
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
         self.tensors.retain(|name, _| keep(name));
@@ -286,6 +297,8 @@ pub fn device(requested: &str) -> Result<Device> {
                 || {
                     if !profiles.is_empty() && profiles.iter().all(Option::is_none) {
                         Device::Cuda(0)
+                    } else if tch::utils::has_mps() {
+                        Device::Mps
                     } else {
                         Device::Cpu
                     }

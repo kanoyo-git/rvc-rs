@@ -669,6 +669,12 @@ impl<'a> Pickle<'a> {
     }
 
     fn global(&mut self, module: &str, name: &str) -> Result<()> {
+        if module == "torch" && matches!(name, "bfloat16" | "float16" | "float32" | "float64") {
+            // Python's AnyPrecisionAdamW records these dtype constants in its
+            // parameter group. They are metadata, never callable globals.
+            self.push(Value::String(name.to_owned()));
+            return Ok(());
+        }
         let class = format!("{module}.{name}");
         ensure!(
             matches!(

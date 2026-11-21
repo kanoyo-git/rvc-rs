@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{BufWriter, Seek};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::ControlFlow;
@@ -24,14 +25,15 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_util::io::ReaderStream;
 
-use crate::audio::{self, ANALYSIS_RATE, Format};
+use crate::audio::{self, ANALYSIS_RATE, Format, conversion_jobs};
 use crate::catalog::{ModelInfo, Paths};
 use crate::model::{self, ConversionSettings, Rvc};
-use crate::{conversion_jobs, dataset, separation};
+use crate::{dataset, separation};
 
 mod gradio;
 mod locale;
 mod share;
+mod studio;
 
 pub use share::share_client;
 
@@ -59,7 +61,10 @@ impl Panel {
 struct StateData {
     paths: Paths,
     job: Mutex<Job>,
-    voice: Mutex<Option<CachedVoice>>,
+    recent_jobs: Mutex<VecDeque<Job>>,
+    voice: Arc<Mutex<Option<CachedVoice>>>,
+    computing: Arc<AtomicBool>,
+    studio: studio::Files,
     legacy: gradio::Legacy,
     #[cfg(feature = "realtime")]
     realtime: Mutex<Option<Live>>,
@@ -69,9 +74,11 @@ type Shared = Arc<StateData>;
 
 #[derive(Default, Serialize)]
 struct Job {
+    id: uuid::Uuid,
     operation: String,
     status: JobState,
     message: String,
+    log: VecDeque<String>,
     result: Option<Value>,
     #[serde(skip)]
     cancelled: Arc<AtomicBool>,
@@ -97,6 +104,8 @@ struct Convert {
     device: String,
     #[serde(default)]
     settings: ConversionSettings,
+    #[serde(default)]
+    auto_register: bool,
 }
 
 fn automatic() -> String {
@@ -132,15 +141,21 @@ enum Action {
         sample_rate: u32,
         workers: usize,
         segment_seconds: f64,
+        #[serde(default)]
+        denoise: f32,
     },
     Extract {
         experiment: PathBuf,
         version: String,
         f0_method: Option<model::PitchMethod>,
+        embedder: Option<crate::catalog::Embedder>,
+        #[serde(default = "automatic")]
         device: String,
         #[serde(default)]
         gpus: Vec<usize>,
         overwrite: bool,
+        #[serde(default)]
+        unvoice_fricatives: bool,
     },
     Train {
         #[serde(flatten)]
@@ -155,6 +170,8 @@ enum Action {
         workers: usize,
         segment_seconds: f64,
         f0_method: model::PitchMethod,
+        #[serde(default)]
+        denoise: f32,
     },
     #[cfg(feature = "index-training")]
     Index {
@@ -196,6 +213,8 @@ impl Action {
                 recursive,
                 overwrite,
             } => {
+                let model = installed_model(paths, &conversion.model)?;
+                crate::assets::voice(paths, &model, conversion.settings.f0_method, &mut report)?;
                 let jobs = conversion_jobs(
                     paths.root.join(input),
                     paths.root.join(output),
@@ -223,7 +242,7 @@ impl Action {
                         bail!("batch conversion cancelled");
                     }
                     let source = audio::read_mono(file, ANALYSIS_RATE)?;
-                    let converted = convert_voice(state, &conversion, &source)?;
+                    let converted = convert_voice(state, &conversion, &source, Some(file))?;
                     audio::write_audio(
                         output,
                         &converted.samples,
@@ -244,6 +263,7 @@ impl Action {
                 overwrite,
                 device,
             } => {
+                crate::assets::separation(paths, &preset, &mut report)?;
                 let secondary_output = secondary_output.map(|path| paths.root.join(path));
                 let options = separation::Options {
                     preset: &preset,
@@ -276,6 +296,7 @@ impl Action {
                 sample_rate,
                 workers,
                 segment_seconds,
+                denoise,
             } => {
                 let input = input.map(|path| paths.root.join(path));
                 let source = match source {
@@ -287,7 +308,7 @@ impl Action {
                     ),
                     DatasetMode::Manifest => dataset::DatasetSource::MultiManifest,
                 };
-                let result = dataset::preprocess_with_cancel(
+                let result = dataset::preprocess_with_denoise(
                     &dataset::PreprocessRequest {
                         source,
                         experiment_dir: &paths.root.join(experiment),
@@ -295,6 +316,7 @@ impl Action {
                         workers,
                         segment_seconds,
                     },
+                    denoise,
                     || cancelled.load(Ordering::Relaxed),
                     |line| {
                         let _ = report(line);
@@ -306,10 +328,15 @@ impl Action {
                 experiment,
                 version,
                 f0_method,
+                embedder,
                 device,
                 gpus,
                 overwrite,
+                unvoice_fricatives,
             } => {
+                if let Some(method) = f0_method {
+                    crate::assets::pitch(paths, method, &mut report)?;
+                }
                 let devices = model::extract::selected_devices(&device, &gpus)?;
                 let request = model::extract::Request {
                     experiment: &paths.root.join(experiment),
@@ -317,12 +344,14 @@ impl Action {
                     f0: f0_method,
                     device: devices[0],
                     overwrite,
+                    unvoice_fricatives,
                 };
-                Ok(json!(model::extract::run_on_devices(
-                    paths, request, &devices, report
+                Ok(json!(model::extract::run_with_embedder(
+                    paths, request, &devices, embedder, report
                 )?))
             }
             Self::Train { mut request } => {
+                crate::assets::training(paths, &request, &mut report)?;
                 request.rebuild_filelist = true;
                 Ok(json!(model::train::run(paths, request, report)?))
             }
@@ -334,7 +363,12 @@ impl Action {
                 workers,
                 segment_seconds,
                 f0_method,
+                denoise,
             } => {
+                crate::assets::training(paths, &request, &mut report)?;
+                if request.f0 {
+                    crate::assets::pitch(paths, f0_method, &mut report)?;
+                }
                 let input = input.map(|path| paths.root.join(path));
                 let experiment = paths.root.join(&request.experiment);
                 request.multi = !matches!(source, DatasetMode::Single);
@@ -348,7 +382,7 @@ impl Action {
                     DatasetMode::Manifest => dataset::DatasetSource::MultiManifest,
                 };
                 let cancellation = || cancelled.load(Ordering::Relaxed);
-                let prepared = dataset::preprocess_with_cancel(
+                let prepared = dataset::preprocess_with_denoise(
                     &dataset::PreprocessRequest {
                         source: dataset_source,
                         experiment_dir: &experiment,
@@ -356,6 +390,7 @@ impl Action {
                         workers,
                         segment_seconds,
                     },
+                    denoise,
                     cancellation,
                     |progress| {
                         let _ = report(&format!("Dataset · {progress}"));
@@ -372,11 +407,15 @@ impl Action {
                     f0: request.f0.then_some(f0_method),
                     device: devices[0],
                     overwrite: true,
+                    unvoice_fricatives: false,
                 };
-                let features =
-                    model::extract::run_on_devices(paths, feature_request, &devices, |progress| {
-                        report(&format!("Features · {progress}"))
-                    })?;
+                let features = model::extract::run_with_embedder(
+                    paths,
+                    feature_request,
+                    &devices,
+                    request.embedder,
+                    |progress| report(&format!("Features · {progress}")),
+                )?;
                 let index_request = crate::train_index::IndexTraining {
                     experiment_dir: &experiment,
                     outside_index_root: &paths.indices,
@@ -476,14 +515,30 @@ enum ModelAction {
     },
 }
 
+/// How the WebUI is reached from outside the machine.
+pub enum Share {
+    /// Through the Gradio relay, with the given frpc client.
+    Relay(PathBuf),
+    /// Through a tunnel the user started, at this https:// origin.
+    Url(String),
+}
+
 pub fn serve(
     paths: Paths,
     listen: IpAddr,
     port: u16,
     open: bool,
     panel: Option<Panel>,
-    share_client: Option<PathBuf>,
+    share: Option<Share>,
 ) -> Result<()> {
+    let external = match &share {
+        Some(Share::Url(url)) => Some(share::External::new(url)?),
+        _ => None,
+    };
+    let share_client = match share {
+        Some(Share::Relay(client)) => Some(client),
+        _ => None,
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -491,8 +546,11 @@ pub fn serve(
         let state = Arc::new(StateData {
             paths,
             job: Mutex::default(),
-            voice: Mutex::default(),
-            legacy: gradio::Legacy::new(share_client.is_some())?,
+            recent_jobs: Mutex::default(),
+            voice: Arc::default(),
+            computing: Arc::default(),
+            studio: studio::Files::new()?,
+            legacy: gradio::Legacy::new(share_client.is_some() || external.is_some())?,
             #[cfg(feature = "realtime")]
             realtime: Mutex::default(),
         });
@@ -511,15 +569,6 @@ pub fn serve(
                     asset(
                         "text/javascript; charset=utf-8",
                         include_str!("../web/app.js"),
-                    )
-                }),
-            )
-            .route(
-                "/locale.js",
-                get(|| async {
-                    asset(
-                        "text/javascript; charset=utf-8",
-                        include_str!("../web/locale.js"),
                     )
                 }),
             )
@@ -561,8 +610,13 @@ pub fn serve(
         } else {
             None
         };
-        let access = tunnel.as_ref().map(share::Tunnel::access);
+        let access = tunnel
+            .as_ref()
+            .map(share::Tunnel::access)
+            .or_else(|| external.as_ref().map(share::External::access));
+        let shutdown_state = Arc::clone(&state);
         let app = router
+            .merge(studio::routes())
             .merge(gradio::routes())
             .layer(middleware::from_fn_with_state(access, local_requests))
             .with_state(state);
@@ -574,6 +628,9 @@ pub fn serve(
         println!("{url}");
         if let Some(tunnel) = &tunnel {
             tunnel.announce(panel.map(Panel::path).unwrap_or(""));
+        }
+        if let Some(external) = &external {
+            external.announce(panel.map(Panel::path).unwrap_or(""));
         }
         if open && let Err(error) = open_browser(&url) {
             eprintln!("Could not open {url}: {error}");
@@ -591,6 +648,15 @@ pub fn serve(
                 tunnel.stop().await;
             } else {
                 shutdown.await;
+            }
+            if let Ok(job) = shutdown_state.job.lock() {
+                job.cancelled.store(true, Ordering::Relaxed);
+            }
+            #[cfg(feature = "realtime")]
+            if let Ok(live) = shutdown_state.realtime.lock()
+                && let Some(live) = live.as_ref()
+            {
+                let _ = live.stop.send(());
             }
         })
         .await?;
@@ -831,6 +897,15 @@ fn installed_model(paths: &Paths, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn checkpoint_model(paths: &Paths, name: &str) -> Result<PathBuf> {
+    let path = Path::new(name);
+    if path.components().count() == 1 {
+        installed_model(paths, name)
+    } else {
+        paths.model(path)
+    }
+}
+
 fn model_output(paths: &Paths, name: &str) -> Result<PathBuf> {
     let path = Path::new(name);
     let mut parts = path.components();
@@ -862,7 +937,7 @@ async fn edit_model(
             } => {
                 let target = model_output(paths, &output)?;
                 model::edit::describe(
-                    &installed_model(paths, &model)?,
+                    &checkpoint_model(paths, &model)?,
                     &target,
                     &description,
                     overwrite,
@@ -879,8 +954,8 @@ async fn edit_model(
             } => {
                 let target = model_output(paths, &output)?;
                 model::edit::merge(
-                    &installed_model(paths, &first)?,
-                    &installed_model(paths, &second)?,
+                    &checkpoint_model(paths, &first)?,
+                    &checkpoint_model(paths, &second)?,
                     &target,
                     alpha,
                     &description,
@@ -953,10 +1028,17 @@ struct CachedVoice {
     engine: Rvc,
 }
 
-fn convert_voice(state: &StateData, request: &Convert, audio: &[f32]) -> Result<model::Audio> {
+/// `source` is the decoded file, read again at the model rate when the voice uses its high band.
+fn convert_voice(
+    state: &StateData,
+    request: &Convert,
+    audio: &[f32],
+    source: Option<&std::path::Path>,
+) -> Result<model::Audio> {
     let paths = &state.paths;
     let model = installed_model(paths, &request.model)?;
-    let speaker = ModelInfo::read(&model)?.speaker(request.speaker_id)?;
+    let info = ModelInfo::read(&model)?;
+    let speaker = info.speaker(request.speaker_id)?;
     let index = if request.index.is_some() {
         paths.require_index(
             &model,
@@ -970,7 +1052,7 @@ fn convert_voice(state: &StateData, request: &Convert, audio: &[f32]) -> Result<
         None
     };
     let key = VoiceKey {
-        model: FileVersion::read(model)?,
+        model: FileVersion::read(model.clone())?,
         speaker,
         index: index.map(FileVersion::read).transpose()?,
         device: model::weights::device(&request.device)?,
@@ -990,11 +1072,51 @@ fn convert_voice(state: &StateData, request: &Convert, audio: &[f32]) -> Result<
         )?;
         *current = Some(CachedVoice { key, engine });
     }
-    current
+    let engine = &current
         .as_ref()
         .context("voice engine was not loaded")?
-        .engine
-        .convert(audio, request.settings)
+        .engine;
+    let hires = match source.filter(|_| engine.uses_bands()) {
+        Some(path) => Some(audio::read_mono(path, engine.rate())?),
+        None => None,
+    };
+    if request.auto_register && info.uses_f0 {
+        let profile = model::register::Profile::load(&model)?;
+        engine.convert_registered(audio, hires.as_deref(), request.settings, profile.as_ref())
+    } else {
+        engine.convert_hires(audio, hires.as_deref(), request.settings)
+    }
+}
+
+struct ComputePermit {
+    busy: Arc<AtomicBool>,
+    voice: Arc<Mutex<Option<CachedVoice>>>,
+}
+
+impl Drop for ComputePermit {
+    fn drop(&mut self) {
+        if let Ok(mut voice) = self.voice.lock()
+            && voice
+                .as_ref()
+                .is_some_and(|cached| cached.key.device != tch::Device::Cpu)
+        {
+            *voice = None;
+        }
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
+fn compute(state: &StateData) -> Result<ComputePermit> {
+    state
+        .computing
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map_err(|_| {
+            anyhow::anyhow!("Stop the active audio stream or wait for the current task to finish.")
+        })?;
+    Ok(ComputePermit {
+        busy: Arc::clone(&state.computing),
+        voice: Arc::clone(&state.voice),
+    })
 }
 
 async fn release_voice(State(state): State<Shared>) -> WebResult<StatusCode> {
@@ -1039,9 +1161,11 @@ async fn convert(State(state): State<Shared>, mut form: Multipart) -> WebResult<
     }
     let request = request.context("settings are required")?;
     let input = input.context("an audio file is required")?;
+    let permit = compute(&state)?;
     let (wav, length) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let _permit = permit;
         let source = audio::read_mono(&input, ANALYSIS_RATE)?;
-        let result = convert_voice(&state, &request, &source)?;
+        let result = convert_voice(&state, &request, &source, Some(&input))?;
         let mut wav = tempfile::tempfile()?;
         audio::write_wav(
             BufWriter::new(&mut wav),
@@ -1073,7 +1197,13 @@ async fn create_manifest(
     let result = tokio::task::spawn_blocking(move || -> Result<Value> {
         let experiment = state.paths.root.join(request.experiment);
         let root = request.root.map(|path| state.paths.root.join(path));
-        if let Some(rows) = request.rows {
+        if let Some(mut rows) = request.rows {
+            let base = root.as_deref().unwrap_or(&state.paths.root);
+            for row in &mut rows {
+                if !row.path.trim().is_empty() {
+                    row.path = base.join(row.path.trim()).to_string_lossy().into_owned();
+                }
+            }
             let result = dataset::manifest_from_rows(&rows, root.as_deref())?;
             let path = dataset::save_manifest(&experiment, &result.manifest)?;
             Ok(json!({ "path": path, "invalid_rows": result.invalid_rows, "manifest": result.manifest }))
@@ -1090,58 +1220,104 @@ async fn start_job(
     State(state): State<Shared>,
     Json(action): Json<Action>,
 ) -> WebResult<StatusCode> {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    if !reserve_job(&state, action.name(), &cancelled)? {
-        return Ok(StatusCode::CONFLICT);
-    }
-    tokio::task::spawn_blocking(move || {
-        let result = action.run(&state, &cancelled, |message| {
-            job_progress(&state, &cancelled, message)
-        });
-        finish_job(&state, &cancelled, result);
-    });
-    Ok(StatusCode::ACCEPTED)
+    let operation = action.name();
+    let id = launch_job(state, operation, move |state, cancelled| {
+        action.run(state, cancelled, |message| {
+            job_progress(state, cancelled, message)
+        })
+    })?;
+    Ok(if id.is_some() {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::CONFLICT
+    })
 }
 
-fn reserve_job(state: &StateData, operation: &str, cancelled: &Arc<AtomicBool>) -> Result<bool> {
+fn launch_job(
+    state: Shared,
+    operation: &str,
+    run: impl FnOnce(&StateData, &AtomicBool) -> Result<Value> + Send + 'static,
+) -> Result<Option<uuid::Uuid>> {
+    let Ok(permit) = compute(&state) else {
+        return Ok(None);
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let Some(id) = reserve_job(&state, operation, &cancelled)? else {
+        return Ok(None);
+    };
+    tokio::spawn(async move {
+        let work_state = Arc::clone(&state);
+        let work_cancelled = Arc::clone(&cancelled);
+        let result = tokio::task::spawn_blocking(move || run(&work_state, &work_cancelled))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+        let mut job = state.job.lock().unwrap_or_else(|error| error.into_inner());
+        finish_job(&mut job, &cancelled, result);
+        drop(permit);
+    });
+    Ok(Some(id))
+}
+
+fn reserve_job(
+    state: &StateData,
+    operation: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<Option<uuid::Uuid>> {
     let mut job = lock(&state.job)?;
     if job.status == JobState::Running {
-        return Ok(false);
+        return Ok(None);
     }
-    *job = Job {
-        operation: operation.to_owned(),
-        status: JobState::Running,
-        cancelled: Arc::clone(cancelled),
-        ..Default::default()
-    };
-    Ok(true)
+    let id = uuid::Uuid::new_v4();
+    let previous = std::mem::replace(
+        &mut *job,
+        Job {
+            id,
+            operation: operation.to_owned(),
+            status: JobState::Running,
+            cancelled: Arc::clone(cancelled),
+            ..Default::default()
+        },
+    );
+    if previous.status != JobState::Idle {
+        let mut recent = lock(&state.recent_jobs)?;
+        if recent.len() == 8 {
+            recent.pop_front();
+        }
+        recent.push_back(previous);
+    }
+    Ok(Some(id))
 }
 
 fn job_progress(state: &StateData, cancelled: &AtomicBool, message: &str) -> ControlFlow<()> {
     if cancelled.load(Ordering::Relaxed) {
         return ControlFlow::Break(());
     }
-    if let Ok(mut job) = state.job.lock() {
+    if let Ok(mut job) = state.job.lock()
+        && job.message != message
+    {
         job.message = message.to_owned();
+        if job.log.len() == 40 {
+            job.log.pop_front();
+        }
+        job.log.push_back(message.to_owned());
     }
     ControlFlow::Continue(())
 }
 
-fn finish_job(state: &StateData, cancelled: &AtomicBool, result: Result<Value>) {
-    if let Ok(mut job) = state.job.lock() {
-        match result {
-            Ok(result) => {
-                job.status = JobState::Complete;
-                job.result = Some(result);
-            }
-            Err(error) => {
-                job.status = if cancelled.load(Ordering::Relaxed) {
-                    JobState::Cancelled
-                } else {
-                    JobState::Failed
-                };
-                job.message = format!("{error:#}");
-            }
+fn finish_job(job: &mut Job, cancelled: &AtomicBool, result: Result<Value>) {
+    match result {
+        Ok(result) => {
+            job.status = JobState::Complete;
+            job.result = Some(result);
+        }
+        Err(error) => {
+            job.status = if cancelled.load(Ordering::Relaxed) {
+                JobState::Cancelled
+            } else {
+                JobState::Failed
+            };
+            job.message = format!("{error:#}");
         }
     }
 }
@@ -1208,6 +1384,7 @@ async fn start_live(
     {
         return Ok(StatusCode::CONFLICT);
     }
+    let permit = compute(&state)?;
     let (stop, run_until) = std::sync::mpsc::channel();
     let status = Arc::new(Mutex::new(json!({ "status": "starting" })));
     let status_thread = Arc::clone(&status);
@@ -1217,12 +1394,19 @@ async fn start_live(
     let thread = std::thread::Builder::new()
         .name("rvc-realtime-control".into())
         .spawn(move || {
+            let _permit = permit;
             let mark = |value| {
                 if let Ok(mut status) = status_thread.lock() {
                     *status = value;
                 }
             };
             let result = (|| -> Result<()> {
+                if let Some(model) = request.model.as_deref() {
+                    crate::assets::voice(&paths, &paths.model(model)?, request.settings.f0_method, &mut |line: &str| {
+                        mark(json!({ "status": "starting", "message": line }));
+                        ControlFlow::Continue(())
+                    })?;
+                }
                 let (stream, controller) =
                     crate::realtime::start_controlled(&paths, request.clone())?;
                 let persistence = crate::realtime::save_profile(&paths, &request)

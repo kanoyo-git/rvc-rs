@@ -6,17 +6,24 @@ mod fcpe;
 #[cfg(feature = "onnx")]
 mod fcpe_onnx;
 mod hubert;
+pub mod aperiodic;
+pub mod fx;
+pub mod gate;
+pub mod layers;
 #[cfg(feature = "onnx")]
 mod hubert_onnx;
+mod nmvpe;
 #[cfg(feature = "onnx")]
 pub(crate) mod onnx;
 mod optimizer;
 mod pitch;
+pub(crate) mod register;
 mod retrieval;
 mod rmvpe;
 #[cfg(feature = "onnx")]
 mod rmvpe_onnx;
 mod synth;
+pub mod timbre;
 pub mod train;
 pub mod train_data;
 mod train_losses;
@@ -32,11 +39,13 @@ use serde::{Deserialize, Serialize};
 use tch::{Device, Kind, Tensor, no_grad};
 
 use crate::audio::{self, ANALYSIS_RATE, FRAME};
-use crate::catalog::Paths;
+use crate::catalog::{Paths, Unvoiced};
 use hubert::Hubert;
 use retrieval::Index;
 use rmvpe::Rmvpe;
 use synth::{Synth, Window};
+
+const FCPE_CHECKPOINT: &str = "assets/fcpe/fcpe_c_v001.pt";
 
 fn onnx_selection(stage: &str) -> Option<OsString> {
     std::env::var_os(stage)
@@ -51,6 +60,29 @@ pub enum PitchMethod {
     Rmvpe,
     Pm,
     Fcpe,
+    Nmvpe,
+}
+
+impl PitchMethod {
+    pub(crate) fn available(self, paths: &Paths) -> bool {
+        match self {
+            Self::Pm => true,
+            Self::Rmvpe => {
+                let checkpoint = paths.rmvpe.join("rmvpe.pt").is_file();
+                if onnx_selection("RVC_RMVPE_ONNX").is_some() {
+                    cfg!(feature = "onnx")
+                        && (checkpoint || paths.rmvpe.join("rmvpe.onnx").is_file())
+                } else {
+                    checkpoint
+                }
+            }
+            Self::Fcpe => {
+                (cfg!(feature = "onnx") || onnx_selection("RVC_FCPE_ONNX").is_none())
+                    && paths.root.join(FCPE_CHECKPOINT).is_file()
+            }
+            Self::Nmvpe => paths.nmvpe().is_file(),
+        }
+    }
 }
 
 enum Pitch {
@@ -59,6 +91,7 @@ enum Pitch {
     RmvpeOnnx(rmvpe_onnx::RmvpeOnnx),
     Pm,
     Fcpe(fcpe::Fcpe),
+    Nmvpe(nmvpe::Nmvpe),
 }
 
 impl Pitch {
@@ -85,19 +118,30 @@ impl Pitch {
             )?)),
             PitchMethod::Pm => Ok(Self::Pm),
             PitchMethod::Fcpe => Ok(Self::Fcpe(fcpe::Fcpe::load(
-                &paths.root.join("assets/fcpe/fcpe_c_v001.pt"),
+                &paths.root.join(FCPE_CHECKPOINT),
                 device,
+            )?)),
+            PitchMethod::Nmvpe => Ok(Self::Nmvpe(nmvpe::Nmvpe::load(
+                &paths.nmvpe(),
+                device,
+                kind,
             )?)),
         }
     }
 
     fn extract(&self, audio: &[f32], stream: Option<&cuda_graph::Cache>) -> Result<Vec<f32>> {
+        // Experiments: RVC_RMVPE_THRESHOLD overrides the voicing threshold (0.03).
+        let threshold = std::env::var("RVC_RMVPE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.03);
         match self {
-            Self::Rmvpe(rmvpe) => rmvpe.infer(audio, 0.03, stream),
+            Self::Rmvpe(rmvpe) => rmvpe.infer(audio, threshold, stream),
             #[cfg(feature = "onnx")]
-            Self::RmvpeOnnx(rmvpe) => rmvpe.infer(audio, 0.03),
+            Self::RmvpeOnnx(rmvpe) => rmvpe.infer(audio, threshold),
             Self::Pm => Ok(pitch::autocorrelation(audio, stream.is_some())),
             Self::Fcpe(fcpe) => fcpe.infer(audio, 0.006, stream),
+            Self::Nmvpe(nmvpe) => nmvpe.infer(audio, stream),
         }
     }
 
@@ -108,6 +152,7 @@ impl Pitch {
             #[cfg(feature = "onnx")]
             Self::RmvpeOnnx(_) => {}
             Self::Fcpe(fcpe) => fcpe.graph.get_mut().clear(),
+            Self::Nmvpe(nmvpe) => nmvpe.network.graph.get_mut().clear(),
             Self::Pm => {}
         }
     }
@@ -156,6 +201,16 @@ pub struct ConversionSettings {
     pub protect: f32,
     pub formant: f32,
     pub precision: Precision,
+    /// How far breaths and fricatives follow the source's spectral shape and
+    /// loudness (0 = as rendered, 1 = fully matched); see [`aperiodic`].
+    pub aperiodic: f32,
+    /// Keep the converted voice under the source's level (+2 dB) frame by frame, so
+    /// faint parts (pauses, fades, echoes) are not sung out loud.
+    pub level_guard: bool,
+    /// Attenuation in dB of frames the voice gate reads as not voice (separation residue,
+    /// beat bleed, effects) while the input is quiet there; 0 turns the gate off. Needs a
+    /// `voice_gate.json` next to the content embedder (see [`gate`]).
+    pub voice_gate: f32,
 }
 
 impl Default for ConversionSettings {
@@ -169,6 +224,9 @@ impl Default for ConversionSettings {
             protect: 0.33,
             formant: 0.0,
             precision: Precision::Auto,
+            aperiodic: 1.0,
+            level_guard: true,
+            voice_gate: 0.0,
         }
     }
 }
@@ -186,6 +244,14 @@ impl ConversionSettings {
         ensure!(
             (0.0..=0.5).contains(&self.protect),
             "--protect must be between 0 and 0.5"
+        );
+        ensure!(
+            (0.0..=1.0).contains(&self.aperiodic),
+            "--aperiodic must be between 0 and 1"
+        );
+        ensure!(
+            (0.0..=60.0).contains(&self.voice_gate),
+            "--voice-gate must be between 0 and 60 dB"
         );
         ensure!(
             self.resample_sr == 0 || (16_000..=192_000).contains(&self.resample_sr),
@@ -222,6 +288,10 @@ pub struct Rvc {
     realtime_formant: f32,
     cached_pitch: Vec<(PitchMethod, Pitch)>,
     loading_pitch: Option<(PitchMethod, JoinHandle<Result<Pitch>>)>,
+    /// Spectrogram for source band features, built on first use.
+    band_spectrogram: std::cell::OnceCell<train_losses::MelSpectrogram>,
+    /// Voice / non-voice classifier on the content features, when one ships with the embedder.
+    voice_gate: Option<gate::VoiceGate>,
     #[cfg(feature = "cuda-graph")]
     stream_layout: Option<StreamLayout>,
 }
@@ -259,8 +329,10 @@ impl Rvc {
             let speaker = synth.info.speaker(speaker)?;
             let index = index.map(|path| Index::load(path, width)).transpose()?;
             measure("load-generator-and-index");
-            let hubert =
-                Hubert::load_with_kind(&paths.root.join("assets/hubert_base"), device, kind)?;
+            let embedder = synth.info.format.embedder;
+            let directory = embedder.install(paths, |_| std::ops::ControlFlow::Continue(()))?;
+            let hubert = Hubert::load(&directory, device, kind, synth.info.format.normalize_input)?;
+            let voice_gate = gate::VoiceGate::load(&directory.join("voice_gate.json"), width, device)?;
             measure("load-hubert");
             let f0 = if synth.info.uses_f0 {
                 Some(Pitch::load(settings.f0_method, paths, device, kind)?)
@@ -282,6 +354,8 @@ impl Rvc {
                 realtime_formant: settings.formant,
                 cached_pitch: Vec::new(),
                 loading_pitch: None,
+                band_spectrogram: std::cell::OnceCell::new(),
+                voice_gate,
                 #[cfg(feature = "cuda-graph")]
                 stream_layout: None,
             })
@@ -293,12 +367,82 @@ impl Rvc {
     }
 
     pub fn convert(&self, samples: &[f32], settings: ConversionSettings) -> Result<Audio> {
-        settings.validate()?;
-        ensure!(samples.len() > FRAME, "input audio is shorter than 10 ms");
-        no_grad(|| self.convert_file(samples, settings))
+        self.convert_hires(samples, None, settings)
     }
 
-    fn convert_file(&self, samples: &[f32], settings: ConversionSettings) -> Result<Audio> {
+    /// Whether the generator reads the source above 8 kHz: pass the recording at
+    /// [`Self::rate`] to [`Self::convert_hires`] so sibilants keep their color.
+    pub fn uses_bands(&self) -> bool {
+        self.synth.uses_bands()
+    }
+
+    /// Convert 16 kHz `samples`, with the same recording at the model rate in `hires`.
+    pub fn convert_hires(
+        &self,
+        samples: &[f32],
+        hires: Option<&[f32]>,
+        settings: ConversionSettings,
+    ) -> Result<Audio> {
+        settings.validate()?;
+        ensure!(samples.len() > FRAME, "input audio is shorter than 10 ms");
+        no_grad(|| self.convert_file(samples, hires, settings, None))
+    }
+
+    pub(crate) fn convert_registered(
+        &self,
+        samples: &[f32],
+        hires: Option<&[f32]>,
+        settings: ConversionSettings,
+        profile: Option<&register::Profile>,
+    ) -> Result<Audio> {
+        settings.validate()?;
+        ensure!(samples.len() > FRAME, "input audio is shorter than 10 ms");
+        no_grad(|| self.convert_file(samples, hires, settings, Some(profile)))
+    }
+
+    /// Source band features [1, frames, bands] for the padded 16 kHz analysis audio.
+    fn band_features(&self, hires: &[f32], padding: usize, frames: usize) -> Result<Tensor> {
+        let rate = self.rate();
+        let pad = padding * rate as usize;
+        let padded = audio::reflect(hires, pad, pad);
+        let mel = match self.band_spectrogram.get() {
+            Some(mel) => mel,
+            None => {
+                let config = train_losses::MelConfig {
+                    fft: 2048,
+                    hop: i64::from(rate / 100),
+                    window: 2048,
+                    sample_rate: rate,
+                    mel_bins: 80,
+                    minimum: 0.0,
+                    maximum: None,
+                };
+                let mel = train_losses::MelSpectrogram::new(config, self.device)?;
+                self.band_spectrogram.get_or_init(|| mel)
+            }
+        };
+        let wave = Tensor::f_from_slice(&padded)?
+            .to_device(self.device)
+            .unsqueeze(0);
+        let features = synth::bands::from_spectrogram(&mel.spectrogram(&wave)?, rate)?;
+        let available = features.size()[1];
+        let frames = frames as i64;
+        let features = if available >= frames {
+            features.narrow(1, 0, frames)
+        } else {
+            let last = features.narrow(1, available - 1, 1);
+            Tensor::cat(&[features, last.repeat([1, frames - available, 1])], 1)
+        };
+        Ok(features.to_kind(self.kind))
+    }
+
+    fn convert_file(
+        &self,
+        samples: &[f32],
+        hires: Option<&[f32]>,
+        settings: ConversionSettings,
+        registration: Option<Option<&register::Profile>>,
+    ) -> Result<Audio> {
         let mut measure = phase_timer(self.device);
         let rate = self.rate();
         let low_memory = match self.device {
@@ -321,12 +465,58 @@ impl Rvc {
         let padded = audio::reflect(&audio, pad, pad);
         measure("prepare-wave");
         let source_frames = padded.len() / FRAME;
-        let pitch = self.f0(&padded, settings.pitch, false)?.map(|mut pitch| {
+        let mut pitch = if let (Some(profile), Some(estimator)) = (registration, self.f0.as_ref()) {
+            // Decide the register from the actual recording, without reflected context.
+            let offset = pad / FRAME;
+            let end = offset + audio.len() / FRAME;
+            let mut raw = estimator.extract(&padded, None)?;
+            raw.resize(source_frames, 0.0);
+            register::match_pitch(&mut raw[offset..end], settings.pitch, profile)?;
+            let center = &raw[offset..end];
+            Some(audio::reflect(center, offset, source_frames - end))
+        } else {
+            self.f0(&padded, settings.pitch, false)?
+        };
+        if let Some(pitch) = &mut pitch {
             pitch.resize(source_frames, 0.0);
-            pitch
-        });
+            if settings.aperiodic > 0.0 {
+                aperiodic::unvoice_fricatives(&padded, pitch);
+            }
+            if let Some(path) = std::env::var_os("RVC_F0_OVERRIDE") {
+                // Debugging aid: replace the F0 track (10 ms frames, without the padding).
+                let offset = (pad / FRAME).min(pitch.len());
+                let text = std::fs::read_to_string(path)?;
+                for (hz, line) in pitch[offset..].iter_mut().zip(text.lines()) {
+                    *hz = line.trim().parse().unwrap_or(0.0);
+                }
+            }
+            if let Some(path) = std::env::var_os("RVC_DUMP_F0") {
+                // Debugging aid: the F0 track (10 ms frames, without the reflected padding).
+                let offset = (pad / FRAME).min(pitch.len());
+                let text: String = pitch[offset..].iter().map(|hz| format!("{hz:.1}\n")).collect();
+                std::fs::write(path, text)?;
+            }
+        }
         measure("f0");
+        let bands = if self.synth.uses_bands() {
+            let resampled;
+            let hires = hires.filter(|_| std::env::var_os("RVC_BANDS_NARROW").is_none());
+            let source = match hires {
+                Some(hires) => hires,
+                None => {
+                    // Without the original the bands above 8 kHz read as silence.
+                    resampled = audio::resample(&audio, ANALYSIS_RATE, rate);
+                    &resampled
+                }
+            };
+            Some(self.band_features(source, padding, source_frames)?)
+        } else {
+            None
+        };
+        measure("bands");
         let mut result = Vec::new();
+        let gate = self.voice_gate.as_ref().filter(|_| settings.voice_gate > 0.0);
+        let mut voice_probability = vec![1.0_f32; if gate.is_some() { source_frames } else { 0 }];
         let mut start = 0;
         for cut in cuts.into_iter().chain(std::iter::once(audio.len())) {
             let last = cut == audio.len();
@@ -344,6 +534,19 @@ impl Rvc {
             let features = self.features(samples, settings.index_rate, 0, false)?;
             measure("hubert-and-retrieval");
             let actual_frames = (features.0.size()[1] as usize).min(input_frames);
+            if let Some(gate) = gate {
+                // The gate reads the source's own features, before any index retrieval.
+                let raw = features.1.as_ref().unwrap_or(&features.0);
+                let probability = gate.probability(raw)?;
+                let first = if start == 0 { 0 } else { pad / FRAME };
+                let last = actual_frames.min(probability.len());
+                for (frame, &p) in probability.iter().enumerate().take(last).skip(first) {
+                    if let Some(slot) = voice_probability.get_mut(start / FRAME + frame) {
+                        *slot = p;
+                    }
+                }
+                measure("voice-gate");
+            }
             let pitch = pitch
                 .as_ref()
                 .map(|pitch| &pitch[start / FRAME..start / FRAME + actual_frames]);
@@ -356,10 +559,33 @@ impl Rvc {
                 trim_frames: (pad / FRAME) as i64,
                 ..Default::default()
             };
-            let output = self.generate(features, pitch, settings, window, false)?;
+            let bands = bands
+                .as_ref()
+                .map(|bands| bands.narrow(1, (start / FRAME) as i64, actual_frames as i64));
+            let output = self.generate(features, pitch, bands.as_ref(), settings, window, false)?;
             measure("generator");
             result.extend(output);
             start = cut;
+        }
+        if settings.aperiodic > 0.0
+            && let Some(pitch) = &pitch
+        {
+            let resampled;
+            let source = match hires {
+                Some(hires) => hires,
+                None => {
+                    resampled = audio::resample(&audio, ANALYSIS_RATE, rate);
+                    &resampled
+                }
+            };
+            let offset = (pad / FRAME).min(pitch.len());
+            let source = aperiodic::Source {
+                audio: source,
+                pitch: &pitch[offset..],
+                bandwidth: aperiodic::bandwidth(source, rate),
+            };
+            aperiodic::transfer(&mut result, &source, rate, settings.aperiodic);
+            measure("aperiodic");
         }
         if settings.rms_mix_rate != 1.0 {
             mix_rms(
@@ -369,6 +595,18 @@ impl Rvc {
                 rate,
                 settings.rms_mix_rate,
             );
+        }
+        if gate.is_some() {
+            let offset = (pad / FRAME).min(voice_probability.len());
+            let gains = gate::gains(&voice_probability[offset..], &audio, settings.voice_gate);
+            gate::apply(&mut result, &gains, rate);
+            measure("voice-gate-apply");
+        }
+        if settings.level_guard {
+            // The 16 kHz analysis audio lacks the top octave: 2 dB of room covers it.
+            let reference = audio::resample(&audio, ANALYSIS_RATE, rate);
+            audio::hold_under(&mut result, &reference, rate, 2.0);
+            measure("level-guard");
         }
         let rate_out = if settings.resample_sr == 0 {
             rate
@@ -468,6 +706,7 @@ impl Rvc {
         self.f0.as_ref().map(|_| self.pitch_method)
     }
 
+    #[cfg(feature = "realtime")]
     pub(crate) fn set_index(&mut self, path: &Path) -> Result<()> {
         if self.index.is_none() {
             let width = if self.synth.info.version == "v2" {
@@ -556,7 +795,15 @@ impl Rvc {
                 frames: frames as i64,
                 ..Default::default()
             };
-            let output = self.generate(features, pitch, settings, window, true)?;
+            // The stream arrives at 16 kHz, so its band features stop at 8 kHz.
+            // Training sees such band-limited sources too (see synth::bands).
+            let bands = if self.synth.uses_bands() {
+                let hires = audio::resample(samples, ANALYSIS_RATE, self.rate());
+                Some(self.band_features(&hires, 0, features.0.size()[1] as usize)?)
+            } else {
+                None
+            };
+            let output = self.generate(features, pitch, bands.as_ref(), settings, window, true)?;
             measure("realtime-generator");
             #[cfg(feature = "cuda-graph")]
             if context_changed
@@ -610,7 +857,9 @@ impl Rvc {
         };
         let pool = realtime.then(|| self.hubert.graph.borrow());
         let mut pitch = f0.extract(audio, pool.as_deref())?;
-        interpolate_voiced(&mut pitch);
+        if self.synth.info.format.f0_unvoiced == Unvoiced::Interpolate {
+            interpolate_voiced(&mut pitch);
+        }
         let ratio = (semitones / 12.0).exp2();
         pitch.iter_mut().for_each(|hz| *hz *= ratio);
         Ok(Some(pitch))
@@ -620,13 +869,16 @@ impl Rvc {
         &self,
         features: (Tensor, Option<Tensor>),
         f0: Option<&[f32]>,
+        bands: Option<&Tensor>,
         settings: ConversionSettings,
         mut window: Window,
         stream: bool,
     ) -> Result<Vec<f32>> {
         let (mut phone, original) = features;
         let available = f0.map_or(phone.size()[1], |hz| phone.size()[1].min(hz.len() as i64));
+        let available = bands.map_or(available, |bands| available.min(bands.size()[1]));
         phone = phone.narrow(1, 0, available);
+        let bands = bands.map(|bands| bands.narrow(1, 0, available));
         let stretch = (settings.formant / 12.0).exp2();
         let frames = window.frames as usize;
         let stretched = (frames as f32 * stretch).ceil() as usize;
@@ -665,12 +917,13 @@ impl Rvc {
             self.synth.infer_realtime(
                 &phone,
                 pitch,
+                bands.as_ref(),
                 self.speaker,
                 window,
                 &self.hubert.graph.borrow(),
             )?
         } else {
-            self.synth.infer(&phone, pitch, self.speaker, window)?
+            self.synth.infer(&phone, pitch, bands.as_ref(), self.speaker, window)?
         };
         let samples = samples.view([-1]).to_device(Device::Cpu);
         let mut samples = Vec::<f32>::try_from(samples)?;
@@ -690,7 +943,7 @@ impl Rvc {
 fn pitch_input_len(method: PitchMethod, samples: usize, block: usize) -> usize {
     let tail = block * FRAME + 800;
     let tail = match method {
-        PitchMethod::Rmvpe => tail.div_ceil(5_120) * 5_120 - FRAME,
+        PitchMethod::Rmvpe | PitchMethod::Nmvpe => tail.div_ceil(5_120) * 5_120 - FRAME,
         PitchMethod::Pm | PitchMethod::Fcpe => tail,
     };
     tail.min(samples)

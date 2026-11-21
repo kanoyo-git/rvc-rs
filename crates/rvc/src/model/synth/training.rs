@@ -19,14 +19,26 @@ pub struct Output {
 }
 
 impl Synth {
-    pub fn train_batch(&self, batch: &Batch, segment_frames: i64) -> Result<Output> {
+    pub(crate) fn train_batch(
+        &self,
+        batch: &Batch,
+        segment_frames: i64,
+        checkpointing: bool,
+    ) -> Result<Output> {
         let w = &self.weights;
         let inter = self.config.inter;
         let samples = batch.spec.size()[0];
         let speaker = self.speaker(&batch.sid)?;
+        let bands = if self.uses_bands() {
+            let source = batch.band_spec.as_ref().unwrap_or(&batch.spec);
+            Some(super::bands::with_band_limited_examples(source, self.rate)?)
+        } else {
+            None
+        };
         let (m_p, logs_p, _) = self.prior(
             &batch.phone,
             batch.pitch.as_ref(),
+            bands.as_ref(),
             &batch.phone_lengths,
             0,
             true,
@@ -57,7 +69,14 @@ impl Synth {
                     .map(|pitch| pitch.squeeze_dim(1))
             })
             .transpose()?;
-        let audio = self.decode(&latent, pitch.as_ref(), &speaker, segment_frames, 0)?;
+        let audio = self.decode(
+            &latent,
+            pitch.as_ref(),
+            &speaker,
+            segment_frames,
+            0,
+            checkpointing,
+        )?;
         Ok(Output {
             audio,
             starts,
@@ -90,7 +109,8 @@ pub fn generator(
 ) -> Result<(Synth, Vec<(String, Tensor)>)> {
     let m = &config.model;
     let d = &config.data;
-    let c = Config::read(generator_config(config), d.sampling_rate)?;
+    let mut c = Config::read(generator_config(config), d.sampling_rate)?;
+    c.aa = m.dec_aa;
     let hidden = m.hidden_channels;
     let filters = m.filter_channels;
     let inter = m.inter_channels;
@@ -123,6 +143,14 @@ pub fn generator(
             "enc_p.emb_pitch.weight".into(),
             &[256, hidden],
             Initial::Normal(1.0),
+        )?;
+    }
+    if m.hf_bands {
+        // Zero, so a generator trained without bands starts out unchanged.
+        init.param(
+            super::bands::WEIGHT.into(),
+            &[hidden, super::bands::COUNT],
+            Initial::Constant(0.0),
         )?;
     }
     let encoder = "enc_p.encoder";
@@ -268,6 +296,10 @@ pub fn generator(
         uses_f0,
         sample_rate: Some(d.sampling_rate),
         info: None,
+        format: crate::catalog::VoiceFormat {
+            dec_aa: m.dec_aa,
+            ..Default::default()
+        },
     };
     let weights = Weights::new(
         init.params

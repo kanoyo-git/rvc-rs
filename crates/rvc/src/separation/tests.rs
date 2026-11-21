@@ -210,7 +210,7 @@ fn shipped_presets_read_their_model_yaml() -> Result<()> {
         )?;
         assert_eq!(config.channels, 2);
         assert_eq!(config.stems, 1);
-        assert_eq!(config.hop, 441);
+        assert!(matches!(config.hop, 441 | 512), "{}", config.hop);
         assert_eq!(document["training"]["target_instrument"], preset.model_stem);
         if let Bands::Split(widths) = config.bands {
             assert_eq!(widths.iter().sum::<i64>(), config.fft / 2 + 1);

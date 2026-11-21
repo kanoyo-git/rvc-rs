@@ -11,7 +11,13 @@ fn cropped_decoder_preserves_kept_audio() -> Result<()> {
     let hop = i64::from(rate) / 100;
     let latent = Tensor::arange(frames, options).view([1, 1, frames]) / frames as f64 - 0.5;
     let speaker = Tensor::full([1, 1, 1], 0.3, options);
-    for (resblock, upsample_kernels) in [(1, [8, 6]), (2, [6, 6]), (2, [7, 6])] {
+    for (resblock, upsample_kernels, aa) in [
+        (1, [8, 6], false),
+        (2, [6, 6], false),
+        (2, [7, 6], false),
+        (1, [8, 6], true),
+        (2, [6, 6], true),
+    ] {
         let mut weights = HashMap::new();
         let mut kernel = |name: String, size| {
             let tensor = Tensor::arange(size, options).view([1, 1, size]) / size as f64 * 0.1;
@@ -43,6 +49,7 @@ fn cropped_decoder_preserves_kept_audio() -> Result<()> {
                 uses_f0: false,
                 sample_rate: Some(rate),
                 info: None,
+                format: Default::default(),
             },
             rate,
             weights: Weights::new(weights),
@@ -58,15 +65,16 @@ fn cropped_decoder_preserves_kept_audio() -> Result<()> {
                 dilations: vec![vec![1, 3, 5]],
                 upsample_rates: vec![4, 4],
                 upsample_kernels: upsample_kernels.to_vec(),
+                aa,
             },
             graph: RefCell::default(),
         };
-        let full = decoder.decode(&latent, None, &speaker, frames, 0)?;
-        let cropped = decoder.decode(&latent, None, &speaker, frames, trim)?;
+        let full = decoder.decode(&latent, None, &speaker, frames, 0, false)?;
+        let cropped = decoder.decode(&latent, None, &speaker, frames, trim, false)?;
         let expected = full.narrow(2, trim * hop, full.size()[2] - 2 * trim * hop);
         assert_eq!(cropped.size(), expected.size());
         let error = f64::try_from((cropped - expected).abs().max())?;
-        assert!(error < 1e-6, "resblock {resblock}, error {error}");
+        assert!(error < 1e-6, "resblock {resblock}, aa {aa}, error {error}");
     }
     Ok(())
 }

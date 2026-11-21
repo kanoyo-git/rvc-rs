@@ -6,6 +6,7 @@ use serde_json::{Value as Json, json};
 use tch::{Device, Kind, Tensor};
 
 use super::train_data::{Config, Version};
+use crate::catalog::{Unvoiced, VoiceFormat};
 use crate::checkpoint::{
     Checkpoint,
     write::{self, Key, Value},
@@ -63,6 +64,10 @@ pub fn merge(
         let mut first = Checkpoint::open(first)?;
         let mut second = Checkpoint::open(second)?;
         let mut metadata = first.compact_metadata()?;
+        ensure!(
+            VoiceFormat::read(&first, None)? == VoiceFormat::read(&second, None)?,
+            "model embedders, pitch or noise settings differ"
+        );
         for key in ["config", "f0", "version"] {
             let one = first.metadata(key)?;
             let two = second.metadata(key)?;
@@ -129,6 +134,10 @@ pub fn merge_legacy(
     tch::no_grad(|| {
         let mut first = Checkpoint::open(first)?;
         let mut second = Checkpoint::open(second)?;
+        ensure!(
+            VoiceFormat::read(&first, None)? == VoiceFormat::read(&second, None)?,
+            "model embedders, pitch or noise settings differ"
+        );
         let mut metadata = BTreeMap::from([
             (
                 "config".into(),
@@ -141,6 +150,11 @@ pub fn merge_legacy(
             ("version".into(), json!(options.version.name())),
             ("info".into(), json!(options.description)),
         ]);
+        for key in ["embedder_model", "nvc"] {
+            if let Some(value) = first.metadata(key)? {
+                metadata.insert(key.into(), value);
+            }
+        }
         let speakers = |file: &Checkpoint| -> Result<BTreeMap<i64, String>> {
             let mut speakers = BTreeMap::new();
             if let Some(Json::Array(entries)) = file.metadata("speaker_info")? {
@@ -259,6 +273,34 @@ pub fn compact(
     ]);
     if !config.speaker_info.is_empty() {
         metadata.insert("speaker_info".into(), json!(config.speaker_info));
+    }
+    let embedder = config.embedder_model.unwrap_or_default();
+    if config.embedder_model.is_some()
+        || config.data.f0_unvoiced == Unvoiced::Zero
+        || config.data.default_noise_scale != 0.66666
+        || config.model.dec_aa
+        || config.model.hf_bands
+    {
+        let augmentation = config
+            .data
+            .content_aug
+            .as_ref()
+            .filter(|options| options.prob > 0.0)
+            .map(|options| {
+                json!({
+                    "prob": options.prob, "mix_range": options.mix_range, "kind": options.kind,
+                })
+            });
+        metadata.insert("embedder_model".into(), json!(embedder));
+        metadata.insert("nvc".into(), json!({
+            "format": "nvc", "format_version": 1,
+            "architecture": format!("rvc-{}-{}", options.version.name(), if options.uses_f0 { "nsf" } else { "nono" }),
+            "embedder": embedder, "sample_rate": options.sample_rate,
+            "hop_length": config.data.hop_length, "content_frame_rate": 50, "f0_frame_rate": 100,
+            "f0_unvoiced": config.data.f0_unvoiced, "content_aug": augmentation,
+            "default_noise_scale": config.data.default_noise_scale,
+            "dec_aa": config.model.dec_aa, "hf_bands": config.model.hf_bands,
+        }));
     }
     let state: BTreeMap<_, _> = state
         .into_iter()

@@ -26,7 +26,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tower_http::services::ServeFile;
 
 use super::{Shared, lock};
-use rvc::model::weights;
+use crate::model::weights;
 
 const MAX_MESSAGE: usize = 192 * 1024 * 1024; // Includes base64 audio.
 const QUEUE_SIZE: usize = 1022;

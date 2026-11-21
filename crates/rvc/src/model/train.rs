@@ -1,4 +1,6 @@
-mod events;
+pub(super) mod activation;
+mod ema;
+pub(crate) mod events;
 mod parallel;
 mod precision;
 mod step;
@@ -20,15 +22,17 @@ use super::edit::{self, Export};
 use super::optimizer::{AdamW, ExponentialLr};
 use super::synth::training::generator;
 use super::train_data::{self, PrepareRequest, SpeakerMode, Version};
-use super::train_losses::{self, MelConfig, MelSpectrogram};
+use super::train_losses::{
+    self, MelConfig, MelSpectrogram, MultiResolutionStft, MultiScaleMel, PhoneticLoss,
+};
 use super::weights;
-use crate::catalog::Paths;
+use crate::catalog::{Embedder, Paths, Unvoiced};
 use crate::checkpoint::{
     Checkpoint,
     write::{self, Value},
 };
 use events::Events;
-use precision::GradScaler;
+use precision::{GradScaler, Precision};
 
 #[derive(clap::Args, Deserialize)]
 #[serde(default)]
@@ -67,9 +71,65 @@ pub struct Request {
     pub gpus: Vec<usize>,
     #[arg(long, action = clap::ArgAction::Set)]
     pub fp16: Option<bool>,
+    /// Use BF16 autocast and compact optimizer state on CUDA.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub bf16: Option<bool>,
+    /// Recompute generator decoder blocks during backward to save memory.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub gradient_checkpointing: Option<bool>,
+    /// Embedder used when extracting this experiment's content features.
+    #[arg(long, value_enum)]
+    pub embedder: Option<Embedder>,
+    /// Generate and blend NVC-TS variants from an NVC feature pool.
+    #[arg(long)]
+    pub timbre_shift_pool: Option<PathBuf>,
+    /// Pool speakers to exclude from NVC-TS substitution.
+    #[arg(long, value_delimiter = ',')]
+    pub timbre_shift_exclude: Vec<String>,
     #[arg(long)]
     #[serde(alias = "if_cache_data_in_gpu")]
     pub cache_data_in_gpu: bool,
+    #[arg(long)]
+    pub multiscale_mel: bool,
+    /// Export an exponential moving average of generator weights with this decay
+    /// (0 disables it, 0.999 averages roughly the last thousand steps).
+    #[arg(long, default_value_t = 0.0)]
+    pub ema_decay: f64,
+    /// Add multi-resolution spectrogram discriminators (MRD) to MPD/MSD.
+    #[arg(long)]
+    pub mrd: bool,
+    /// Weight of the multi-resolution STFT loss (0 disables it).
+    #[arg(long, default_value_t = 0.0)]
+    pub stft_loss: f64,
+    /// Weight of the phonetic loss: L1 between frozen speech-encoder features of real
+    /// and generated audio (0 disables it). Sharpens articulation.
+    #[arg(long, default_value_t = 0.0)]
+    pub phonetic_loss: f64,
+    /// Train only generator parameters whose names start with these prefixes (for example
+    /// `enc_p` to fit a new content encoder while the decoder, flow and posterior stay frozen).
+    #[arg(long, value_delimiter = ',')]
+    pub train_only: Vec<String>,
+    /// Encoder for the phonetic loss. mHuBERT-147 covers Russian and 146 other languages.
+    #[arg(long, value_enum, default_value = "mhubert147")]
+    pub phonetic_encoder: Embedder,
+    /// F0 on unvoiced frames: `interpolate` (RVC) or `zero` (NVC). Requires raw F0 from extraction.
+    #[arg(long, value_enum)]
+    pub unvoiced_f0: Option<Unvoiced>,
+    /// Condition the content encoder on the source's 2-16 kHz band shape, so sibilants keep
+    /// their color. Turned on automatically when the pretrained generator has these weights.
+    #[arg(long)]
+    pub hf_bands: bool,
+    /// Run decoder activations anti-aliased (BigVGAN-style), against metallic artifacts.
+    /// Turned on automatically when the pretrained generator was trained this way.
+    #[arg(long)]
+    pub dec_aa: bool,
+    /// Layered copy of this experiment (from `layer-aug` + `extract`): inputs are read from it
+    /// for a `--layer-aug-prob` share of examples while the target stays clean, so stacked
+    /// doubles, harmonies and reverb in a song do not turn into artifacts.
+    #[arg(long)]
+    pub layer_aug: Option<PathBuf>,
+    #[arg(long, default_value_t = 0.5)]
+    pub layer_aug_prob: f64,
     #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     pub tensorboard: bool,
     #[arg(long)]
@@ -101,7 +161,24 @@ impl Default for Request {
             device: "auto".into(),
             gpus: Vec::new(),
             fp16: None,
+            bf16: None,
+            gradient_checkpointing: None,
+            embedder: None,
+            timbre_shift_pool: None,
+            timbre_shift_exclude: Vec::new(),
             cache_data_in_gpu: false,
+            multiscale_mel: false,
+            ema_decay: 0.0,
+            mrd: false,
+            stft_loss: 0.0,
+            phonetic_loss: 0.0,
+            train_only: Vec::new(),
+            phonetic_encoder: Embedder::Mhubert147,
+            unvoiced_f0: None,
+            hf_bands: false,
+            dec_aa: false,
+            layer_aug: None,
+            layer_aug_prob: 0.5,
             tensorboard: true,
             pretrained_g: None,
             pretrained_d: None,
@@ -203,40 +280,125 @@ fn run_on_devices(
             SpeakerMode::Single(request.speaker_id)
         },
     })?;
-    let config = prepared.config;
-    let dataset = prepared.dataset;
-    let train = &config.train;
-    let batch_size = request.batch_size.unwrap_or(train.batch_size);
+    let mut config = prepared.config;
+    let mut dataset = prepared.dataset;
+    let extracted = super::extract::feature_embedder(&experiment, version)?;
+    let embedder = request
+        .embedder
+        .or(extracted)
+        .or(config.embedder_model)
+        .unwrap_or_default();
+    embedder.supports(version.name())?;
+    ensure!(
+        extracted
+            .or(config.embedder_model)
+            .is_none_or(|source| source == embedder),
+        "cached features use {}. Extract features with {} before training.",
+        extracted
+            .or(config.embedder_model)
+            .unwrap_or_default()
+            .name(),
+        embedder.name()
+    );
+    let pair = newest_pair(&experiment)?;
+    ensure!(
+        !(request.fresh && pair.is_some()),
+        "--fresh requires an experiment without existing model checkpoints"
+    );
+    if pair.is_some() {
+        ensure!(
+            config.embedder_model.unwrap_or_default() == embedder,
+            "cannot resume with another embedder. Use the original features or a new experiment."
+        );
+    }
+    config.embedder_model = Some(embedder);
+    ensure!(
+        request.stft_loss.is_finite() && request.stft_loss >= 0.0,
+        "STFT loss weight must be a non-negative number"
+    );
+    ensure!(
+        request.phonetic_loss.is_finite() && request.phonetic_loss >= 0.0,
+        "phonetic loss weight must be a non-negative number"
+    );
+    if let Some(pool) = &request.timbre_shift_pool {
+        config.data.content_aug = if pool.as_os_str().is_empty() {
+            config.data.f0_unvoiced = Unvoiced::Interpolate;
+            None
+        } else {
+            let mut options = config
+                .data
+                .content_aug
+                .take()
+                .filter(|options| options.pool.as_ref() == Some(pool))
+                .unwrap_or_else(|| super::timbre::Options::knn(pool.clone(), Vec::new()));
+            options.exclude.clone_from(&request.timbre_shift_exclude);
+            Some(options)
+        };
+    } else if !request.timbre_shift_exclude.is_empty() {
+        let options = config
+            .data
+            .content_aug
+            .as_mut()
+            .context("select a feature pool to exclude speakers")?;
+        options.exclude.clone_from(&request.timbre_shift_exclude);
+    }
+    if let Some(unvoiced) = request.unvoiced_f0 {
+        ensure!(
+            pair.is_none() || config.data.f0_unvoiced == unvoiced,
+            "cannot change the unvoiced F0 mode when resuming"
+        );
+        config.data.f0_unvoiced = unvoiced;
+    } else if pair.is_none() && request.f0 && dataset.has_raw_pitch(&paths.experiments.join("mute"))
+    {
+        // New experiments keep F0 at zero on unvoiced frames, as the extracted
+        // pitch says, instead of interpolating through consonants and breaths.
+        // This lowered voiced/unvoiced errors by about a third in our tests.
+        config.data.f0_unvoiced = Unvoiced::Zero;
+    }
+    let device = devices[0];
+    let bf16 = request.bf16.unwrap_or(config.train.bf16);
+    let checkpointing = request
+        .gradient_checkpointing
+        .unwrap_or(config.train.gradient_checkpointing);
+    let precision = Precision::choose(devices, request.fp16, bf16)?;
+    config.train.bf16 = bf16;
+    config.train.gradient_checkpointing = checkpointing;
+    let mut resume = pair
+        .map(|(_, g, d)| -> Result<_> { Ok((Checkpoint::open(&g)?, Checkpoint::open(&d)?)) })
+        .transpose()?;
+    let (first, saved_step) = resume
+        .as_ref()
+        .map_or(Ok((1, None)), |(g, d)| resume_position(g, d))?;
+    ensure!(
+        first <= request.epochs,
+        "next training epoch {first} exceeds requested final epoch {}",
+        request.epochs
+    );
+    let batch_size = request.batch_size.unwrap_or(config.train.batch_size);
     ensure!(
         (1..=256).contains(&batch_size),
         "batch size must be between 1 and 256"
     );
     ensure!(
-        train.log_interval != 0 && train.segment_size.rem_euclid(config.data.hop_length) == 0,
+        config.train.log_interval != 0
+            && config.train.segment_size.rem_euclid(config.data.hop_length) == 0,
         "invalid training log interval or segment size"
     );
-    let device = devices[0];
-    let mut automatic_fp16 = true;
-    let mut all_cuda = true;
-    for &rank_device in devices {
-        if let Device::Cuda(index) = rank_device {
-            let profile = weights::cuda_profile(index);
-            if let Some(profile) = profile {
-                ensure!(
-                    profile.eligible(),
-                    "CUDA device {index} does not meet the training memory or capability requirements"
-                );
-            }
-            automatic_fp16 &= profile.is_some_and(|profile| profile.fp16);
-        } else {
-            all_cuda = false;
-        }
-    }
     ensure!(
-        all_cuda || request.fp16 != Some(true),
-        "FP16 training requires CUDA devices"
+        !request.multiscale_mel || config.train.segment_size > 1024,
+        "multi-scale mel requires training segments longer than 1024 samples"
     );
-    let amp = all_cuda && request.fp16.unwrap_or(automatic_fp16);
+    dataset.configure_timbre(paths, &experiment, &mut config, device, &mut progress)?;
+    if let Some(directory) = &request.layer_aug {
+        dataset.configure_layers(paths.root.join(directory), request.layer_aug_prob)?;
+    }
+    if resume.is_none() {
+        let (bands, aa) = pretrained_architecture(paths, &request)?;
+        config.model.hf_bands = request.hf_bands || bands;
+        config.model.dec_aa = request.dec_aa || aa;
+    }
+    config.save(&experiment)?;
+    let train = &config.train;
     let mel_config = MelConfig {
         fft: config.data.filter_length,
         hop: config.data.hop_length,
@@ -247,33 +409,50 @@ fn run_on_devices(
         maximum: config.data.mel_fmax,
     };
     let mel = MelSpectrogram::new(mel_config, device)?;
+    let multiscale = request
+        .multiscale_mel
+        .then(|| MultiScaleMel::new(request.sample_rate, device))
+        .transpose()?;
+    let phonetic_directory = request.phonetic_encoder.directory(paths);
+    let auxiliary = step::Auxiliary {
+        stft: (request.stft_loss > 0.0)
+            .then(|| MultiResolutionStft::new(device))
+            .transpose()?,
+        phonetic: (request.phonetic_loss > 0.0)
+            .then(|| {
+                PhoneticLoss::new(
+                    &phonetic_directory,
+                    i64::from(request.sample_rate),
+                    device,
+                    precision.kind(),
+                )
+            })
+            .transpose()?,
+    };
 
     tch::manual_seed(train.seed);
-    let pair = newest_pair(&experiment)?;
-    ensure!(
-        !(request.fresh && pair.is_some()),
-        "--fresh requires an experiment without existing model checkpoints"
-    );
-    let mut resume = pair
-        .map(|(_, g, d)| -> Result<_> { Ok((Checkpoint::open(&g)?, Checkpoint::open(&d)?)) })
-        .transpose()?;
-    let first = if let Some((g, d)) = &resume {
-        pair_epoch(g, d)?
-    } else {
-        1
-    };
-    ensure!(
-        first <= request.epochs,
-        "saved checkpoint epoch {first} exceeds requested final epoch {}",
-        request.epochs
-    );
-    let precision = if amp { "FP16 mixed precision" } else { "FP32" };
+    // Training shapes repeat (bucketed clip lengths, fixed decoder segments), so cuDNN
+    // autotuning pays off after the first few steps. `RVC_CUDNN_BENCHMARK=0` disables it.
+    if devices
+        .iter()
+        .all(|device| matches!(device, Device::Cuda(_)))
+        && std::env::var("RVC_CUDNN_BENCHMARK").map_or(true, |value| value != "0")
+    {
+        tch::Cuda::cudnn_set_benchmark(true);
+    }
+    let precision_name = precision.name();
     let starting = format!(
-        "Training on {} input rows at {devices:?} ({precision}) starting with epoch {first}",
-        dataset.sample_count()
+        "Training on {} input rows at {devices:?} ({precision_name}, gradient checkpointing {checkpointing}, {}, NVC-TS {}) starting with epoch {first}",
+        dataset.sample_count(),
+        embedder.name(),
+        config
+            .data
+            .content_aug
+            .as_ref()
+            .is_some_and(|options| options.prob > 0.0)
     );
     notify(&mut progress, &starting)?;
-    let mut scaler = GradScaler::new(amp);
+    let mut scaler = GradScaler::new(precision == Precision::Fp16);
     let mut writer = if request.tensorboard {
         Events::new(&experiment.join("eval"))?;
         Some(Events::new(&experiment)?)
@@ -304,12 +483,20 @@ fn run_on_devices(
         g_weights,
         resume.is_some(),
     )?;
+    ensure!(
+        request.ema_decay.is_finite() && (0.0..1.0).contains(&request.ema_decay),
+        "EMA decay must be in [0, 1)"
+    );
+    // Resumed runs start the average from the restored weights.
+    let mut ema = (request.ema_decay > 0.0)
+        .then(|| ema::Ema::new(&g_params, request.ema_decay))
+        .transpose()?;
     let v2 = matches!(version, Version::V2);
     let spectral = config.model.use_spectral_norm;
     let mut discriminator = if d_weights.is_empty() {
-        Discriminator::new(v2, spectral, device)?
+        Discriminator::new(v2, spectral, request.mrd, device)?
     } else {
-        Discriminator::from_weights(v2, spectral, device, d_weights)?
+        Discriminator::from_weights(v2, spectral, request.mrd, device, d_weights)?
     };
     let replicas = devices.len();
     let mut peers = Vec::with_capacity(replicas - 1);
@@ -320,6 +507,16 @@ fn run_on_devices(
             version,
             f0: request.f0,
             mel: mel_config,
+            multiscale: request.multiscale_mel,
+            stft: request.stft_loss > 0.0,
+            phonetic: (request.phonetic_loss > 0.0).then(|| {
+                (
+                    phonetic_directory.as_path(),
+                    i64::from(request.sample_rate),
+                    precision.kind(),
+                )
+            }),
+            resolution: discriminator.has_resolution_branches(),
             generator: &g_params,
             discriminator: &state,
         };
@@ -327,23 +524,52 @@ fn run_on_devices(
             peers.push(parallel::Replica::new(device, &initial)?);
         }
     }
+    let trainable = |name: &str| {
+        request.train_only.is_empty()
+            || request
+                .train_only
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str()))
+    };
+    let mut frozen_note = None;
+    if !request.train_only.is_empty() {
+        ensure!(
+            replicas == 1,
+            "--train-only supports a single training device"
+        );
+        let mut count = 0;
+        for (name, tensor) in &g_params {
+            if trainable(name) {
+                count += tensor.numel();
+            } else {
+                let _ = tensor.shallow_clone().set_requires_grad(false);
+            }
+        }
+        ensure!(count > 0, "--train-only matched no generator parameters");
+        frozen_note = Some(format!(
+            "Training {count} generator parameters; the rest stay frozen"
+        ));
+    }
     let mut g = AdamW::new(
         g_params
             .iter()
+            .filter(|(name, _)| trainable(name))
             .map(|(name, tensor)| (name.clone(), tensor.shallow_clone()))
             .collect(),
         train.learning_rate,
         train.betas,
         train.eps,
-    )?;
+    )?
+    .with_bf16(bf16);
     let mut d = AdamW::new(
         discriminator.parameters(),
         train.learning_rate,
         train.betas,
         train.eps,
-    )?;
+    )?
+    .with_bf16(bf16);
     if let Some((mut g_source, mut d_source)) = resume.take() {
-        if !resized_speaker_embedding {
+        if !resized_speaker_embedding && request.train_only.is_empty() {
             g.restore(g_source.adamw_state()?)?;
         }
         d.restore(d_source.adamw_state()?)?;
@@ -357,6 +583,9 @@ fn run_on_devices(
         .len();
     let mut log = training_log(&experiment, &request)?;
     writeln!(log, "{starting}").context("writing train.log")?;
+    if let Some(note) = &frozen_note {
+        log_progress(&mut log, &mut progress, note)?;
+    }
     if resized_speaker_embedding {
         log_progress(
             &mut log,
@@ -364,18 +593,25 @@ fn run_on_devices(
             "Resetting the generator optimizer after resizing the speaker embedding",
         )?;
     }
-    let mut global = (first - 1)
-        .checked_mul(steps_per_epoch)
-        .context("global step overflow")?;
+    let mut global = match saved_step {
+        Some(step) => step,
+        None => (first - 1)
+            .checked_mul(steps_per_epoch)
+            .context("global step overflow")?,
+    };
     let step = step::Settings {
-        amp,
+        precision,
+        checkpointing,
         segment_frames: train.segment_size / config.data.hop_length,
         hop_length: config.data.hop_length,
         segment_size: train.segment_size,
         c_mel: train.c_mel,
         c_kl: train.c_kl,
+        c_stft: request.stft_loss,
+        c_phonetic: request.phonetic_loss,
     };
     let mut cached = Vec::new();
+    let mut profile = Profile::new(device);
     for epoch in first..=request.epochs {
         let batches = if cached.is_empty() {
             dataset.batches(batch_size, epoch as u64, replicas, 0)?
@@ -392,7 +628,12 @@ fn run_on_devices(
                         batches.len()
                     ),
                 )?;
-                cached.push(dataset.load_batch(indices, device, |x| mel.spectrogram(x))?);
+                cached.push(dataset.load_batch_seeded(
+                    indices,
+                    device,
+                    batch_seed(train.seed, epoch, index, 0),
+                    |x| mel.spectrogram(x),
+                )?);
             }
         }
         let batch_count = if cached.is_empty() {
@@ -410,6 +651,7 @@ fn run_on_devices(
                 &dataset,
                 batches,
                 request.cache_data_in_gpu,
+                |index| batch_seed(train.seed, epoch, index, rank + 1),
                 &mut progress,
             )?;
             ensure!(
@@ -422,109 +664,201 @@ fn run_on_devices(
             let seed = train.seed as u64 ^ (epoch as u64).rotate_left(17);
             order.shuffle(&mut StdRng::seed_from_u64(seed));
         }
-        for (i, index) in order.into_iter().enumerate() {
-            notify(
-                &mut progress,
-                &format!(
-                    "Epoch {epoch}/{} · batch {}/{batch_count}",
-                    request.epochs,
-                    i + 1
-                ),
-            )?;
-            let loaded;
-            let batch = if let Some(batch) = cached.get(index) {
-                batch
-            } else {
-                loaded = dataset.load_batch(&batches[index], device, |x| mel.spectrogram(x))?;
-                &loaded
-            };
-            let write_event = writer.is_some() && global.is_multiple_of(train.log_interval);
-            let forward = step.generate(&generator, batch)?;
-            let loss_d = step.discriminate(&mut discriminator, &forward)?;
-            let mut metrics = if write_event {
-                discriminator_metrics(&loss_d.real_scores, &loss_d.generated_scores)?
-            } else {
-                Vec::new()
-            };
-            let (peer_forward, peer_d): (Vec<_>, Vec<_>) = peers
-                .iter_mut()
-                .map(|replica| replica.discriminator_phase(&dataset, index, &step, scaler.factor()))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .unzip();
-            let d_step =
-                parallel::optimize(&mut d, &loss_d.total, peer_d, scaler.factor(), write_event)?;
-            if !peers.is_empty() {
-                let state = discriminator.state_dict();
-                for replica in &mut peers {
-                    replica.synchronize_discriminator(&state)?;
-                }
-            }
-
-            let loss_g = step.generator_loss(&mut discriminator, forward, &mel)?;
-            let peer_g = peers
-                .iter_mut()
-                .zip(peer_forward)
-                .map(|(replica, forward)| replica.generator_phase(forward, &step, scaler.factor()))
-                .collect::<Result<Vec<_>>>()?;
-            let g_step =
-                parallel::optimize(&mut g, &loss_g.total, peer_g, scaler.factor(), write_event)?;
-            scaler.update(d_step.overflow || g_step.overflow);
-            if !peers.is_empty() {
-                let state = spectral.then(|| discriminator.state_dict());
-                for replica in &mut peers {
-                    replica.synchronize_generator(&g_params)?;
-                    if let Some(state) = &state {
-                        replica.synchronize_discriminator(state)?;
+        // Host-side loading of the next batches overlaps GPU work unless the
+        // dataset is cached on the device or `RVC_PREFETCH=0`.
+        let prefetch = cached.is_empty() && prefetch_enabled();
+        let seed = train.seed;
+        std::thread::scope(|scope| -> Result<()> {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(PREFETCH_BATCHES);
+            if prefetch {
+                let order = order.clone();
+                let (batches, dataset) = (&batches, &dataset);
+                scope.spawn(move || {
+                    for index in order {
+                        let staged = dataset.stage_batch(
+                            &batches[index],
+                            batch_seed(seed, epoch, index, 0),
+                            Some(device),
+                        );
+                        if sender.send(staged).is_err() {
+                            break;
+                        }
                     }
-                }
+                });
+            } else {
+                drop(sender);
             }
-            if write_event && let Some(writer) = writer.as_mut() {
-                append_generator_metrics(&mut metrics, &loss_g.scores)?;
-                metrics.extend([
-                    ("loss/g/total".into(), loss_g.total.f_double_value(&[])?),
-                    ("loss/d/total".into(), loss_d.total.f_double_value(&[])?),
-                    ("learning_rate".into(), g.learning_rate()),
-                    ("grad_norm_d".into(), d_step.norm),
-                    ("grad_norm_g".into(), g_step.norm),
-                    ("loss/g/fm".into(), loss_g.feature.f_double_value(&[])?),
-                    (
-                        "loss/g/mel".into(),
-                        clamp_metric(loss_g.mel.f_double_value(&[])?, 75.0),
-                    ),
-                    (
-                        "loss/g/kl".into(),
-                        clamp_metric(loss_g.kl.f_double_value(&[])?, 9.0),
-                    ),
-                ]);
-                writer.summary(
-                    global,
-                    &metrics,
-                    &[
-                        ("slice/mel_org", loss_g.real_mel.f_select(0, 0)?),
-                        ("slice/mel_gen", loss_g.generated_mel.f_select(0, 0)?),
-                        ("all/mel", loss_g.full_mel.f_select(0, 0)?),
-                    ],
-                )?;
-            }
-            if global.is_multiple_of(train.log_interval) || i + 1 == batch_count {
-                let display = |tensor: &Tensor| tensor.double_value(&[]);
-                log_progress(
-                    &mut log,
+            for (i, index) in order.into_iter().enumerate() {
+                notify(
                     &mut progress,
                     &format!(
-                        "Epoch {epoch} · step {} · D {:.4} · G {:.4} · mel {:.4} · KL {:.4} · lr {:.6}",
-                        global + 1,
-                        display(&loss_d.total),
-                        display(&loss_g.total),
-                        display(&loss_g.mel),
-                        display(&loss_g.kl),
-                        g.learning_rate()
+                        "Epoch {epoch}/{} · batch {}/{batch_count}",
+                        request.epochs,
+                        i + 1
                     ),
                 )?;
+                profile.mark(0);
+                let loaded;
+                let batch = if let Some(batch) = cached.get(index) {
+                    batch
+                } else if prefetch {
+                    let staged = receiver
+                        .recv()
+                        .context("training batch loader stopped unexpectedly")??;
+                    loaded = dataset.finish_batch(staged, device, |x| mel.spectrogram(x))?;
+                    &loaded
+                } else {
+                    loaded = dataset.load_batch_seeded(
+                        &batches[index],
+                        device,
+                        batch_seed(train.seed, epoch, index, 0),
+                        |x| mel.spectrogram(x),
+                    )?;
+                    &loaded
+                };
+                let write_event = writer.is_some() && global.is_multiple_of(train.log_interval);
+                profile.mark(1);
+                let forward = step.generate(&generator, batch)?;
+                profile.mark(2);
+                let loss_d = step.discriminate(&mut discriminator, &forward)?;
+                let mut metrics = if write_event {
+                    discriminator_metrics(&loss_d.real_scores, &loss_d.generated_scores)?
+                } else {
+                    Vec::new()
+                };
+                let (peer_forward, peer_d): (Vec<_>, Vec<_>) = peers
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(rank, replica)| {
+                        replica.discriminator_phase(
+                            &dataset,
+                            index,
+                            batch_seed(train.seed, epoch, index, rank + 1),
+                            &step,
+                            scaler.factor(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .unzip();
+                let d_step = parallel::optimize(
+                    &mut d,
+                    &loss_d.total,
+                    peer_d,
+                    scaler.factor(),
+                    write_event,
+                )?;
+                if !peers.is_empty() {
+                    let state = discriminator.state_dict();
+                    for replica in &mut peers {
+                        replica.synchronize_discriminator(&state)?;
+                    }
+                }
+
+                profile.mark(3);
+                let loss_g = step.generator_loss(
+                    &mut discriminator,
+                    forward,
+                    &mel,
+                    multiscale.as_ref(),
+                    &auxiliary,
+                )?;
+                profile.mark(4);
+                let peer_g = peers
+                    .iter_mut()
+                    .zip(peer_forward)
+                    .map(|(replica, forward)| {
+                        replica.generator_phase(forward, &step, scaler.factor())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let g_step = parallel::optimize(
+                    &mut g,
+                    &loss_g.total,
+                    peer_g,
+                    scaler.factor(),
+                    write_event,
+                )?;
+                profile.mark(5);
+                scaler.update(d_step.overflow || g_step.overflow);
+                if let Some(ema) = ema.as_mut().filter(|_| !g_step.overflow) {
+                    ema.update(&g_params)?;
+                }
+                if let Some(report) = profile.finish_step() {
+                    log_progress(&mut log, &mut progress, &report)?;
+                }
+                if !peers.is_empty() {
+                    let state = spectral.then(|| discriminator.state_dict());
+                    for replica in &mut peers {
+                        replica.synchronize_generator(&g_params)?;
+                        if let Some(state) = &state {
+                            replica.synchronize_discriminator(state)?;
+                        }
+                    }
+                }
+                if write_event && let Some(writer) = writer.as_mut() {
+                    append_generator_metrics(&mut metrics, &loss_g.scores)?;
+                    metrics.extend([
+                        ("loss/g/total".into(), loss_g.total.f_double_value(&[])?),
+                        ("loss/d/total".into(), loss_d.total.f_double_value(&[])?),
+                        ("learning_rate".into(), g.learning_rate()),
+                        ("grad_norm_d".into(), d_step.norm),
+                        ("grad_norm_g".into(), g_step.norm),
+                        ("loss/g/fm".into(), loss_g.feature.f_double_value(&[])?),
+                        (
+                            "loss/g/mel".into(),
+                            clamp_metric(loss_g.mel.f_double_value(&[])?, 75.0),
+                        ),
+                        (
+                            "loss/g/kl".into(),
+                            clamp_metric(loss_g.kl.f_double_value(&[])?, 9.0),
+                        ),
+                    ]);
+                    if let Some(stft) = &loss_g.stft {
+                        metrics.push(("loss/g/stft".into(), stft.f_double_value(&[])?));
+                    }
+                    if let Some(phonetic) = &loss_g.phonetic {
+                        metrics.push(("loss/g/phonetic".into(), phonetic.f_double_value(&[])?));
+                    }
+                    writer.summary(
+                        global,
+                        &metrics,
+                        &[
+                            ("slice/mel_org", loss_g.real_mel.f_select(0, 0)?),
+                            ("slice/mel_gen", loss_g.generated_mel.f_select(0, 0)?),
+                            ("all/mel", loss_g.full_mel.f_select(0, 0)?),
+                        ],
+                    )?;
+                }
+                if global.is_multiple_of(train.log_interval) || i + 1 == batch_count {
+                    let display = |tensor: &Tensor| tensor.double_value(&[]);
+                    let stft = loss_g
+                        .stft
+                        .as_ref()
+                        .map(|stft| format!(" · STFT {:.4}", display(stft)))
+                        .unwrap_or_default()
+                        + &loss_g
+                            .phonetic
+                            .as_ref()
+                            .map(|phonetic| format!(" · phonetic {:.4}", display(phonetic)))
+                            .unwrap_or_default();
+                    log_progress(
+                        &mut log,
+                        &mut progress,
+                        &format!(
+                            "Epoch {epoch} · step {} · D {:.4} · G {:.4} · mel {:.4}{stft} · KL {:.4} · lr {:.6}",
+                            global + 1,
+                            display(&loss_d.total),
+                            display(&loss_g.total),
+                            display(&loss_g.mel),
+                            display(&loss_g.kl),
+                            g.learning_rate()
+                        ),
+                    )?;
+                }
+                global += 1;
             }
-            global += 1;
-        }
+            Ok(())
+        })?;
         if epoch.is_multiple_of(request.save_every) || epoch == request.epochs {
             let suffix = if request.latest_only {
                 2_333_333
@@ -545,13 +879,14 @@ fn run_on_devices(
                 ),
                 (&d, discriminator.state_dict()),
                 train.learning_rate,
+                config.model.dec_aa,
             )?;
             if request.save_weights {
                 let path = paths.weights.join(format!("{name}_e{epoch}_s{global}.pth"));
                 edit::compact(
                     &path,
                     &config,
-                    g_params.iter().map(|(k, v)| (k.clone(), v.shallow_clone())),
+                    exported(&g_params, ema.as_ref()),
                     Export {
                         version,
                         sample_rate: request.sample_rate,
@@ -560,6 +895,24 @@ fn run_on_devices(
                         overwrite: true,
                     },
                 )?;
+                if ema.is_some() {
+                    // The raw weights of the same step, for comparison with the average.
+                    let path = paths
+                        .weights
+                        .join(format!("{name}_e{epoch}_s{global}_raw.pth"));
+                    edit::compact(
+                        &path,
+                        &config,
+                        exported(&g_params, None),
+                        Export {
+                            version,
+                            sample_rate: request.sample_rate,
+                            uses_f0: request.f0,
+                            description: &format!("{epoch}epoch raw"),
+                            overwrite: true,
+                        },
+                    )?;
+                }
             }
         }
         g_lr.step(&mut g)?;
@@ -569,7 +922,7 @@ fn run_on_devices(
     edit::compact(
         &model,
         &config,
-        g_params,
+        exported(&g_params, ema.as_ref()),
         Export {
             version,
             sample_rate: request.sample_rate,
@@ -587,8 +940,112 @@ fn run_on_devices(
     })
 }
 
+/// Generator weights for exported voice models: the EMA when enabled.
+fn exported(parameters: &[(String, Tensor)], ema: Option<&ema::Ema>) -> Vec<(String, Tensor)> {
+    ema.map_or_else(
+        || {
+            parameters
+                .iter()
+                .map(|(name, value)| (name.clone(), value.shallow_clone()))
+                .collect()
+        },
+        ema::Ema::weights,
+    )
+}
+
+const PREFETCH_BATCHES: usize = 2;
+
+fn prefetch_enabled() -> bool {
+    std::env::var("RVC_PREFETCH").map_or(true, |value| value != "0")
+}
+
+/// Optional per-phase step timing, enabled with `RVC_TRAIN_PROFILE=<steps>`.
+struct Profile {
+    device: Device,
+    every: usize,
+    last: Option<std::time::Instant>,
+    totals: [f64; 6],
+    steps: usize,
+    phase: usize,
+    started: Option<std::time::Instant>,
+}
+
+impl Profile {
+    fn new(device: Device) -> Self {
+        let every = std::env::var("RVC_TRAIN_PROFILE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        Self {
+            device,
+            every,
+            last: None,
+            totals: [0.0; 6],
+            steps: 0,
+            phase: 0,
+            started: None,
+        }
+    }
+
+    fn mark(&mut self, phase: usize) {
+        if self.every == 0 {
+            return;
+        }
+        if let Device::Cuda(index) = self.device {
+            tch::Cuda::synchronize(index as i64);
+        }
+        let now = std::time::Instant::now();
+        if phase == 0 {
+            if self.started.is_none() {
+                self.started = Some(now);
+            }
+        } else if let Some(last) = self.last {
+            self.totals[self.phase] += (now - last).as_secs_f64();
+        }
+        self.phase = phase;
+        self.last = Some(now);
+    }
+
+    fn finish_step(&mut self) -> Option<String> {
+        if self.every == 0 {
+            return None;
+        }
+        self.steps += 1;
+        if !self.steps.is_multiple_of(self.every) {
+            return None;
+        }
+        let n = self.steps as f64;
+        let names = [
+            "load",
+            "G forward",
+            "D fwd+bwd+step",
+            "G loss forward",
+            "G bwd+step",
+        ];
+        let parts: Vec<_> = names
+            .iter()
+            .zip(&self.totals)
+            .map(|(name, total)| format!("{name} {:.1} ms", 1000.0 * total / n))
+            .collect();
+        let wall = self
+            .started
+            .map(|start| start.elapsed().as_secs_f64() / n)
+            .unwrap_or(0.0);
+        Some(format!(
+            "Profile over {} steps: {} · wall {:.1} ms/step",
+            self.steps,
+            parts.join(" · "),
+            1000.0 * wall
+        ))
+    }
+}
+
 fn clamp_metric(value: f64, max: f64) -> f64 {
     if value > max { max } else { value }
+}
+
+fn batch_seed(seed: i64, epoch: usize, batch: usize, rank: usize) -> u64 {
+    seed as u64 ^ (epoch as u64).rotate_left(17) ^ (batch as u64).rotate_left(41) ^ rank as u64
 }
 
 fn discriminator_metrics(real: &[Tensor], generated: &[Tensor]) -> Result<Vec<(String, f64)>> {
@@ -647,6 +1104,19 @@ fn training_log(experiment: &Path, request: &Request) -> Result<File> {
         "sample_rate": format!("{}k", request.sample_rate / 1000),
         "if_f0": u8::from(request.f0),
         "version": request.version.name(),
+        "speaker_id": request.speaker_id,
+        "multi": request.multi,
+        "batch_size": request.batch_size,
+        "save_every": request.save_every,
+        "latest_only": request.latest_only,
+        "save_weights": request.save_weights,
+        "tensorboard": request.tensorboard,
+        "multiscale_mel": request.multiscale_mel,
+        "stft_loss": request.stft_loss,
+        "phonetic_loss": request.phonetic_loss,
+        "phonetic_encoder": request.phonetic_encoder.name(),
+        "mrd": request.mrd,
+        "ema_decay": request.ema_decay,
     });
     writeln!(log, "{metadata}").context("writing train.log metadata")?;
     Ok(log)
@@ -683,6 +1153,26 @@ fn pair_epoch(g: &Checkpoint, d: &Checkpoint) -> Result<usize> {
     Ok(g_epoch)
 }
 
+fn resume_position(g: &Checkpoint, d: &Checkpoint) -> Result<(usize, Option<usize>)> {
+    let epoch = pair_epoch(g, d)?;
+    let step = g
+        .metadata("rvc_global_step")?
+        .map(|value| -> Result<usize> {
+            Ok(value
+                .as_u64()
+                .context("invalid saved training step")?
+                .try_into()?)
+        })
+        .transpose()?;
+    // Native and current NVC pairs are saved after the entire epoch.
+    let next = if step.is_some() || g.has("training_state") {
+        epoch.checked_add(1).context("checkpoint epoch overflow")?
+    } else {
+        epoch
+    };
+    Ok((next, step))
+}
+
 fn newest_pair(path: &Path) -> Result<Option<(usize, PathBuf, PathBuf)>> {
     let mut models = BTreeMap::new();
     for file in fs::read_dir(path)? {
@@ -708,6 +1198,172 @@ fn newest_pair(path: &Path) -> Result<Option<(usize, PathBuf, PathBuf)>> {
     }
     let mut found = models.into_iter().rev();
     Ok(found.find_map(|(step, [g, d])| Some((step, g?, d?))))
+}
+
+pub(crate) fn has_checkpoint_pair(experiment: &Path) -> Result<bool> {
+    Ok(newest_pair(experiment)?.is_some())
+}
+
+#[derive(Serialize)]
+pub(crate) struct ResumeInfo {
+    pub epoch: usize,
+    pub sample_rate: u32,
+    pub version: Version,
+    pub f0: bool,
+    pub multi: bool,
+    pub speaker_id: i64,
+    pub batch_size: usize,
+    pub save_every: usize,
+    pub latest_only: bool,
+    pub save_weights: bool,
+    pub tensorboard: bool,
+    pub multiscale_mel: bool,
+    pub stft_loss: f64,
+    pub phonetic_loss: f64,
+    pub mrd: bool,
+    pub ema_decay: f64,
+    pub embedder: Embedder,
+    pub bf16: bool,
+    pub gradient_checkpointing: bool,
+    pub timbre_shift_pool: Option<PathBuf>,
+    pub generator: PathBuf,
+    pub discriminator: PathBuf,
+}
+
+pub(crate) fn resume_info(experiment: &Path) -> Result<ResumeInfo> {
+    let (step, generator, discriminator) = newest_pair(experiment)?
+        .context("no complete generator and discriminator checkpoint pair")?;
+    let g = Checkpoint::open(&generator)?;
+    let d = Checkpoint::open(&discriminator)?;
+    let version = match g
+        .tensor_shape(Some("model"), "enc_p.emb_phone.weight")?
+        .get(1)
+    {
+        Some(256) => Version::V1,
+        Some(768) => Version::V2,
+        _ => anyhow::bail!("unsupported checkpoint content feature size"),
+    };
+    let f0 = g
+        .tensor_shape(Some("model"), "enc_p.emb_pitch.weight")
+        .is_ok();
+    let config: train_data::Config =
+        serde_json::from_reader(File::open(experiment.join("config.json"))?)
+            .context("reading experiment config")?;
+    let mut info = ResumeInfo {
+        epoch: pair_epoch(&g, &d)?,
+        sample_rate: config.data.sampling_rate,
+        version,
+        f0,
+        multi: !config.speaker_info.is_empty(),
+        speaker_id: 0,
+        batch_size: config.train.batch_size,
+        save_every: 5,
+        latest_only: step == 2_333_333,
+        save_weights: false,
+        tensorboard: true,
+        multiscale_mel: false,
+        stft_loss: 0.0,
+        phonetic_loss: 0.0,
+        mrd: false,
+        ema_decay: 0.0,
+        embedder: config.embedder_model.unwrap_or_default(),
+        bf16: config.train.bf16,
+        gradient_checkpointing: config.train.gradient_checkpointing,
+        timbre_shift_pool: config.data.content_aug.and_then(|options| options.pool),
+        generator,
+        discriminator,
+    };
+    if let Ok(log) = File::open(experiment.join("train.log")) {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(log).lines() {
+            let line = line?;
+            if !line.starts_with('{') {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                && value["sample_rate"] == format!("{}k", info.sample_rate / 1000)
+                && value["version"] == version.name()
+                && value["if_f0"] == u8::from(f0)
+            {
+                info.multi = value["multi"].as_bool().unwrap_or(info.multi);
+                info.speaker_id = value["speaker_id"].as_i64().unwrap_or(info.speaker_id);
+                info.batch_size = value["batch_size"]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(info.batch_size);
+                info.save_every = value["save_every"]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(info.save_every);
+                info.latest_only = value["latest_only"].as_bool().unwrap_or(info.latest_only);
+                info.save_weights = value["save_weights"].as_bool().unwrap_or(info.save_weights);
+                info.tensorboard = value["tensorboard"].as_bool().unwrap_or(info.tensorboard);
+                info.multiscale_mel = value["multiscale_mel"]
+                    .as_bool()
+                    .unwrap_or(info.multiscale_mel);
+                info.stft_loss = value["stft_loss"].as_f64().unwrap_or(info.stft_loss);
+                info.phonetic_loss = value["phonetic_loss"]
+                    .as_f64()
+                    .unwrap_or(info.phonetic_loss);
+                info.mrd = value["mrd"].as_bool().unwrap_or(info.mrd);
+                info.ema_decay = value["ema_decay"].as_f64().unwrap_or(info.ema_decay);
+            }
+        }
+    }
+    Ok(info)
+}
+
+/// Whether the pretrained generator has band conditioning and anti-aliased activations.
+fn pretrained_architecture(paths: &Paths, request: &Request) -> Result<(bool, bool)> {
+    let Some(model) = pretrained_path(paths, request, "G") else {
+        return Ok((false, false));
+    };
+    let checkpoint = Checkpoint::open(&model)?;
+    let section = if checkpoint.has("model") {
+        "model"
+    } else {
+        "weight"
+    };
+    let bands = checkpoint
+        .tensor_shape(Some(section), super::synth::bands::WEIGHT)
+        .is_ok();
+    let aa = checkpoint
+        .metadata("nvc")?
+        .and_then(|meta| meta.get("dec_aa").and_then(serde_json::Value::as_bool))
+        .or(checkpoint
+            .metadata("dec_aa")?
+            .and_then(|value| value.as_bool()))
+        .unwrap_or(false);
+    Ok((bands, aa))
+}
+
+fn pretrained_path(paths: &Paths, request: &Request, kind: &str) -> Option<PathBuf> {
+    let custom = if kind == "G" {
+        &request.pretrained_g
+    } else {
+        &request.pretrained_d
+    };
+    if request.random_weights && custom.is_none() {
+        return None;
+    }
+    let rate = request.sample_rate / 1000;
+    let prefix = if request.f0 { "f0" } else { "" };
+    let directory = if matches!(request.version, Version::V2) {
+        "pretrained_v2"
+    } else {
+        "pretrained"
+    };
+    let model = custom
+        .as_ref()
+        .map(|path| paths.root.join(path))
+        .unwrap_or_else(|| {
+            paths
+                .root
+                .join("assets")
+                .join(directory)
+                .join(format!("{prefix}{kind}{rate}k.pth"))
+        });
+    (model.is_file() || custom.is_some()).then_some(model)
 }
 
 fn load_pretrained(
@@ -761,6 +1417,7 @@ fn checkpoint_names(suffix: usize) -> [String; 2] {
     [format!("G_{suffix}.pth"), format!("D_{suffix}.pth")]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn save_pair(
     experiment: &Path,
     suffix: usize,
@@ -769,17 +1426,23 @@ fn save_pair(
     g: Save<'_>,
     d: Save<'_>,
     initial_rate: f64,
+    dec_aa: bool,
 ) -> Result<()> {
     let staging = tempfile::TempDir::new_in(experiment)?;
     let names = checkpoint_names(suffix);
     for ((optimizer, tensors), filename) in [g, d].into_iter().zip(&names) {
-        let data = Value::Dict(vec![
+        let mut entries = vec![
             ("model".into(), Value::tensors(tensors)),
             ("iteration".into(), json!(epoch).into()),
             ("optimizer".into(), optimizer.state_dict()?),
             ("learning_rate".into(), json!(initial_rate).into()),
             ("rvc_global_step".into(), json!(step).into()),
-        ]);
+        ];
+        if dec_aa {
+            // Lets a run that starts from this checkpoint as pretrained keep the decoder layout.
+            entries.push(("dec_aa".into(), json!(true).into()));
+        }
+        let data = Value::Dict(entries);
         write::write(&staging.path().join(filename), &data, false)?;
     }
 
@@ -885,6 +1548,7 @@ mod tests {
                 (&optimizer, parameters()),
                 (&optimizer, parameters()),
                 0.02,
+                false,
             )
         };
 
@@ -911,8 +1575,8 @@ mod tests {
 
         recover_pending_pair(experiment)?;
         assert_eq!(
-            pair_epoch(&Checkpoint::open(&g)?, &Checkpoint::open(&d)?)?,
-            2
+            resume_position(&Checkpoint::open(&g)?, &Checkpoint::open(&d)?)?,
+            (3, Some(4))
         );
         assert!(!pending.exists());
         recover_pending_pair(experiment)?;

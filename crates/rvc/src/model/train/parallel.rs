@@ -8,11 +8,13 @@ use crate::model::discriminator::Discriminator;
 use crate::model::optimizer::{self, AdamW, GradientStep};
 use crate::model::synth::{Synth, training::generator};
 use crate::model::train_data::{Batch, Config, Dataset, Version};
-use crate::model::train_losses::{MelConfig, MelSpectrogram};
+use crate::model::train_losses::{
+    MelConfig, MelSpectrogram, MultiResolutionStft, MultiScaleMel, PhoneticLoss,
+};
 
 use super::{
     notify,
-    step::{Forward, Settings},
+    step::{Auxiliary, Forward, Settings},
 };
 
 pub(super) struct Replica {
@@ -23,6 +25,8 @@ pub(super) struct Replica {
     discriminator_state: Vec<(String, Tensor)>,
     discriminator_parameters: Vec<(String, Tensor)>,
     mel: MelSpectrogram,
+    multiscale: Option<MultiScaleMel>,
+    auxiliary: Auxiliary,
     batches: Vec<Vec<usize>>,
     cache: Vec<Batch>,
 }
@@ -32,6 +36,11 @@ pub(super) struct Initialize<'a> {
     pub version: Version,
     pub f0: bool,
     pub mel: MelConfig,
+    pub multiscale: bool,
+    pub stft: bool,
+    /// Encoder directory, sample rate and weight kind for the phonetic loss.
+    pub phonetic: Option<(&'a std::path::Path, i64, tch::Kind)>,
+    pub resolution: bool,
     pub generator: &'a [(String, Tensor)],
     pub discriminator: &'a [(String, Tensor)],
 }
@@ -49,6 +58,7 @@ impl Replica {
         let discriminator = Discriminator::from_weights(
             matches!(init.version, Version::V2),
             init.config.model.use_spectral_norm,
+            init.resolution,
             device,
             detached(init.discriminator, device)?,
         )?;
@@ -62,6 +72,20 @@ impl Replica {
             discriminator_state,
             discriminator_parameters,
             mel: MelSpectrogram::new(init.mel, device)?,
+            multiscale: init
+                .multiscale
+                .then(|| MultiScaleMel::new(init.mel.sample_rate, device))
+                .transpose()?,
+            auxiliary: Auxiliary {
+                stft: init
+                    .stft
+                    .then(|| MultiResolutionStft::new(device))
+                    .transpose()?,
+                phonetic: init
+                    .phonetic
+                    .map(|(directory, rate, kind)| PhoneticLoss::new(directory, rate, device, kind))
+                    .transpose()?,
+            },
             batches: Vec::new(),
             cache: Vec::new(),
         })
@@ -72,6 +96,7 @@ impl Replica {
         dataset: &Dataset,
         indices: Vec<Vec<usize>>,
         cache: bool,
+        seed: impl Fn(usize) -> u64,
         progress: &mut impl FnMut(&str) -> ControlFlow<()>,
     ) -> Result<usize> {
         if self.cache.is_empty() {
@@ -87,10 +112,12 @@ impl Replica {
                             self.device
                         ),
                     )?;
-                    self.cache.push(
-                        dataset
-                            .load_batch(indices, self.device, |wave| self.mel.spectrogram(wave))?,
-                    );
+                    self.cache.push(dataset.load_batch_seeded(
+                        indices,
+                        self.device,
+                        seed(index),
+                        |wave| self.mel.spectrogram(wave),
+                    )?);
                 }
             }
         }
@@ -109,6 +136,7 @@ impl Replica {
         &mut self,
         dataset: &Dataset,
         index: usize,
+        seed: u64,
         settings: &Settings,
         scale: Option<f32>,
     ) -> Result<(Forward, Vec<Tensor>)> {
@@ -116,9 +144,10 @@ impl Replica {
         let batch = if let Some(batch) = self.cache.get(index) {
             batch
         } else {
-            loaded = dataset.load_batch(&self.batches[index], self.device, |wave| {
-                self.mel.spectrogram(wave)
-            })?;
+            loaded =
+                dataset.load_batch_seeded(&self.batches[index], self.device, seed, |wave| {
+                    self.mel.spectrogram(wave)
+                })?;
             &loaded
         };
         let forward = settings.generate(&self.generator, batch)?;
@@ -133,7 +162,13 @@ impl Replica {
         settings: &Settings,
         scale: Option<f32>,
     ) -> Result<Vec<Tensor>> {
-        let loss = settings.generator_loss(&mut self.discriminator, forward, &self.mel)?;
+        let loss = settings.generator_loss(
+            &mut self.discriminator,
+            forward,
+            &self.mel,
+            self.multiscale.as_ref(),
+            &self.auxiliary,
+        )?;
         gradients(&loss.total, &self.generator_state, scale)
     }
 

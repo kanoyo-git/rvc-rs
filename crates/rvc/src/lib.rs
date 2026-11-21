@@ -1,7 +1,13 @@
+#[cfg(feature = "inference")]
+pub mod assets;
 pub mod audio;
 pub mod catalog;
 pub mod checkpoint;
+#[cfg(feature = "inference")]
+pub mod cover;
 pub mod dataset;
+#[cfg(feature = "inference")]
+mod download;
 #[cfg(feature = "inference")]
 pub mod model;
 #[cfg(feature = "realtime")]
@@ -10,3 +16,5 @@ pub mod realtime;
 pub mod separation;
 #[cfg(feature = "index-training")]
 pub mod train_index;
+#[cfg(feature = "inference")]
+pub mod web;

@@ -10,6 +10,7 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 /// The safe subset of PyTorch's checkpoint representation used by RVC.
 pub enum Value {
     Meta(Json),
+    BFloat16,
     Tensor(Tensor),
     Dict(Vec<(Key, Value)>),
     List(Vec<Value>),
@@ -97,6 +98,7 @@ impl<'a> Pickle<'a> {
     fn value(&mut self, value: &'a Value) -> Result<()> {
         match value {
             Value::Meta(json) => self.json(json)?,
+            Value::BFloat16 => self.bytes.extend_from_slice(b"ctorch\nbfloat16\n"),
             Value::Tensor(tensor) => self.tensor(tensor)?,
             Value::Dict(fields) => {
                 self.bytes.push(b'}');

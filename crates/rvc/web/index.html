@@ -1,292 +1,889 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>RVC WebUI</title>
-  <link rel="stylesheet" href="/app.css">
-  <script src="/locale.js" defer></script>
-  <script src="/app.js" defer></script>
-</head>
-<body>
-  <header class="header">
-    <div class="header-inner">
-      <h1>RVC <span>WebUI</span></h1>
-      <nav aria-label="Workspace">
-        <button type="button" data-panel="convert" aria-current="page">Conversion</button>
-        <button type="button" data-panel="realtime" id="live-nav">Realtime</button>
-        <button type="button" data-panel="training">Training</button>
-        <button type="button" data-panel="separation">Separation</button>
-        <button type="button" data-panel="models">Models</button>
-        <button type="button" data-panel="help">Help</button>
-      </nav>
-      <label class="language-label"><span class="visually-hidden">Language</span><select id="language"></select></label>
-    </div>
-  </header>
-  <main>
-    <p class="message" id="startup" role="status" hidden></p>
-
-    <section id="convert">
-      <h2>Voice conversion</h2>
-      <div class="workspace">
-        <form id="convert-form" class="card">
-          <fieldset class="model-fields"></fieldset>
-          <label class="file-field"><span>Source audio</span><input name="audio" type="file" accept="audio/*,.mkv,.webm,.mp4" required></label>
-          <div class="button-row">
-            <button type="submit" class="primary">Convert audio</button>
-            <button type="button" id="release-voice">Unload voice model</button>
-          </div>
-          <p class="message" role="status"></p>
-        </form>
-        <div class="card result-card">
-          <h3>Converted audio</h3>
-          <audio id="preview" controls hidden></audio>
-          <a id="download" class="download" download="converted.wav" hidden>Download WAV</a>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f0f10" />
+    <meta name="color-scheme" content="dark light" />
+    <title>NVC Studio</title>
+    <link rel="icon" href="/studio/logo.png" />
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <svg class="sprite" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <symbol id="i-wave" viewBox="0 0 24 24"><path d="M2 10v3M6 6v11M10 3v18M14 8v7M18 5v13M22 10v3"/></symbol>
+      <symbol id="i-disc" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="2"/><path d="M6 12a6 6 0 0 1 6-6"/></symbol>
+      <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/></symbol>
+      <symbol id="i-split" viewBox="0 0 24 24"><path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M12 22v-8.3a4 4 0 0 0-1.17-2.87L3 3"/><path d="m15 9 6-6"/></symbol>
+      <symbol id="i-train" viewBox="0 0 24 24"><path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/></symbol>
+      <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/></symbol>
+      <symbol id="i-chart" viewBox="0 0 24 24"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m19 9-5 5-4-4-3 3"/></symbol>
+      <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+      <symbol id="i-library" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M12 10v6"/><path d="m15 13-3 3-3-3"/></symbol>
+      <symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></symbol>
+      <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+      <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12-7.5a1 1 0 0 0 0-1.72l-12-7.5A1 1 0 0 0 7 4.5Z" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1" fill="currentColor" stroke="none"/><rect x="14" y="4" width="4" height="16" rx="1" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-volume" viewBox="0 0 24 24"><path d="M11 4.7a.7.7 0 0 0-1.2-.5L6.4 7.6A1.4 1.4 0 0 1 5.4 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.4a1.4 1.4 0 0 1 1 .4l3.4 3.4a.7.7 0 0 0 1.2-.5Z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.4 18.4a9 9 0 0 0 0-12.8"/></symbol>
+      <symbol id="i-eject" viewBox="0 0 24 24"><path d="M5 17h14"/><path d="m5 13 7-8 7 8Z"/></symbol>
+    </svg>
+    <a class="skip" href="#workspace" data-i18n="skip"></a>
+    <div class="app">
+      <aside class="side">
+        <div class="brand">
+          <img class="wordmark-dark" src="/studio/wordmark.png" alt="NVC Studio" width="176" height="44" />
+          <img class="wordmark-light" src="/studio/wordmark-light.png" alt="NVC Studio" width="176" height="44" />
         </div>
-      </div>
-      <details class="card">
-        <summary>Batch conversion</summary>
-        <form id="batch-form" class="task-form" data-operation="batch">
-          <fieldset class="model-fields"></fieldset>
-          <div class="pair">
-            <label>Source folder<input name="input" required placeholder="datasets/source"></label>
-            <label>Output folder<input name="output" required placeholder="outputs"></label>
-            <label>Output format<select name="format"><option>wav</option><option>flac</option><option>mp3</option><option>m4a</option></select></label>
+        <nav aria-label="Studio" class="nav">
+          <p class="nav-label" data-i18n="navConvert"></p>
+          <button type="button" class="nav-item" data-tab="infer"><svg class="icon" aria-hidden="true"><use href="#i-wave" /></svg><span data-i18n="tabInfer"></span></button>
+          <button type="button" class="nav-item" data-tab="cover"><svg class="icon" aria-hidden="true"><use href="#i-disc" /></svg><span data-i18n="tabCover"></span></button>
+          <button type="button" class="nav-item" data-tab="realtime" hidden><svg class="icon" aria-hidden="true"><use href="#i-mic" /></svg><span data-i18n="tabRealtime"></span></button>
+          <button type="button" class="nav-item" data-tab="separate"><svg class="icon" aria-hidden="true"><use href="#i-split" /></svg><span data-i18n="tabSeparate"></span></button>
+          <p class="nav-label" data-i18n="navTrain"></p>
+          <button type="button" class="nav-item" data-tab="train"><svg class="icon" aria-hidden="true"><use href="#i-train" /></svg><span data-i18n="tabTrain"></span></button>
+          <button type="button" class="nav-item" data-tab="layers"><svg class="icon" aria-hidden="true"><use href="#i-layers" /></svg><span data-i18n="tabLayers"></span></button>
+          <button type="button" class="nav-item" data-tab="metrics"><svg class="icon" aria-hidden="true"><use href="#i-chart" /></svg><span data-i18n="tabMetrics"></span></button>
+          <button type="button" class="nav-item" data-tab="speakers"><svg class="icon" aria-hidden="true"><use href="#i-users" /></svg><span data-i18n="tabSpeakers"></span></button>
+          <p class="nav-label" data-i18n="navModels"></p>
+          <button type="button" class="nav-item" data-tab="library"><svg class="icon" aria-hidden="true"><use href="#i-library" /></svg><span data-i18n="tabLibrary"></span></button>
+          <button type="button" class="nav-item" data-tab="ckpt"><svg class="icon" aria-hidden="true"><use href="#i-box" /></svg><span data-i18n="tabCkpt"></span></button>
+          <button type="button" class="nav-item" data-tab="faq"><svg class="icon" aria-hidden="true"><use href="#i-help" /></svg><span data-i18n="tabFaq"></span></button>
+        </nav>
+        <div class="side-foot">
+          <div class="tally" id="tally" role="status">
+            <span class="tally-dot" aria-hidden="true"></span>
+            <span class="tally-text" id="tallyText" data-i18n="idle"></span>
+            <span class="tally-time mono" id="tallyTime"></span>
           </div>
-          <label class="check"><input name="recursive" type="checkbox"> Include subfolders</label>
-          <label class="check"><input name="overwrite" type="checkbox"> Replace existing files</label>
-          <button type="submit" class="primary">Convert folder</button>
-        </form>
-      </details>
-    </section>
-
-    <section id="realtime" hidden>
-      <h2>Realtime conversion</h2>
-      <form class="card" id="live-form">
-        <fieldset class="model-fields"></fieldset>
-        <label>Model file path<input name="model_path" placeholder="Optional .pth file outside assets/weights"></label>
-        <div class="pair">
-          <label>Audio host<select name="host"></select></label>
-          <label>Input device<select name="input_device"></select></label>
-          <label>Output device<select name="output_device"></select></label>
-          <label>Sample rate<select name="rate_choice"><option value="device">Device rate</option><option value="model">Model rate</option><option>44100</option><option>48000</option></select></label>
-          <label>Block (ms)<input name="block_ms" type="number" min="10" max="2000" step="10" value="250" required></label>
-          <label>Crossfade (ms)<input name="crossfade_ms" type="number" min="0" max="150" step="10" value="50" required></label>
-          <label>Context (ms)<input name="extra_ms" type="number" min="0" max="5000" step="10" value="2500" required></label>
-          <label>Silence threshold (dB)<input name="threshold_db" type="number" min="-60" max="0" value="-60" required></label>
-          <label>Formant shift<input name="formant" type="number" min="-24" max="24" step="0.1" value="0" required></label>
+          <div class="side-tools">
+            <span class="mono meta" id="deviceName"></span>
+            <select id="langSelect" class="mini" data-i18n-attr="aria-label:language">
+              <option value="en">EN</option>
+              <option value="ru">RU</option>
+            </select>
+            <button type="button" id="themeToggle" class="icon-btn">
+              <svg class="icon theme-sun" aria-hidden="true"><use href="#i-sun" /></svg>
+              <svg class="icon theme-moon" aria-hidden="true"><use href="#i-moon" /></svg>
+            </button>
+          </div>
         </div>
-        <div class="pair">
-          <label class="check"><input name="monitor" type="checkbox"> Microphone monitor</label>
-          <label class="check"><input name="wasapi_exclusive" type="checkbox"> Exclusive WASAPI</label>
-          <label class="check"><input name="input_noise_reduction" type="checkbox"> Input noise reduction</label>
-          <label class="check"><input name="output_noise_reduction" type="checkbox"> Output noise reduction</label>
-        </div>
-        <div class="button-row"><button type="submit" class="primary">Start audio</button><button type="button" id="stop-live">Stop audio</button></div>
-        <p class="message" id="live-status" role="status"></p>
-      </form>
-    </section>
+      </aside>
 
-    <section id="training" hidden>
-      <h2>Training</h2>
-      <div class="workspace">
-        <form class="card task-form" id="preprocess-form" data-operation="preprocess">
-          <h3>Prepare dataset</h3>
-          <label>Dataset mode<select name="source"><option value="single">Single speaker</option><option value="multi_folder">Multi-speaker folders</option><option value="manifest">Saved speaker manifest</option></select></label>
-          <label>Dataset folder<input name="input" placeholder="datasets/voice"></label>
-          <label>Experiment folder<input name="experiment" placeholder="logs/voice" required></label>
-          <div class="pair">
-            <label>Sample rate<select name="sample_rate"><option value="32000">32 kHz</option><option value="40000" selected>40 kHz</option><option value="48000">48 kHz</option></select></label>
-            <label>Workers<input name="workers" type="number" min="1" max="256" value="2" required></label>
-            <label>Segment length (s)<input name="segment_seconds" type="number" min="0.4" max="20" step="0.1" value="3.0" required></label>
-          </div>
-          <button type="submit" class="primary">Prepare audio</button>
-        </form>
-        <form class="card task-form" id="extract-form" data-operation="extract">
-          <h3>Extract features</h3>
-          <label>Experiment folder<input name="experiment" placeholder="logs/voice" required></label>
-          <label>Model version<select name="version"><option value="v2">RVC v2</option><option value="v1">RVC v1</option></select></label>
-          <label>Pitch extraction<select name="f0_method"><option value="rmvpe">RMVPE</option><option value="pm">PM</option><option value="fcpe">FCPE</option><option value="">No pitch extraction</option></select></label>
-          <label>Compute device<input name="device" value="auto" placeholder="cpu, cuda:0, mps"></label>
-          <label>CUDA devices<input name="gpus" placeholder="0,1" pattern="[0-9]+( *, *[0-9]+)*"></label>
-          <label class="check"><input name="overwrite" type="checkbox"> Recompute cached features</label>
-          <button type="submit" class="primary">Extract features</button>
-        </form>
-        <form class="card task-form" id="index-form" data-operation="index">
-          <h3>Train retrieval index</h3>
-          <label>Experiment folder<input name="experiment" placeholder="logs/voice" required></label>
-          <label>Model version<select name="version"><option value="v2">RVC v2</option><option value="v1">RVC v1</option></select></label>
-          <label>Dataset mode<select name="mode"><option value="auto">Automatic</option><option value="single">Single speaker</option><option value="multi">Multi-speaker</option></select></label>
-          <label>Workers<input name="workers" type="number" min="1" max="256" value="2" required></label>
-          <button type="submit" class="primary">Train index</button>
-        </form>
-        <form class="card task-form" id="train-form" data-operation="train">
-          <h3>Train voice model</h3>
-          <div class="pair">
-            <label>Experiment folder<input name="experiment" placeholder="logs/voice" required></label>
-            <label>Output model name<input name="name" placeholder="Use experiment name"></label>
-            <label>Sample rate<select name="sample_rate"><option value="32000">32 kHz</option><option value="40000" selected>40 kHz</option><option value="48000">48 kHz</option></select></label>
-            <label>Model version<select name="version"><option value="v2">RVC v2</option><option value="v1">RVC v1</option></select></label>
-            <label>Epochs<input name="epochs" type="number" min="1" max="100000" value="20" required></label>
-            <label>Batch size<input name="batch_size" type="number" min="1" max="256" placeholder="Use experiment config"></label>
-            <label>Save every (epochs)<input name="save_every" type="number" min="1" value="5" required></label>
-            <label>Speaker ID<input name="speaker_id" type="number" min="0" max="109" value="0" required></label>
-            <label>Compute device<input name="device" value="auto" placeholder="cpu, cuda:0, mps" required></label>
-            <label>CUDA devices<input name="gpus" placeholder="0,1" pattern="[0-9]+( *, *[0-9]+)*"></label>
-          </div>
-          <label class="check"><input name="f0" type="checkbox" checked> Pitch guidance</label>
-          <label class="check"><input name="multi" type="checkbox"> Multi-speaker training</label>
-          <details class="options">
-            <summary>Checkpoints and pretrained weights</summary>
-            <div class="pair">
-              <label>Pretrained generator<input name="pretrained_g" placeholder="Use default weights"></label>
-              <label>Pretrained discriminator<input name="pretrained_d" placeholder="Use default weights"></label>
-              <label class="check"><input name="save_weights" type="checkbox"> Export intermediate models</label>
-              <label class="check"><input name="latest_only" type="checkbox"> Keep one rolling checkpoint pair</label>
-              <label class="check"><input name="random_weights" type="checkbox"> Initialize without default pretrained weights</label>
-              <label>Training precision<select id="training-precision"><option value="">Automatic</option><option value="true">FP16</option><option value="false">FP32</option></select></label>
-              <label class="check"><input name="cache_data_in_gpu" type="checkbox"> Cache batches on GPU</label>
-              <label class="check"><input name="tensorboard" type="checkbox" checked> Write TensorBoard logs</label>
+      <main id="workspace">
+        <p id="startup" class="notice is-error" role="alert" hidden></p>
+
+        <section class="panel" data-panel="infer">
+          <header class="page-head"><h1 data-i18n="inferTitle"></h1><p data-i18n="inferLead"></p></header>
+          <div class="work">
+            <div class="col">
+              <section class="card voice" data-voice="i">
+            <header class="card-head"><h2 data-i18n="voice"></h2><span class="actions tight"><span class="meta mono" id="iVoiceMeta"></span><button type="button" class="icon-btn" data-refresh-models data-i18n-attr="aria-label:refreshVoices;title:refreshVoices"><svg class="icon" aria-hidden="true"><use href="#i-refresh" /></svg></button><button type="button" id="unloadModel" class="icon-btn" data-i18n-attr="aria-label:unloadVoice;title:unloadVoice"><svg class="icon" aria-hidden="true"><use href="#i-eject" /></svg></button></span></header>
+            <div class="grid">
+              <label class="field"><span class="label" data-i18n="voiceModel"></span><select id="iModel" name="model"></select></label>
+              <label class="field" id="iSpeakerWrap" hidden><span class="label" data-i18n="speaker"></span><select id="iSpeaker" name="speaker"></select></label>
+              <label class="field"><span class="label" data-i18n="index"></span><select id="iIndex" name="index"></select></label>
+              <label class="field" id="iIndexPathWrap" hidden><span class="label" data-i18n="indexFile"></span><input id="iIndexPath" type="text" spellcheck="false" placeholder="assets/indices/voice.index" /></label>
             </div>
-          </details>
-          <button type="submit" class="primary">Train prepared model</button>
-          <details id="train-all">
-            <summary>Run every training stage</summary>
-            <div class="pair">
-              <label>Dataset mode<select name="source"><option value="single">Single speaker</option><option value="multi_folder">Multi-speaker folders</option><option value="manifest">Saved speaker manifest</option></select></label>
-              <label>Dataset folder<input name="input" placeholder="datasets/voice"></label>
-              <label>Pitch estimator<select name="f0_method"><option value="rmvpe">RMVPE</option><option value="pm">PM</option><option value="fcpe">FCPE</option></select></label>
-              <label>Workers<input name="workers" type="number" min="1" max="256" value="2"></label>
-              <label>Segment length (s)<input name="segment_seconds" type="number" min="0.4" max="20" step="0.1" value="3.0"></label>
-              <button type="submit" data-operation="train_all">Prepare, train and index</button>
+          </section>
+              <section class="card">
+                <header class="card-head"><h2 data-i18n="settings"></h2></header>
+                <div class="stack">
+                  <div class="grid">
+                    <label class="field"><span class="label" data-i18n="pitch"></span><input id="iPitch" type="number" min="-48" max="48" step="0.1" value="0" /></label>
+                    <label class="field"><span class="label" data-i18n="resample"></span><input id="iResample" type="number" min="0" max="192000" step="1" value="0" data-i18n-attr="title:resampleHint" /></label>
+                  </div>
+                  <div class="field"><span class="label" data-i18n="f0Method"></span>
+              <div class="seg" role="radiogroup">
+                <label><input type="radio" name="iF0" value="pm" /><span>pm</span></label>
+                <label><input type="radio" name="iF0" value="rmvpe" /><span>rmvpe</span></label>
+                <label><input type="radio" name="iF0" value="nmvpe" /><span>nmvpe</span></label>
+                <label><input type="radio" name="iF0" value="fcpe" /><span>fcpe</span></label>
+              </div>
+              <small class="hint pitch-availability" data-i18n="pitchWeightsMissing">Install weights on the server to enable other pitch methods</small>
+                  </div>
+                  <label class="field"><span class="label" data-i18n="indexRate"></span>
+                <span class="range-row"><input id="iIndexRate" type="range" min="0" max="1" step="0.01" value="0.75" /><output>0.75</output></span>
+                <small class="hint" data-i18n="indexRateHint"></small>
+              </label>
+                  <label class="field"><span class="label" data-i18n="protect"></span>
+                <span class="range-row"><input id="iProtect" type="range" min="0" max="0.5" step="0.01" value="0.33" /><output>0.33</output></span>
+                <small class="hint" data-i18n="protectHint"></small>
+              </label>
+                  <label class="field"><span class="label" data-i18n="rms"></span>
+                <span class="range-row"><input id="iRms" type="range" min="0" max="1" step="0.01" value="0.25" /><output>0.25</output></span>
+                <small class="hint" data-i18n="rmsHint"></small>
+              </label>
+                  <details class="more">
+                    <summary data-i18n="fineTuning"></summary>
+                    <div class="stack">
+                      <label class="field"><span class="label" data-i18n="formant"></span>
+                <span class="range-row"><input id="iFormant" type="range" min="-12" max="12" step="0.1" value="0" /><output>0</output></span>
+                <small class="hint" data-i18n="formantHint"></small>
+              </label>
+                      <label class="field"><span class="label" data-i18n="aperiodic"></span>
+                <span class="range-row"><input id="iAperiodic" type="range" min="0" max="1" step="0.05" value="1" /><output>1</output></span>
+                <small class="hint" data-i18n="aperiodicHint"></small>
+              </label>
+                      <label class="field"><span class="label" data-i18n="voiceGate"></span>
+                <span class="range-row"><input id="iGate" type="range" min="0" max="60" step="1" value="0" /><output>0</output></span>
+              </label>
+                      <small class="hint" id="iGateHint" data-i18n="voiceGateHint"></small>
+                      <label class="switch"><input id="iLevelGuard" type="checkbox" role="switch" checked /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="levelGuard"></span><small class="hint" data-i18n="levelGuardHint"></small></span></label>
+                      <label class="field"><span class="label" data-i18n="precision"></span><select id="iPrecision"><option value="auto" data-i18n="automatic"></option><option value="fp32">FP32</option><option value="fp16">FP16 (CUDA)</option></select></label>
+                    </div>
+                  </details>
+                </div>
+              </section>
+              <section class="card">
+                <header class="card-head"><h2 data-i18n="register"></h2></header>
+                <div class="stack">
+                  <label class="switch"><input id="iAutoRegister" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="autoRegister"></span><small class="hint" data-i18n="autoRegisterHint"></small></span></label>
+                  <div id="iProfile" class="stack" hidden>
+                    <label class="field"><span class="label" data-i18n="profileDataset"></span><input id="iProfileDataset" type="text" spellcheck="false" placeholder="datasets/voice" /></label>
+                    <div class="drop" data-drop-for="iProfileFile">
+                <input id="iProfileFile" type="file" accept="audio/*,.mkv,.webm,.mp4" hidden />
+                <svg class="icon drop-icon" aria-hidden="true"><use href="#i-upload" /></svg>
+                <span class="drop-text"><span class="drop-title" data-i18n="dropProfileAudio"></span><span class="drop-hint" data-i18n="profileFileWins"></span></span>
+                <span class="drop-name" data-empty="true" data-i18n="noFile"></span>
+                <button type="button" class="drop-clear icon-btn" hidden data-i18n-attr="aria-label:clearFile"><svg class="icon" aria-hidden="true"><use href="#i-x" /></svg></button>
+              </div>
+                    <div class="actions">
+              <button type="button" id="iBuildProfile" class="btn primary" data-i18n="buildPitchProfile"></button>
+              <button type="button" id="iStopProfile" class="btn danger" hidden data-i18n="stop"></button>
             </div>
-          </details>
-        </form>
-        <form class="card" id="manifest-form">
-          <h3>Speaker manifest</h3>
-          <label>Experiment folder<input name="experiment" placeholder="logs/voice" required></label>
-          <label>Dataset root<input name="root" placeholder="datasets/speakers"></label>
-          <div id="speaker-rows"></div>
-          <div class="button-row"><button type="button" id="add-speaker">Add speaker row</button><button type="submit" class="primary">Save manifest</button></div>
-          <p class="message" role="status"></p>
-        </form>
-      </div>
-    </section>
-
-    <section id="separation" hidden>
-      <h2>Vocal separation and dereverberation</h2>
-      <form class="card task-form" id="separate-form" data-operation="separate">
-        <label>Preset<select name="preset" id="presets"></select></label>
-        <div class="pair">
-          <label>Input file or folder<input name="input" required></label>
-          <label>Output folder<input name="output" required></label>
-          <label>Secondary output folder<input name="secondary_output" placeholder="Use the output folder"></label>
-          <label>Output format<select name="format"><option>wav</option><option>flac</option><option>mp3</option><option>m4a</option></select></label>
-          <label>Compute device<input name="device" value="auto" placeholder="cpu, cuda:0, mps"></label>
-        </div>
-        <label class="check"><input name="overwrite" type="checkbox"> Replace existing files</label>
-        <button type="submit" class="primary">Separate audio</button>
-      </form>
-    </section>
-
-    <section id="models" hidden>
-      <h2>Model information</h2>
-      <div class="workspace">
-        <div id="model-info" class="card">
-          <label>Model<select name="model" class="models"></select></label>
-          <dl id="model-details"></dl>
-        </div>
-        <form class="card model-action" data-operation="describe">
-          <h3>Edit description</h3>
-          <label>Model<select name="model" class="models"></select></label>
-          <label>Description<input name="description"></label>
-          <label>Output filename<input name="output" required placeholder="voice.pth"></label>
-          <label class="check"><input name="overwrite" type="checkbox"> Replace existing file</label>
-          <button type="submit" class="primary">Save description</button>
-          <p class="message" role="status"></p>
-        </form>
-        <form class="card model-action" data-operation="merge">
-          <h3>Merge models</h3>
-          <label>First model<select name="first" class="models"></select></label>
-          <label>Second model<select name="second" class="models"></select></label>
-          <label>Weight of the first model<input name="alpha" type="number" min="0" max="1" step="0.01" value="0.5" required></label>
-          <label>Description<input name="description"></label>
-          <label>Output filename<input name="output" required placeholder="merged.pth"></label>
-          <label class="check"><input name="overwrite" type="checkbox"> Replace existing file</label>
-          <button type="submit" class="primary">Merge checkpoints</button>
-          <p class="message" role="status"></p>
-        </form>
-        <form class="card model-action" data-operation="extract">
-          <h3>Export inference weights</h3>
-          <label>Training checkpoint<input name="checkpoint" required placeholder="logs/voice/G_200.pth"></label>
-          <div class="pair">
-            <label>Model version<select name="version"><option value="v2">RVC v2</option><option value="v1">RVC v1</option></select></label>
-            <label>Sample rate<select name="sample_rate"><option value="32000">32 kHz</option><option value="40000" selected>40 kHz</option><option value="48000">48 kHz</option></select></label>
+                    <pre class="log" id="iProfileLog" aria-live="polite"></pre>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <div class="col take">
+              <section class="card">
+                <header class="card-head">
+                  <h2 data-i18n="take"></h2>
+                  <div class="seg compact" role="radiogroup">
+                    <label><input type="radio" name="iMode" value="single" checked /><span data-i18n="singleInfer"></span></label>
+                    <label><input type="radio" name="iMode" value="batch" /><span data-i18n="batchInfer"></span></label>
+                  </div>
+                </header>
+                <div class="stack" data-mode="single">
+              <div class="drop" data-drop-for="sAudio" data-preview-for="sPreview">
+                <input id="sAudio" type="file" accept="audio/*,.mkv,.webm,.mp4" hidden />
+                <svg class="icon drop-icon" aria-hidden="true"><use href="#i-upload" /></svg>
+                <span class="drop-text"><span class="drop-title" data-i18n="dropAudio"></span><span class="drop-hint" data-i18n="dropHint"></span></span>
+                <span class="drop-name" data-empty="true" data-i18n="noFile"></span>
+                <button type="button" class="drop-clear icon-btn" hidden data-i18n-attr="aria-label:clearFile"><svg class="icon" aria-hidden="true"><use href="#i-x" /></svg></button>
+              </div>
+              <audio id="sPreview" hidden preload="metadata"></audio>
+                  <div class="actions">
+              <button type="button" id="runSingle" class="btn primary" data-i18n="convert"></button>
+              <button type="button" id="stopSingle" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                  <pre class="log" id="sLog" aria-live="polite"></pre>
+                  <div class="result" id="sResult" hidden>
+                    <span class="label" data-i18n="result"></span>
+                    <audio id="sOut" preload="metadata" data-wave="eager" data-accent="true" data-download-formats="wav,flac,mp3,m4a"></audio>
+                  </div>
+                </div>
+                <div class="stack" data-mode="batch" hidden>
+                  <p class="hint" data-i18n="batchNote"></p>
+                  <label class="field"><span class="label" data-i18n="inFolder"></span><input id="bIn" type="text" spellcheck="false" autocomplete="off" placeholder="audio/input" /></label>
+              <div class="drop" data-drop-for="bFiles">
+                <input id="bFiles" type="file" accept="audio/*,.mkv,.webm,.mp4" multiple hidden />
+                <svg class="icon drop-icon" aria-hidden="true"><use href="#i-upload" /></svg>
+                <span class="drop-text"><span class="drop-title" data-i18n="dropMany"></span><span class="drop-hint" data-i18n="dropHint"></span></span>
+                <span class="drop-name" data-empty="true" data-i18n="noFile"></span>
+                <button type="button" class="drop-clear icon-btn" hidden data-i18n-attr="aria-label:clearFile"><svg class="icon" aria-hidden="true"><use href="#i-x" /></svg></button>
+              </div>
+                  <div class="grid">
+                    <label class="field"><span class="label" data-i18n="outFolder"></span><input id="bOut" type="text" spellcheck="false" value="opt" /></label>
+                    <div class="field"><span class="label" data-i18n="exportFormat"></span><div class="seg" role="radiogroup"><label><input type="radio" name="bFmt" value="wav" checked /><span>wav</span></label><label><input type="radio" name="bFmt" value="flac" /><span>flac</span></label><label><input type="radio" name="bFmt" value="mp3" /><span>mp3</span></label><label><input type="radio" name="bFmt" value="m4a" /><span>m4a</span></label></div></div>
+                  </div>
+                  <div class="row">
+                    <label class="switch"><input id="bRecursive" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="recursive"></span></span></label>
+                    <label class="switch"><input id="bOverwrite" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="overwrite"></span></span></label>
+                  </div>
+                  <div class="actions">
+              <button type="button" id="runBatch" class="btn primary" data-i18n="convert"></button>
+              <button type="button" id="stopBatch" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                  <pre class="log" id="bLog" aria-live="polite"></pre>
+                  <div id="bResults" class="results" hidden></div>
+                </div>
+              </section>
+            </div>
           </div>
-          <label>Description<input name="description"></label>
-          <label>Output filename<input name="output" required placeholder="voice.pth"></label>
-          <label class="check"><input name="f0" type="checkbox" checked> Pitch guidance</label>
-          <label class="check"><input name="overwrite" type="checkbox"> Replace existing file</label>
-          <button type="submit" class="primary">Export model</button>
-          <p class="message" role="status"></p>
-        </form>
-      </div>
-    </section>
+        </section>
 
-    <section id="help" hidden>
-      <h2>Help</h2>
-      <details class="card">
-        <summary>Where are the voice models?</summary>
-        <p>Put compact .pth voice models in assets/weights and open Models to refresh the list. Training checkpoints in logs can be exported from Models.</p>
-      </details>
-      <details class="card">
-        <summary>What does the retrieval index do?</summary>
-        <p>Use the added .index file for the model and speaker. Set Index mix to zero for conversion without retrieval.</p>
-      </details>
-      <details class="card">
-        <summary>How do I train a voice?</summary>
-        <p>Prepare the recordings, extract features and pitch, train, then build the index. The one-step button runs these stages with the settings in the training form.</p>
-      </details>
-      <details class="card">
-        <summary>Why does realtime audio break up?</summary>
-        <p>The status shows processing time per block and audio dropouts. Increase the block duration if processing regularly takes longer than a block.</p>
-      </details>
-    </section>
+        <section class="panel" data-panel="cover">
+          <header class="page-head"><h1 data-i18n="coverTitle"></h1><p data-i18n="coverLead"></p></header>
+          <p class="notice" id="coverMissing" hidden data-i18n="coverMissing"></p>
+          <div class="work">
+            <div class="col">
+              <section class="card voice" data-voice="c">
+            <header class="card-head"><h2 data-i18n="voice"></h2><span class="actions tight"><span class="meta mono" id="cVoiceMeta"></span><button type="button" class="icon-btn" data-refresh-models data-i18n-attr="aria-label:refreshVoices;title:refreshVoices"><svg class="icon" aria-hidden="true"><use href="#i-refresh" /></svg></button></span></header>
+            <div class="grid">
+              <label class="field"><span class="label" data-i18n="voiceModel"></span><select id="cModel" name="model"></select></label>
+              <label class="field" id="cSpeakerWrap" hidden><span class="label" data-i18n="speaker"></span><select id="cSpeaker" name="speaker"></select></label>
+              <label class="field"><span class="label" data-i18n="index"></span><select id="cIndex" name="index"></select></label>
+              <label class="field" id="cIndexPathWrap" hidden><span class="label" data-i18n="indexFile"></span><input id="cIndexPath" type="text" spellcheck="false" placeholder="assets/indices/voice.index" /></label>
+            </div>
+          </section>
+              <section class="card">
+                <header class="card-head"><h2 data-i18n="settings"></h2></header>
+                <div class="stack">
+                  <label class="field"><span class="label" data-i18n="pitch"></span><input id="cPitch" type="number" min="-24" max="24" step="1" value="0" /></label>
+                  <label class="field"><span class="label" data-i18n="indexRate"></span>
+                <span class="range-row"><input id="cIndexRate" type="range" min="0" max="1" step="0.01" value="0.5" /><output>0.5</output></span>
+                <small class="hint" data-i18n="indexRateHint"></small>
+              </label>
+                  <div class="field"><span class="label" data-i18n="backing"></span>
+                    <div class="seg" role="radiogroup">
+                      <label><input type="radio" name="cBacking" value="convert" checked /><span data-i18n="backingConvert"></span></label>
+                      <label><input type="radio" name="cBacking" value="keep" /><span data-i18n="backingKeep"></span></label>
+                      <label><input type="radio" name="cBacking" value="drop" /><span data-i18n="backingDrop"></span></label>
+                    </div>
+                    <small class="hint" data-i18n="backingHint"></small>
+                  </div>
+                  <label class="switch"><input id="cReverb" type="checkbox" role="switch" checked /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="rebuildReverb"></span><small class="hint" data-i18n="rebuildReverbHint"></small></span></label>
+                  <label class="field"><span class="label" data-i18n="vocalGain"></span>
+                <span class="range-row"><input id="cVocalGain" type="range" min="-12" max="12" step="0.5" value="0" /><output>0</output></span>
+                <small class="hint" data-i18n="vocalGainHint"></small>
+              </label>
+                  <details class="more">
+                    <summary data-i18n="fineTuning"></summary>
+                    <div class="stack">
+                      <label class="field"><span class="label" data-i18n="aperiodic"></span>
+                <span class="range-row"><input id="cAperiodic" type="range" min="0" max="1" step="0.05" value="1" /><output>1</output></span>
+                <small class="hint" data-i18n="aperiodicHint"></small>
+              </label>
+                      <label class="field"><span class="label" data-i18n="voiceGate"></span>
+                <span class="range-row"><input id="cGate" type="range" min="0" max="60" step="1" value="0" /><output>0</output></span>
+              </label>
+                      <small class="hint" id="cGateHint" data-i18n="voiceGateHint"></small>
+                      <label class="field"><span class="label" data-i18n="device"></span><select id="cDevice"><option value="auto" data-i18n="automatic"></option><option value="cpu">CPU</option></select><small class="hint" data-i18n="coverDeviceHint"></small></label>
+                    </div>
+                  </details>
+                </div>
+              </section>
+            </div>
+            <div class="col take">
+              <section class="card">
+                <header class="card-head">
+                  <h2 data-i18n="source"></h2>
+                  <div class="seg compact" role="radiogroup">
+                    <label><input type="radio" name="cSource" value="song" checked /><span data-i18n="sourceSong"></span></label>
+                    <label><input type="radio" name="cSource" value="vocals" /><span data-i18n="sourceVocals"></span></label>
+                  </div>
+                </header>
+                <div class="stack">
+              <div class="drop" data-drop-for="cFiles" data-preview-for="cPreview">
+                <input id="cFiles" type="file" accept="audio/*,.mkv,.webm,.mp4" multiple hidden />
+                <svg class="icon drop-icon" aria-hidden="true"><use href="#i-upload" /></svg>
+                <span class="drop-text"><span class="drop-title" data-i18n="dropSongs"></span><span class="drop-hint" data-i18n="dropHint"></span></span>
+                <span class="drop-name" data-empty="true" data-i18n="noFile"></span>
+                <button type="button" class="drop-clear icon-btn" hidden data-i18n-attr="aria-label:clearFile"><svg class="icon" aria-hidden="true"><use href="#i-x" /></svg></button>
+              </div>
+              <audio id="cPreview" hidden preload="metadata"></audio>
+                  <label class="field"><span class="label" data-i18n="songPath"></span><input id="cIn" type="text" spellcheck="false" autocomplete="off" placeholder="music/song.flac" /></label>
+                  <div id="cInstrumental" class="stack" hidden>
+              <div class="drop" data-drop-for="cInstFile">
+                <input id="cInstFile" type="file" accept="audio/*,.mkv,.webm,.mp4" hidden />
+                <svg class="icon drop-icon" aria-hidden="true"><use href="#i-upload" /></svg>
+                <span class="drop-text"><span class="drop-title" data-i18n="dropInstrumental"></span><span class="drop-hint" data-i18n="instrumentalHint"></span></span>
+                <span class="drop-name" data-empty="true" data-i18n="noFile"></span>
+                <button type="button" class="drop-clear icon-btn" hidden data-i18n-attr="aria-label:clearFile"><svg class="icon" aria-hidden="true"><use href="#i-x" /></svg></button>
+              </div>
+                    <label class="field"><span class="label" data-i18n="instrumentalPath"></span><input id="cInstPath" type="text" spellcheck="false" autocomplete="off" /></label>
+                  </div>
+                  <div class="grid">
+                    <label class="field"><span class="label" data-i18n="outFolderOptional"></span><input id="cOut" type="text" spellcheck="false" autocomplete="off" placeholder="covers" /></label>
+                    <div class="field"><span class="label" data-i18n="exportFormat"></span><div class="seg" role="radiogroup"><label><input type="radio" name="cFmt" value="wav" /><span>wav</span></label><label><input type="radio" name="cFmt" value="flac" checked /><span>flac</span></label><label><input type="radio" name="cFmt" value="mp3" /><span>mp3</span></label><label><input type="radio" name="cFmt" value="m4a" /><span>m4a</span></label></div></div>
+                  </div>
+                  <div class="actions">
+              <button type="button" id="runCover" class="btn primary" data-i18n="makeCover"></button>
+              <button type="button" id="stopCover" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                  <pre class="log" id="cLog" aria-live="polite"></pre>
+                  <div id="cResults" class="results" hidden></div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
 
-    <aside class="card" id="job" hidden aria-label="Background task" aria-live="polite">
-      <div class="button-row"><h3 id="job-title">Background task</h3><button id="stop-job" type="button">Cancel task</button></div>
-      <p class="message" id="job-message"></p>
-      <pre id="job-result" hidden></pre>
-    </aside>
-  </main>
+        <section class="panel" data-panel="realtime">
+          <header class="page-head"><h1 data-i18n="liveTitle"></h1><p data-i18n="liveLead"></p></header>
+          <form id="live-form" class="work">
+            <div class="col">
+              <section class="card">
+                <header class="card-head"><h2 data-i18n="voice"></h2></header>
+                <div class="grid">
+                  <label class="field"><span class="label" data-i18n="voiceModel"></span><select name="model"></select></label>
+                  <label class="field"><span class="label" data-i18n="speaker"></span><select name="speaker_id"></select></label>
+                  <label class="field"><span class="label" data-i18n="indexFile"></span><input name="index" spellcheck="false" placeholder=".index" /></label>
+                  <label class="field"><span class="label" data-i18n="modelPath"></span><input name="model_path" spellcheck="false" data-i18n-attr="placeholder:modelPathHint" /></label>
+                </div>
+              </section>
+              <section class="card">
+                <header class="card-head"><h2 data-i18n="settings"></h2><span class="meta" data-i18n="liveEditable"></span></header>
+                <div class="stack">
+                  <div class="grid">
+                    <label class="field"><span class="label" data-i18n="pitch"></span><input name="pitch" type="number" min="-48" max="48" step="0.1" value="0" required /></label>
+                    <label class="field"><span class="label" data-i18n="formant"></span><input name="formant" type="number" min="-24" max="24" step="0.1" value="0" required /></label>
+                    <label class="field"><span class="label" data-i18n="f0Method"></span><select name="f0_method"><option value="pm">pm</option><option value="rmvpe">rmvpe</option><option value="nmvpe">nmvpe</option><option value="fcpe">fcpe</option></select></label>
+                    <label class="field"><span class="label" data-i18n="silenceDb"></span><input name="threshold_db" type="number" min="-60" max="0" value="-60" required /></label>
+                  </div>
+                  <label class="field"><span class="label" data-i18n="indexRate"></span><span class="range-row"><input name="index_rate" type="range" min="0" max="1" step="0.01" value="0.75" /><output>0.75</output></span></label>
+                  <label class="field"><span class="label" data-i18n="rms"></span><span class="range-row"><input name="rms_mix_rate" type="range" min="0" max="1" step="0.01" value="1" /><output>1</output></span></label>
+                  <div class="row">
+                    <label class="switch"><input name="monitor" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text" data-i18n="monitor"></span></label>
+                    <label class="switch"><input name="input_noise_reduction" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text" data-i18n="inputNoise"></span></label>
+                    <label class="switch"><input name="output_noise_reduction" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text" data-i18n="outputNoise"></span></label>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <div class="col take">
+              <section class="card">
+                <header class="card-head"><h2 data-i18n="audioDevices"></h2></header>
+                <div class="grid">
+                  <label class="field"><span class="label" data-i18n="audioHost"></span><select name="host"></select></label>
+                  <label class="field"><span class="label" data-i18n="sampleRate"></span><select name="rate_choice"><option value="device" data-i18n="deviceRate"></option><option value="model" data-i18n="modelRate"></option><option>44100</option><option>48000</option></select></label>
+                  <label class="field"><span class="label" data-i18n="audioInput"></span><select name="input_device"></select></label>
+                  <label class="field"><span class="label" data-i18n="audioOutput"></span><select name="output_device"></select></label>
+                  <label class="field"><span class="label" data-i18n="blockMs"></span><input name="block_ms" type="number" min="10" max="2000" step="10" value="250" required /></label>
+                  <label class="field"><span class="label" data-i18n="crossfadeMs"></span><input name="crossfade_ms" type="number" min="0" max="150" step="10" value="50" required /></label>
+                  <label class="field"><span class="label" data-i18n="contextMs"></span><input name="extra_ms" type="number" min="0" max="5000" step="10" value="2500" required /></label>
+                  <label class="switch"><input name="wasapi_exclusive" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text" data-i18n="wasapi"></span></label>
+                </div>
+              </section>
+              <section class="card">
+                <header class="card-head"><h2 data-i18n="liveStream"></h2></header>
+                <div class="stack">
+                  <dl class="figures" id="liveStats">
+                    <div><dt data-i18n="liveRate"></dt><dd class="mono" id="lsRate">—</dd></div>
+                    <div><dt data-i18n="liveBlock"></dt><dd class="mono" id="lsBlock">—</dd></div>
+                    <div><dt data-i18n="liveProc"></dt><dd class="mono" id="lsProc">—</dd></div>
+                    <div><dt data-i18n="liveDrops"></dt><dd class="mono" id="lsDrops">—</dd></div>
+                  </dl>
+                  <div class="actions">
+                    <button type="submit" class="btn primary" data-i18n="startAudio"></button>
+                    <button type="button" class="btn danger" id="stop-live" data-i18n="stopAudio" disabled></button>
+                  </div>
+                  <pre class="log" id="live-status" role="status"></pre>
+                </div>
+              </section>
+            </div>
+          </form>
+        </section>
 
-  <template id="model-fields">
-    <div class="pair">
-      <label>Voice model<select name="model" class="models"></select></label>
-      <label>Speaker<select name="speaker_id"><option value="">Automatic</option></select></label>
-      <label>Pitch shift (semitones)<input name="pitch" type="number" min="-48" max="48" value="0" required></label>
-      <label>Pitch estimator<select name="f0_method"><option value="rmvpe">RMVPE</option><option value="pm">PM</option><option value="fcpe">FCPE</option></select></label>
+        <section class="panel" data-panel="separate">
+          <header class="page-head"><h1 data-i18n="sepTitle"></h1><p data-i18n="sepLead"></p></header>
+          <div class="work">
+            <div class="col">
+              <section class="card">
+                <header class="card-head"><h2 data-i18n="sepModel"></h2></header>
+                <div class="stack">
+                  <label class="field"><span class="label" data-i18n="sepMode"></span><select id="pModel"></select></label>
+                  <p class="meta mono" id="pInfo"></p>
+                  <div class="grid">
+                    <label class="field"><span class="label" data-i18n="vocalFolder"></span><input id="pVocal" type="text" spellcheck="false" value="opt" /></label>
+                    <label class="field"><span class="label" data-i18n="residualFolder"></span><input id="pResidual" type="text" spellcheck="false" value="opt" /></label>
+                  </div>
+                  <div class="field"><span class="label" data-i18n="exportFormat"></span><div class="seg" role="radiogroup"><label><input type="radio" name="pFmt" value="wav" /><span>wav</span></label><label><input type="radio" name="pFmt" value="flac" checked /><span>flac</span></label><label><input type="radio" name="pFmt" value="mp3" /><span>mp3</span></label><label><input type="radio" name="pFmt" value="m4a" /><span>m4a</span></label></div></div>
+                  <label class="switch"><input id="sepOverwrite" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="overwrite"></span></span></label>
+                </div>
+              </section>
+            </div>
+            <div class="col take">
+              <section class="card">
+                <header class="card-head"><h2 data-i18n="source"></h2></header>
+                <div class="stack">
+                  <label class="field"><span class="label" data-i18n="inFolder"></span><input id="pIn" type="text" spellcheck="false" autocomplete="off" /></label>
+              <div class="drop" data-drop-for="pFiles">
+                <input id="pFiles" type="file" accept="audio/*,.mkv,.webm,.mp4" multiple hidden />
+                <svg class="icon drop-icon" aria-hidden="true"><use href="#i-upload" /></svg>
+                <span class="drop-text"><span class="drop-title" data-i18n="dropMany"></span><span class="drop-hint" data-i18n="dropHint"></span></span>
+                <span class="drop-name" data-empty="true" data-i18n="noFile"></span>
+                <button type="button" class="drop-clear icon-btn" hidden data-i18n-attr="aria-label:clearFile"><svg class="icon" aria-hidden="true"><use href="#i-x" /></svg></button>
+              </div>
+                  <div class="actions">
+              <button type="button" id="runSep" class="btn primary" data-i18n="separate"></button>
+              <button type="button" id="stopSep" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                  <pre class="log" id="pLog" aria-live="polite"></pre>
+                  <div id="pResults" class="results" hidden></div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel" data-panel="train">
+          <header class="page-head"><h1 data-i18n="trainTitle"></h1><p data-i18n="trainLead"></p></header>
+          <div class="steps">
+            <section class="card step">
+              <header class="card-head"><h2><span class="step-num mono">1</span><span data-i18n="step1"></span></h2></header>
+              <div class="grid three">
+                <label class="field"><span class="label" data-i18n="expName"></span><input id="expName" type="text" spellcheck="false" autocomplete="off" /></label>
+                <label class="field"><span class="label" data-i18n="modelVersion"></span><select id="trainVersion"><option value="v2">RVC v2</option><option value="v1">RVC v1</option></select></label>
+                <div class="field"><span class="label" data-i18n="sampleRate"></span>
+                  <div class="seg" role="radiogroup">
+                    <label><input type="radio" name="sr" value="40k" checked /><span>40k</span></label>
+                    <label><input type="radio" name="sr" value="48k" /><span>48k</span></label>
+                    <label id="sr32wrap"><input type="radio" name="sr" value="32k" /><span>32k</span></label>
+                  </div>
+                </div>
+                <div class="field"><span class="label" data-i18n="pitchGuide"></span>
+                  <div class="seg" role="radiogroup">
+                    <label><input type="radio" name="ifF0" value="1" checked /><span data-i18n="yes"></span></label>
+                    <label><input type="radio" name="ifF0" value="0" /><span data-i18n="no"></span></label>
+                  </div>
+                </div>
+                <label class="field"><span class="label" data-i18n="cpuWorkers"></span>
+                <span class="range-row"><input id="cpuWorkers" type="range" min="1" max="64" step="1" value="4" /><output>4</output></span>
+              </label>
+              </div>
+            </section>
+
+            <section class="card step">
+              <header class="card-head"><h2><span class="step-num mono">2</span><span data-i18n="step2a"></span></h2></header>
+              <div class="stack">
+                <div class="field"><span class="label" data-i18n="setType"></span>
+                  <div class="seg" role="radiogroup">
+                    <label><input type="radio" name="mode" value="single" checked /><span data-i18n="singleSpk"></span></label>
+                    <label><input type="radio" name="mode" value="multi_folder" /><span data-i18n="multiSpk"></span></label>
+                    <label><input type="radio" name="mode" value="manifest" /><span data-i18n="savedManifest"></span></label>
+                  </div>
+                  <small class="hint" id="multiHelp" hidden data-i18n="multiHelp"></small>
+                </div>
+                <div class="grid">
+            <div class="drop" data-drop-for="trainsetZip">
+                <input id="trainsetZip" type="file" accept=".zip,application/zip" hidden />
+                <svg class="icon drop-icon" aria-hidden="true"><use href="#i-upload" /></svg>
+                <span class="drop-text"><span class="drop-title" data-i18n="dropDataset"></span><span class="drop-hint" data-i18n="dropDatasetHint"></span></span>
+                <span class="drop-name" data-empty="true" data-i18n="noFile"></span>
+                <button type="button" class="drop-clear icon-btn" hidden data-i18n-attr="aria-label:clearFile"><svg class="icon" aria-hidden="true"><use href="#i-x" /></svg></button>
+              </div>
+                  <label class="field" id="trainsetWrap"><span class="label" data-i18n="trainFolder"></span><input id="trainset" type="text" spellcheck="false" autocomplete="off" /></label>
+                </div>
+                <div class="grid three">
+                  <label class="field" id="spkWrap"><span class="label" data-i18n="speakerId"></span><input id="spkId" type="number" min="0" max="109" value="0" /></label>
+                  <label class="field"><span class="label" data-i18n="segmentSeconds"></span><input id="segmentSeconds" type="number" min="0.4" max="20" step="0.1" value="3" /></label>
+                </div>
+                <label class="switch"><input id="noiseReduce" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="noiseReduce"></span><small class="hint" data-i18n="noiseReduceHelp"></small></span></label>
+                <div id="reduceStrengthWrap" hidden><label class="field"><span class="label" data-i18n="reduceStrength"></span>
+                <span class="range-row"><input id="reduceStrength" type="range" min="0" max="1" step="0.05" value="0.75" /><output>0.75</output></span>
+                <small class="hint" data-i18n="reduceStrengthHelp"></small>
+              </label></div>
+                <div class="actions">
+              <button type="button" id="runPre" class="btn primary" data-i18n="processData"></button>
+              <button type="button" id="stopPre" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                <pre class="log" id="preLog" aria-live="polite"></pre>
+              </div>
+            </section>
+
+            <section class="card step">
+              <header class="card-head"><h2><span class="step-num mono">3</span><span data-i18n="step2b"></span></h2></header>
+              <div class="stack">
+                <div class="grid">
+                  <label class="field"><span class="label" data-i18n="contentEmbedder"></span><select id="trainEmbedder"></select></label>
+                  <div class="field"><span class="label" data-i18n="trainF0"></span>
+              <div class="seg" role="radiogroup">
+                <label><input type="radio" name="tf0" value="pm" /><span>pm</span></label>
+                <label><input type="radio" name="tf0" value="rmvpe" /><span>rmvpe</span></label>
+                <label><input type="radio" name="tf0" value="nmvpe" /><span>nmvpe</span></label>
+                <label><input type="radio" name="tf0" value="fcpe" /><span>fcpe</span></label>
+              </div>
+              <small class="hint pitch-availability" data-i18n="pitchWeightsMissing">Install weights on the server to enable other pitch methods</small>
+                  </div>
+                </div>
+                <div class="row">
+                  <label class="switch"><input id="overwriteFeatures" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="overwriteFeatures"></span></span></label>
+                  <label class="switch"><input id="unvoiceFricatives" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="unvoiceFricatives"></span><small class="hint" data-i18n="unvoiceFricativesHint"></small></span></label>
+                </div>
+                <div class="actions">
+              <button type="button" id="runExt" class="btn primary" data-i18n="extractFeatures"></button>
+              <button type="button" id="stopExt" class="btn danger" hidden data-i18n="stop"></button>
+              <button type="button" id="downloadEmbedder" class="btn" data-i18n="installEmbedder"></button>
+              <button type="button" id="stopEmbedder" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                <pre class="log" id="extLog" aria-live="polite"></pre>
+              </div>
+            </section>
+
+            <section class="card step">
+              <header class="card-head"><h2><span class="step-num mono">4</span><span data-i18n="step3"></span></h2></header>
+              <div class="stack">
+                <div class="grid three">
+                  <label class="field"><span class="label" data-i18n="totalEpoch"></span>
+                <span class="range-row"><input id="totalEpoch" type="range" min="1" max="1200" step="1" value="20" /><output>20</output></span>
+              </label>
+                  <label class="field"><span class="label" data-i18n="saveEvery"></span>
+                <span class="range-row"><input id="saveEvery" type="range" min="1" max="50" step="1" value="5" /><output>5</output></span>
+              </label>
+                  <label class="field"><span class="label" data-i18n="batchSize"></span>
+                <span class="range-row"><input id="batchSize" type="range" min="1" max="40" step="1" value="1" /><output>1</output></span>
+              </label>
+                </div>
+                <div class="grid three">
+                  <label class="field"><span class="label" data-i18n="trainPrecision"></span><select id="trainPrecision"><option value="" data-i18n="automatic"></option><option value="fp32">FP32</option><option value="fp16">FP16 (CUDA)</option><option value="bf16">BF16 (CUDA)</option></select></label>
+                  <label class="field"><span class="label" data-i18n="gradientCheckpointing"></span><select id="gradientCheckpointing"><option value="" data-i18n="automatic"></option><option value="true" data-i18n="yes"></option><option value="false" data-i18n="no"></option></select></label>
+                  <label class="field"><span class="label" data-i18n="gpus"></span><input id="trainGpus" type="text" spellcheck="false" placeholder="0,1" /></label>
+                </div>
+                <div class="row">
+                  <label class="switch"><input id="latestOnly" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="saveLatest"></span></span></label>
+                  <label class="switch"><input id="saveSmall" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="saveSmall"></span></span></label>
+                  <label class="switch"><input id="cacheGpu" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="cacheGpu"></span></span></label>
+                  <label class="switch"><input id="writeMetrics" type="checkbox" role="switch" checked /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="writeMetrics"></span></span></label>
+                </div>
+                <div class="sub">
+                  <h3 data-i18n="pretrained"></h3>
+                  <div class="grid">
+                    <label class="field"><span class="label" data-i18n="preCatalog"></span><select id="preCatalog"></select></label>
+                    <div class="field end"><div class="actions tight">
+                      <button type="button" id="downloadPretrained" class="btn" data-i18n="downloadPretrained"></button>
+                      <button type="button" id="stopPretrained" class="btn danger" hidden data-i18n="stop"></button>
+                      <button type="button" id="refreshPretrained" class="icon-btn" data-i18n-attr="aria-label:refreshPretrained"><svg class="icon" aria-hidden="true"><use href="#i-refresh" /></svg></button>
+                    </div></div>
+                    <label class="field"><span class="label" data-i18n="preG"></span><select id="preG"></select></label>
+                    <label class="field"><span class="label" data-i18n="preD"></span><select id="preD"></select></label>
+                    <label class="field" id="preGPathWrap" hidden><span class="label" data-i18n="pretrainedPath"></span><input id="preGPath" type="text" spellcheck="false" /></label>
+                    <label class="field" id="preDPathWrap" hidden><span class="label" data-i18n="pretrainedPath"></span><input id="preDPath" type="text" spellcheck="false" /></label>
+                  </div>
+                  <small class="hint" id="nvcPretrainedHint" hidden data-i18n="nvcPretrainedHint"></small>
+                  <small class="hint" data-i18n="preCatalogHelp"></small>
+                </div>
+                <details class="more">
+                  <summary data-i18n="qualityOptions"></summary>
+                  <div class="stack">
+                    <div class="grid">
+                      <label class="field"><span class="label" data-i18n="unvoicedF0"></span><select id="unvoicedF0"><option value="" data-i18n="automatic"></option><option value="zero" data-i18n="unvoicedZero"></option><option value="interpolate" data-i18n="unvoicedInterpolate"></option></select></label>
+                      <label class="field"><span class="label" data-i18n="layerAug"></span><select id="layerAug"></select></label>
+                    </div>
+                    <div id="layerAugProbWrap" hidden><label class="field"><span class="label" data-i18n="layerAugProb"></span>
+                <span class="range-row"><input id="layerAugProb" type="range" min="0.05" max="1" step="0.05" value="0.5" /><output>0.5</output></span>
+                <small class="hint" data-i18n="layerAugHint"></small>
+              </label></div>
+                    <div class="toggles">
+                      <label class="switch"><input id="hfBands" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="hfBands"></span><small class="hint" data-i18n="hfBandsHint"></small></span></label>
+                      <label class="switch"><input id="emaWeights" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="emaWeights"></span><small class="hint" data-i18n="emaHint"></small></span></label>
+                      <label class="switch"><input id="multiScaleMel" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="multiScaleMel"></span></span></label>
+                      <label class="switch"><input id="mrdDisc" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="mrdDisc"></span><small class="hint" data-i18n="mrdHint"></small></span></label>
+                      <label class="switch"><input id="decAa" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="decAa"></span><small class="hint" data-i18n="decAaHint"></small></span></label>
+                      <label class="switch"><input id="freshStart" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="freshStart"></span><small class="hint" data-i18n="freshStartHint"></small></span></label>
+                    </div>
+                    <div class="grid three">
+                      <label class="field"><span class="label" data-i18n="stftLoss"></span><input id="stftLoss" type="number" min="0" step="0.5" value="0" /></label>
+                      <label class="field"><span class="label" data-i18n="phoneticLoss"></span><input id="phoneticLoss" type="number" min="0" step="5" value="0" /></label>
+                      <label class="field"><span class="label" data-i18n="phoneticEncoder"></span><select id="phoneticEncoder"></select></label>
+                    </div>
+                    <label class="field"><span class="label" data-i18n="trainOnly"></span><input id="trainOnly" type="text" spellcheck="false" placeholder="enc_p" /></label>
+                    <small class="hint" data-i18n="trainOnlyHint"></small>
+                  </div>
+                </details>
+                <details class="more">
+                  <summary>NVC-TS</summary>
+                  <div class="stack">
+                    <p class="hint" data-i18n="timbreHelp"></p>
+                    <div class="grid">
+                      <label class="field"><span class="label" data-i18n="timbreMode"></span><select id="timbreMode"><option value="" data-i18n="automatic"></option><option value="pool" data-i18n="useFeaturePool"></option><option value="off" data-i18n="off"></option></select></label>
+                      <label class="field" id="timbrePoolWrap" hidden><span class="label" data-i18n="featurePoolPath"></span><input id="timbrePool" type="text" spellcheck="false" /></label>
+                    </div>
+                    <label class="field" id="timbreExcludeWrap" hidden><span class="label" data-i18n="featurePoolExclude"></span><input id="timbreExclude" type="text" spellcheck="false" /></label>
+                    <div class="sub">
+                      <h3 data-i18n="buildFeaturePool"></h3>
+                      <p class="hint" data-i18n="featurePoolHelp"></p>
+                      <div class="grid three">
+                        <label class="field"><span class="label" data-i18n="featurePoolSpec"></span><input id="poolSpec" type="text" spellcheck="false" placeholder='{"Alex":["audio/alex"]}' /></label>
+                        <label class="field"><span class="label" data-i18n="featurePoolOutput"></span><input id="poolOutput" type="text" spellcheck="false" placeholder="assets/feature_pools/voices" /></label>
+                        <label class="field"><span class="label" data-i18n="featurePoolMinutes"></span><input id="poolMinutes" type="number" min="0.01" step="any" value="8" /></label>
+                      </div>
+                      <div class="actions">
+              <button type="button" id="buildFeaturePool" class="btn primary" data-i18n="buildPool"></button>
+              <button type="button" id="stopFeaturePool" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                    </div>
+                  </div>
+                </details>
+                <div class="actions">
+              <button type="button" id="runTrain" class="btn primary" data-i18n="trainModel"></button>
+              <button type="button" id="stopTrain" class="btn danger" hidden data-i18n="stop"></button>
+              <button type="button" id="runIndex" class="btn" data-i18n="trainIndex"></button>
+              <button type="button" id="stopIndex" class="btn danger" hidden data-i18n="stop"></button>
+              <button type="button" id="runAll" class="btn" data-i18n="oneClick"></button>
+              <button type="button" id="stopAll" class="btn danger" hidden data-i18n="stop"></button>
+              <span id="trainExport" class="contents"></span>
+            </div>
+                <pre class="log" id="trainLog" aria-live="polite"></pre>
+              </div>
+            </section>
+
+            <section class="card step">
+              <header class="card-head"><h2><span class="step-num mono">5</span><span data-i18n="step4"></span></h2>
+                <button type="button" id="refreshResume" class="icon-btn" data-i18n-attr="aria-label:refreshExperiments"><svg class="icon" aria-hidden="true"><use href="#i-refresh" /></svg></button>
+              </header>
+              <div class="stack">
+                <p class="hint" data-i18n="resumeLead"></p>
+                <div class="grid four">
+                  <label class="field"><span class="label" data-i18n="resumeExp"></span><select id="resumeExp"></select></label>
+                  <label class="field"><span class="label" data-i18n="resumeTotal"></span><input id="resumeTotal" type="number" min="2" step="1" value="600" /></label>
+                  <label class="field"><span class="label" data-i18n="trainPrecision"></span><select id="resumePrecision"><option value="" data-i18n="automatic"></option><option value="fp32">FP32</option><option value="fp16">FP16 (CUDA)</option><option value="bf16">BF16 (CUDA)</option></select></label>
+                  <label class="field"><span class="label" data-i18n="gradientCheckpointing"></span><select id="resumeCheckpointing"><option value="" data-i18n="automatic"></option><option value="true" data-i18n="yes"></option><option value="false" data-i18n="no"></option></select></label>
+                </div>
+                <dl class="facts mono" id="resumeInfo"></dl>
+                <div class="actions">
+              <button type="button" id="runResume" class="btn primary" data-i18n="resumeTrain"></button>
+              <button type="button" id="stopResume" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                <pre class="log" id="resumeLog" aria-live="polite"></pre>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="panel" data-panel="layers">
+          <header class="page-head"><h1 data-i18n="layersTitle"></h1><p data-i18n="layersLead"></p></header>
+          <div class="work even">
+            <section class="card">
+              <header class="card-head"><h2 data-i18n="layeredCopy"></h2></header>
+              <div class="stack">
+                <div class="grid">
+                  <label class="field"><span class="label" data-i18n="sourceExperiment"></span><select id="laSource"></select></label>
+                  <label class="field"><span class="label" data-i18n="outputExperiment"></span><input id="laOutput" type="text" spellcheck="false" autocomplete="off" /></label>
+                  <div class="field"><span class="label" data-i18n="sampleRate"></span>
+                    <div class="seg" role="radiogroup">
+                      <label><input type="radio" name="laSr" value="32000" /><span>32k</span></label>
+                      <label><input type="radio" name="laSr" value="40000" checked /><span>40k</span></label>
+                      <label><input type="radio" name="laSr" value="48000" /><span>48k</span></label>
+                    </div>
+                  </div>
+                  <label class="field"><span class="label" data-i18n="seed"></span><input id="laSeed" type="number" min="0" step="1" value="0" /></label>
+                </div>
+                <label class="switch"><input id="laLayers" type="checkbox" role="switch" checked /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="layersOn"></span><small class="hint" data-i18n="layersOnHint"></small></span></label>
+                <label class="switch"><input id="laFx" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="fxOn"></span><small class="hint" data-i18n="fxOnHint"></small></span></label>
+                <label class="field" id="laFxProfileWrap" hidden><span class="label" data-i18n="fxProfilePath"></span><input id="laFxProfile" type="text" spellcheck="false" placeholder="assets/fx_profile.json" /></label>
+                <label class="field"><span class="label" data-i18n="bleedFolder"></span><input id="laBleed" type="text" spellcheck="false" /></label>
+                <small class="hint" data-i18n="bleedHint"></small>
+                <div class="sub">
+                  <label class="switch"><input id="laExtract" type="checkbox" role="switch" checked /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="extractAfter"></span><small class="hint" data-i18n="extractAfterHint"></small></span></label>
+                  <div class="grid" id="laExtractFields">
+                    <label class="field"><span class="label" data-i18n="contentEmbedder"></span><select id="laEmbedder"></select></label>
+                    <div class="field"><span class="label" data-i18n="trainF0"></span>
+              <div class="seg" role="radiogroup">
+                <label><input type="radio" name="laF0" value="pm" /><span>pm</span></label>
+                <label><input type="radio" name="laF0" value="rmvpe" /><span>rmvpe</span></label>
+                <label><input type="radio" name="laF0" value="nmvpe" /><span>nmvpe</span></label>
+                <label><input type="radio" name="laF0" value="fcpe" /><span>fcpe</span></label>
+              </div>
+              <small class="hint pitch-availability" data-i18n="pitchWeightsMissing">Install weights on the server to enable other pitch methods</small>
+                    </div>
+                  </div>
+                </div>
+                <div class="actions">
+              <button type="button" id="runLayers" class="btn primary" data-i18n="buildLayers"></button>
+              <button type="button" id="stopLayers" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                <pre class="log" id="laLog" aria-live="polite"></pre>
+              </div>
+            </section>
+            <section class="card">
+              <header class="card-head"><h2 data-i18n="fxProfile"></h2></header>
+              <div class="stack">
+                <p class="hint" data-i18n="fxProfileLead"></p>
+                <label class="field"><span class="label" data-i18n="fxInput"></span><input id="fxIn" type="text" spellcheck="false" placeholder="datasets/artist_vocals" /></label>
+                <label class="field"><span class="label" data-i18n="fxOutput"></span><input id="fxOut" type="text" spellcheck="false" value="assets/fx_profile.json" /></label>
+                <div class="actions">
+              <button type="button" id="runFx" class="btn primary" data-i18n="measure"></button>
+              <button type="button" id="stopFx" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                <pre class="log" id="fxLog" aria-live="polite"></pre>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="panel" data-panel="metrics">
+          <header class="page-head"><h1 data-i18n="metricsTitle"></h1><p data-i18n="metricsLead"></p></header>
+          <section class="card chart-card">
+            <header class="card-head">
+              <div class="grid inline">
+                <label class="field"><span class="label" data-i18n="expName"></span><select id="metricRun"></select></label>
+                <label class="field"><span class="label" data-i18n="metricName"></span><select id="metricName"></select></label>
+              </div>
+              <button type="button" id="tbReload" class="icon-btn" data-i18n-attr="aria-label:tbReload"><svg class="icon" aria-hidden="true"><use href="#i-refresh" /></svg></button>
+            </header>
+            <dl class="figures" id="metricFigures" hidden>
+              <div><dt data-i18n="metricLast"></dt><dd class="mono" id="mLast"></dd></div>
+              <div><dt data-i18n="metricBest"></dt><dd class="mono" id="mBest"></dd></div>
+              <div><dt data-i18n="metricSteps"></dt><dd class="mono" id="mSteps"></dd></div>
+            </dl>
+            <svg id="metricChart" class="chart" viewBox="0 0 960 320" preserveAspectRatio="none" role="img" hidden></svg>
+            <p class="hint" id="tbStatus" role="status"></p>
+          </section>
+        </section>
+
+        <section class="panel" data-panel="speakers">
+          <header class="page-head"><h1 data-i18n="helperTitle"></h1><p data-i18n="helperLead"></p></header>
+          <section class="card">
+            <header class="card-head">
+              <label class="field"><span class="label" data-i18n="expName"></span><input id="hExp" type="text" spellcheck="false" autocomplete="off" /></label>
+              <span class="meta mono" id="hPage">1 / 1</span>
+            </header>
+            <div class="table-head">
+              <span data-i18n="path"></span><span data-i18n="name"></span><span data-i18n="id"></span><span data-i18n="repeat"></span>
+            </div>
+            <div id="hRows" class="rows"></div>
+            <div class="actions">
+              <button type="button" id="hSubmit" class="btn primary" data-i18n="submitManifest"></button>
+              <button type="button" id="hAdd" class="btn" data-i18n="addRow"></button>
+              <button type="button" id="hDel" class="btn" data-i18n="delRow"></button>
+              <span class="spacer"></span>
+              <button type="button" id="hPrev" class="btn ghost" data-i18n="prev"></button>
+              <button type="button" id="hNext" class="btn ghost" data-i18n="next"></button>
+            </div>
+            <pre class="log" id="hStatus" aria-live="polite"></pre>
+          </section>
+        </section>
+
+        <section class="panel" data-panel="library">
+          <header class="page-head"><h1 data-i18n="libTitle"></h1><p data-i18n="libLead"></p></header>
+          <div class="work">
+            <section class="card">
+              <header class="card-head">
+                <h2 data-i18n="libImport"></h2>
+                <div class="seg compact" role="radiogroup">
+                  <label><input type="radio" name="libKind" value="zip" checked /><span data-i18n="libZip"></span></label>
+                  <label><input type="radio" name="libKind" value="pretrained" /><span data-i18n="libPre"></span></label>
+                </div>
+              </header>
+              <div class="stack">
+                <label class="field" id="libUrlWrap"><span class="label" data-i18n="libUrl"></span><input id="libUrl" type="url" spellcheck="false" autocomplete="off" placeholder="https://" /></label>
+                <div id="libFileWrap"><div class="drop" data-drop-for="libFile">
+                <input id="libFile" type="file" accept=".zip,.pth,.index,.json" hidden />
+                <svg class="icon drop-icon" aria-hidden="true"><use href="#i-upload" /></svg>
+                <span class="drop-text"><span class="drop-title" data-i18n="libDropZip"></span><span class="drop-hint" data-i18n="libDropHint"></span></span>
+                <span class="drop-name" data-empty="true" data-i18n="noFile"></span>
+                <button type="button" class="drop-clear icon-btn" hidden data-i18n-attr="aria-label:clearFile"><svg class="icon" aria-hidden="true"><use href="#i-x" /></svg></button>
+              </div></div>
+                <div id="libPretrainedFields" class="grid" hidden>
+                  <label class="field"><span class="label" data-i18n="libGUrl"></span><input id="libGUrl" type="url" spellcheck="false" placeholder="https://…/f0G40k.pth" /></label>
+                  <label class="field"><span class="label" data-i18n="libDUrl"></span><input id="libDUrl" type="url" spellcheck="false" placeholder="https://…/f0D40k.pth" /></label>
+                </div>
+                <div class="grid">
+                  <label class="field"><span class="label" data-i18n="importName"></span><input id="libName" type="text" spellcheck="false" autocomplete="off" /></label>
+                  <label class="field" id="libRateWrap" hidden><span class="label" data-i18n="sampleRate"></span><select id="libRate"><option value="32000">32k</option><option value="40000" selected>40k</option><option value="48000">48k</option></select></label>
+                </div>
+                <div class="actions">
+              <button type="button" id="runLib" class="btn primary" data-i18n="libImportBtn"></button>
+              <button type="button" id="stopLib" class="btn danger" hidden data-i18n="stop"></button>
+            </div>
+                <pre class="log" id="libLog" aria-live="polite"></pre>
+              </div>
+            </section>
+            <section class="card">
+              <header class="card-head"><h2 data-i18n="installedVoices"></h2><span class="meta mono" id="voiceCount"></span></header>
+              <ul class="list mono" id="voiceList"></ul>
+            </section>
+          </div>
+        </section>
+
+        <section class="panel" data-panel="ckpt">
+          <header class="page-head"><h1 data-i18n="ckptTitle"></h1><p data-i18n="ckptLead"></p></header>
+          <div class="work even">
+            <section class="card">
+              <header class="card-head"><h2 data-i18n="merge"></h2></header>
+              <div class="stack">
+                <div class="grid">
+                  <label class="field"><span class="label" data-i18n="modelA"></span><input id="mA" list="modelNames" type="text" spellcheck="false" /></label>
+                  <label class="field"><span class="label" data-i18n="modelB"></span><input id="mB" list="modelNames" type="text" spellcheck="false" /></label>
+                </div>
+                <label class="field"><span class="label" data-i18n="weightA"></span>
+                <span class="range-row"><input id="mAlpha" type="range" min="0" max="1" step="0.01" value="0.5" /><output>0.5</output></span>
+              </label>
+                <label class="field"><span class="label" data-i18n="saveNameNoExt"></span><input id="mName" type="text" spellcheck="false" /></label>
+                <label class="field"><span class="label" data-i18n="modelInfo"></span><textarea id="mInfo" rows="2"></textarea></label>
+                <div class="actions"><button type="button" id="runMerge" class="btn primary" data-i18n="merge"></button></div>
+                <pre class="log" id="mLog" aria-live="polite"></pre>
+              </div>
+            </section>
+            <section class="card">
+              <header class="card-head"><h2 data-i18n="extract"></h2></header>
+              <div class="stack">
+                <label class="field"><span class="label" data-i18n="trainCheckpoint"></span><input id="ePath" type="text" spellcheck="false" placeholder="logs/voice/G_2333.pth" /></label>
+                <div class="grid">
+                  <label class="field"><span class="label" data-i18n="saveName"></span><input id="eName" type="text" spellcheck="false" /></label>
+                  <label class="field"><span class="label" data-i18n="modelVersion"></span><select id="exportVersion"><option value="v2">RVC v2</option><option value="v1">RVC v1</option></select></label>
+                  <div class="field"><span class="label" data-i18n="sampleRate"></span>
+                    <div class="seg" role="radiogroup">
+                      <label><input type="radio" name="eSr" value="32k" /><span>32k</span></label>
+                      <label><input type="radio" name="eSr" value="40k" checked /><span>40k</span></label>
+                      <label><input type="radio" name="eSr" value="48k" /><span>48k</span></label>
+                    </div>
+                  </div>
+                  <div class="field"><span class="label" data-i18n="pitchGuide"></span>
+                    <div class="seg" role="radiogroup">
+                      <label><input type="radio" name="eF0" value="1" checked /><span data-i18n="yes"></span></label>
+                      <label><input type="radio" name="eF0" value="0" /><span data-i18n="no"></span></label>
+                    </div>
+                  </div>
+                </div>
+                <label class="field"><span class="label" data-i18n="modelInfo"></span><textarea id="eInfo" rows="2"></textarea></label>
+                <div class="actions"><button type="button" id="runExtCkpt" class="btn primary" data-i18n="extract"></button></div>
+                <pre class="log" id="eLog" aria-live="polite"></pre>
+              </div>
+            </section>
+            <section class="card">
+              <header class="card-head"><h2 data-i18n="modify"></h2></header>
+              <div class="stack">
+                <div class="grid">
+                  <label class="field"><span class="label" data-i18n="modelPath"></span><input id="modPath" list="modelNames" type="text" spellcheck="false" /></label>
+                  <label class="field"><span class="label" data-i18n="saveName"></span><input id="modName" type="text" spellcheck="false" /></label>
+                </div>
+                <label class="field"><span class="label" data-i18n="newInfo"></span><textarea id="modInfo" rows="2"></textarea></label>
+                <div class="actions"><button type="button" id="runMod" class="btn primary" data-i18n="modifyBtn"></button></div>
+                <pre class="log" id="modLog" aria-live="polite"></pre>
+              </div>
+            </section>
+            <section class="card">
+              <header class="card-head"><h2 data-i18n="inspect"></h2></header>
+              <div class="stack">
+                <label class="field"><span class="label" data-i18n="modelPath"></span><input id="insPath" list="modelNames" type="text" spellcheck="false" /></label>
+                <div class="actions"><button type="button" id="runShow" class="btn primary" data-i18n="inspect"></button></div>
+                <dl class="facts mono" id="insInfo"></dl>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="panel" data-panel="faq">
+          <header class="page-head"><h1 data-i18n="faqTitle"></h1><p data-i18n="faqLead"></p></header>
+          <section class="card prose">
+            <h2 data-i18n="faqModelsTitle"></h2><p data-i18n="faqModelsBody"></p>
+            <h2 data-i18n="faqCoverTitle"></h2><p data-i18n="faqCoverBody"></p>
+            <h2 data-i18n="faqGuardTitle"></h2><p data-i18n="faqGuardBody"></p>
+            <h2 data-i18n="faqGateTitle"></h2><p data-i18n="faqGateBody"></p>
+            <h2 data-i18n="faqPretrainTitle"></h2><p data-i18n="faqPretrainBody"></p>
+            <h2 data-i18n="faqLayersTitle"></h2><p data-i18n="faqLayersBody"></p>
+            <h2 data-i18n="faqVramTitle"></h2><p data-i18n="faqVramBody"></p>
+            <h2 data-i18n="faqTrainingTitle"></h2><p data-i18n="faqTrainingBody"></p>
+            <h2 data-i18n="faqPathsTitle"></h2><p data-i18n="faqPathsBody"></p>
+          </section>
+        </section>
+      </main>
     </div>
-    <details class="options">
-      <summary>Conversion settings</summary>
-      <div class="pair">
-        <label>Retrieval index<input name="index" placeholder="Select automatically"></label>
-        <label>Index mix<input name="index_rate" type="number" min="0" max="1" step="0.01" value="0.75" required></label>
-        <label>Volume envelope mix<input name="rms_mix_rate" type="number" min="0" max="1" step="0.01" value="1" required></label>
-        <label>Consonant protection<input name="protect" type="number" min="0" max="0.5" step="0.01" value="0.33" required></label>
-        <label>Output rate (Hz)<input name="resample_sr" type="number" min="0" max="192000" value="0" required></label>
-        <label>Compute device<input name="device" value="auto" placeholder="cpu, cuda:0, mps"></label>
-      </div>
-    </details>
-  </template>
-  <template id="speaker-row">
-    <div class="speaker-row">
-      <label>Audio folder<input data-field="path"></label>
-      <label>Speaker name<input data-field="speaker_name"></label>
-      <label>ID<input data-field="speaker_id" type="number" min="0" max="109"></label>
-      <label>Repeat<input data-field="repeat" type="number" min="1"></label>
-      <button type="button" class="remove-speaker" aria-label="Remove speaker row">Remove</button>
-    </div>
-  </template>
-</body>
+    <datalist id="modelNames"></datalist>
+    <div id="toasts" class="toasts" role="region" data-i18n-attr="aria-label:notifications"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
 </html>

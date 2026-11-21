@@ -1,22 +1,35 @@
 use anyhow::Result;
 use tch::{Kind, Tensor};
 
+use super::precision::Precision;
 use crate::model::discriminator::Discriminator;
 use crate::model::synth::{
     Synth,
     training::{Output as Generated, segments},
 };
 use crate::model::train_data::Batch;
-use crate::model::train_losses::{self, MelSpectrogram};
+use crate::model::train_losses::{
+    self, MelSpectrogram, MultiResolutionStft, MultiScaleMel, PhoneticLoss,
+};
 
 #[derive(Clone, Copy)]
 pub(super) struct Settings {
-    pub amp: bool,
+    pub precision: Precision,
+    pub checkpointing: bool,
     pub segment_frames: i64,
     pub hop_length: i64,
     pub segment_size: i64,
     pub c_mel: f64,
     pub c_kl: f64,
+    pub c_stft: f64,
+    pub c_phonetic: f64,
+}
+
+/// Optional generator losses beyond the RVC mel/KL/adversarial terms.
+#[derive(Default)]
+pub(super) struct Auxiliary {
+    pub stft: Option<MultiResolutionStft>,
+    pub phonetic: Option<PhoneticLoss>,
 }
 
 pub(super) struct Forward {
@@ -34,6 +47,8 @@ pub(super) struct DiscriminatorLoss {
 pub(super) struct GeneratorLoss {
     pub total: Tensor,
     pub mel: Tensor,
+    pub stft: Option<Tensor>,
+    pub phonetic: Option<Tensor>,
     pub kl: Tensor,
     pub feature: Tensor,
     pub scores: Vec<Tensor>,
@@ -44,7 +59,9 @@ pub(super) struct GeneratorLoss {
 
 impl Settings {
     pub(super) fn generate(&self, model: &Synth, batch: &Batch) -> Result<Forward> {
-        let generated = tch::autocast(self.amp, || model.train_batch(batch, self.segment_frames))?;
+        let generated = self
+            .precision
+            .run(|| model.train_batch(batch, self.segment_frames, self.checkpointing))?;
         let source = segments(
             &batch.wave,
             &(&generated.starts * self.hop_length),
@@ -62,9 +79,9 @@ impl Settings {
         model: &mut Discriminator,
         forward: &Forward,
     ) -> Result<DiscriminatorLoss> {
-        let (real, generated) = tch::autocast(self.amp, || {
-            model.forward(&forward.source, &forward.generated.audio.detach(), true)
-        })?;
+        let (real, generated) = self
+            .precision
+            .run(|| model.forward(&forward.source, &forward.generated.audio.detach(), true))?;
         let total = train_losses::discriminator_loss(&real.scores, &generated.scores)?;
         Ok(DiscriminatorLoss {
             total,
@@ -78,24 +95,41 @@ impl Settings {
         model: &mut Discriminator,
         forward: Forward,
         mel: &MelSpectrogram,
+        multiscale: Option<&MultiScaleMel>,
+        auxiliary: &Auxiliary,
     ) -> Result<GeneratorLoss> {
         let Forward {
             generated,
             source,
             spectrum,
         } = forward;
-        let (real, synthetic) =
-            tch::autocast(self.amp, || model.forward(&source, &generated.audio, true))?;
-        let full_mel = tch::autocast(self.amp, || mel.spec_to_mel(&spectrum))?;
+        let (real, synthetic) = self
+            .precision
+            .run(|| model.forward(&source, &generated.audio, true))?;
+        let full_mel = self.precision.run(|| mel.spec_to_mel(&spectrum))?;
         let real_mel = segments(&full_mel, &generated.starts, self.segment_frames)?;
-        let generated_mel =
-            mel.mel_spectrogram(&generated.audio.f_to_kind(Kind::Float)?.squeeze_dim(1))?;
-        let generated_mel = if self.amp {
-            generated_mel.f_to_kind(Kind::Half)?
+        let spectrogram =
+            || mel.mel_spectrogram(&generated.audio.f_to_kind(Kind::Float)?.squeeze_dim(1));
+        let generated_mel = if multiscale.is_some() {
+            tch::no_grad(spectrogram)?
         } else {
-            generated_mel
+            spectrogram()?
         };
-        let mel = real_mel.f_l1_loss(&generated_mel, tch::Reduction::Mean)? * self.c_mel;
+        let generated_mel = generated_mel.f_to_kind(self.precision.kind())?;
+        let mel = if let Some(multiscale) = multiscale {
+            multiscale.loss(&source, &generated.audio)? * (self.c_mel / 3.0)
+        } else {
+            // BF16 convolution is supported by CUDA. Compute the reduction in FP32.
+            let (real, generated) = if self.precision == Precision::Bf16 {
+                (
+                    real_mel.f_to_kind(Kind::Float)?,
+                    generated_mel.f_to_kind(Kind::Float)?,
+                )
+            } else {
+                (real_mel.shallow_clone(), generated_mel.shallow_clone())
+            };
+            real.f_l1_loss(&generated, tch::Reduction::Mean)? * self.c_mel
+        };
         let kl = train_losses::kl_loss(
             &generated.z_p,
             &generated.logs_q,
@@ -105,10 +139,34 @@ impl Settings {
         )? * self.c_kl;
         let feature = train_losses::feature_loss(&real.features, &synthetic.features)?;
         let gan = train_losses::generator_loss(&synthetic.scores)?;
-        let total = &mel + &kl + &feature + &gan;
+        let stft = auxiliary
+            .stft
+            .as_ref()
+            .filter(|_| self.c_stft > 0.0)
+            .map(|stft| -> Result<Tensor> {
+                Ok(stft.loss(&source, &generated.audio)? * self.c_stft)
+            })
+            .transpose()?;
+        let phonetic = auxiliary
+            .phonetic
+            .as_ref()
+            .filter(|_| self.c_phonetic > 0.0)
+            .map(|phonetic| -> Result<Tensor> {
+                Ok(self
+                    .precision
+                    .run(|| phonetic.loss(&source, &generated.audio))?
+                    * self.c_phonetic)
+            })
+            .transpose()?;
+        let mut total = &mel + &kl + &feature + &gan;
+        for extra in [&stft, &phonetic].into_iter().flatten() {
+            total += extra;
+        }
         Ok(GeneratorLoss {
             total,
             mel,
+            stft,
+            phonetic,
             kl,
             feature,
             scores: synthetic.scores,

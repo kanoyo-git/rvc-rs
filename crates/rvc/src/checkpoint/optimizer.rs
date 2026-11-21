@@ -32,6 +32,7 @@ pub(crate) struct AdamWMoments {
     pub exp_avg: Tensor,
     pub exp_avg_sq: Tensor,
     pub max_exp_avg_sq: Option<Tensor>,
+    pub compensation: Option<Tensor>,
 }
 
 pub(crate) struct AdamWState {
@@ -80,10 +81,14 @@ impl Checkpoint {
             let exp_avg = required(&fields, "exp_avg")?;
             let exp_avg_sq = required(&fields, "exp_avg_sq")?;
             let max_exp_avg_sq = fields.get("max_exp_avg_sq").copied();
+            let compensation = fields.get("compensation").copied();
             let (step, step_kind) = self.adamw_step(step, &mut budget)?;
             let exp_avg = self.adamw_tensor(exp_avg, &mut budget)?;
             let exp_avg_sq = self.adamw_tensor(exp_avg_sq, &mut budget)?;
             let max_exp_avg_sq = max_exp_avg_sq
+                .map(|id| self.adamw_tensor(id, &mut budget))
+                .transpose()?;
+            let compensation = compensation
                 .map(|id| self.adamw_tensor(id, &mut budget))
                 .transpose()?;
             ensure!(
@@ -98,6 +103,7 @@ impl Checkpoint {
                     exp_avg,
                     exp_avg_sq,
                     max_exp_avg_sq,
+                    compensation,
                 },
             );
         }

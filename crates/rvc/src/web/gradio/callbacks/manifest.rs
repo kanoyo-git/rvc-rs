@@ -4,7 +4,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use rvc::dataset::{ManifestRowInput, manifest_from_rows, save_manifest};
+use crate::dataset::{ManifestRowInput, manifest_from_rows, save_manifest};
 
 use super::{Args, StateData, lock, training, update};
 

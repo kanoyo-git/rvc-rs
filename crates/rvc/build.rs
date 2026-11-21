@@ -9,9 +9,75 @@ fn main() {
         }
     }
     #[cfg(feature = "inference")]
-    build_cuda_sdpa();
+    {
+        build_training_bridge();
+        build_cuda_sdpa();
+    }
     #[cfg(feature = "cuda-graph")]
     cuda_graph::build();
+}
+
+#[cfg(feature = "inference")]
+fn build_training_bridge() {
+    use std::{env, path::PathBuf, process::Command};
+
+    const SOURCE: &str = "src/model/train/bridge.cpp";
+    println!("cargo:rerun-if-changed={SOURCE}");
+    for name in [
+        "LIBTORCH",
+        "LIBTORCH_INCLUDE",
+        "LIBTORCH_CXX11_ABI",
+        "LIBTORCH_USE_PYTORCH",
+        "VIRTUAL_ENV",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let (includes, abi) = if env::var_os("LIBTORCH_USE_PYTORCH").is_some() {
+        let python = if cfg!(windows) || env::var_os("VIRTUAL_ENV").is_some() {
+            "python"
+        } else {
+            "python3"
+        };
+        let output = Command::new(python)
+            .args(["-c", "import torch; from torch.utils.cpp_extension import include_paths; print(int(torch.compiled_with_cxx11_abi())); print(*include_paths(), sep='\\n')"])
+            .output()
+            .expect("querying PyTorch C++ headers");
+        assert!(
+            output.status.success(),
+            "querying PyTorch C++ headers: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("PyTorch include paths must be text");
+        let mut lines = stdout.lines();
+        let abi = lines.next().expect("missing PyTorch C++ ABI").to_owned();
+        (lines.map(PathBuf::from).collect::<Vec<_>>(), abi)
+    } else {
+        let root = env::var_os("LIBTORCH_INCLUDE")
+            .or_else(|| env::var_os("LIBTORCH"))
+            .map_or_else(|| PathBuf::from("/usr"), PathBuf::from);
+        let include = root.join("include");
+        (
+            vec![include.join("torch/csrc/api/include"), include],
+            env::var("LIBTORCH_CXX11_ABI").unwrap_or_else(|_| "1".into()),
+        )
+    };
+    // A dependency-only type check with tch/doc-only has no LibTorch SDK.
+    if !includes
+        .iter()
+        .any(|path| path.join("ATen/autocast_mode.h").is_file())
+    {
+        return;
+    }
+    let mut compiler = cc::Build::new();
+    compiler
+        .cpp(true)
+        .std("c++17")
+        .flag_if_supported("/EHsc")
+        .define("_GLIBCXX_USE_CXX11_ABI", abi.as_str())
+        .includes(includes)
+        .file(SOURCE)
+        .warnings(false)
+        .compile("rvc_training");
 }
 
 #[cfg(feature = "inference")]

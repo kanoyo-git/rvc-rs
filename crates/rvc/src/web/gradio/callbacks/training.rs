@@ -9,8 +9,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::{Action, Args, StateData, model, trim_path, update, work};
+use crate::model::{PitchMethod, train::Request, train_data::Version};
 use crate::web::DatasetMode;
-use rvc::model::{PitchMethod, train::Request, train_data::Version};
 
 pub(super) fn run(
     state: &StateData,
@@ -29,6 +29,7 @@ pub(super) fn run(
                 sample_rate: rate(args.text(2)?)?,
                 workers: args.integer(3)?,
                 segment_seconds: segment_duration()?,
+                denoise: 0.0,
             }
         }
         14 => {
@@ -51,12 +52,14 @@ pub(super) fn run(
                 devices = gpu_list(args.text(6)?)?;
             }
             Action::Extract {
+                embedder: None,
                 experiment: experiment(state, args.text(4)?)?,
                 version: version(args.text(5)?)?.name().to_owned(),
                 f0_method: method,
                 device: "auto".to_owned(),
                 gpus: devices,
                 overwrite: true,
+                unvoice_fricatives: false,
             }
         }
         18..=20 => return pretrained_updates(state, index, args),
@@ -67,13 +70,13 @@ pub(super) fn run(
         23 => Action::Index {
             experiment: experiment(state, args.text(0)?)?,
             version: match version(args.text(1)?)? {
-                Version::V1 => rvc::train_index::ModelVersion::V1,
-                Version::V2 => rvc::train_index::ModelVersion::V2,
+                Version::V1 => crate::train_index::ModelVersion::V1,
+                Version::V2 => crate::train_index::ModelVersion::V2,
             },
             mode: if multi(args.text(2)?) {
-                rvc::train_index::IndexMode::Multi
+                crate::train_index::IndexMode::Multi
             } else {
-                rvc::train_index::IndexMode::Single
+                crate::train_index::IndexMode::Single
             },
             workers: std::thread::available_parallelism().map_or(1, usize::from),
         },
@@ -88,6 +91,7 @@ pub(super) fn run(
                 workers: args.integer(5)?,
                 segment_seconds: segment_duration()?,
                 f0_method: pitch(args.text(6)?)?,
+                denoise: 0.0,
             }
         }
         #[cfg(not(feature = "index-training"))]

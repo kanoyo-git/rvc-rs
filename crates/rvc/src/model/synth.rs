@@ -4,6 +4,8 @@ mod onnx_decoder;
 mod onnx_flow;
 #[cfg(feature = "onnx")]
 mod onnx_prior;
+mod alias_free;
+pub mod bands;
 #[cfg(test)]
 mod tests;
 pub mod training;
@@ -40,6 +42,7 @@ struct Onnx {
     decoder: Option<onnx_decoder::Decoder>,
 }
 
+#[derive(Clone)]
 struct Config {
     inter: i64,
     hidden: i64,
@@ -52,6 +55,8 @@ struct Config {
     dilations: Vec<Vec<i64>>,
     upsample_rates: Vec<i64>,
     upsample_kernels: Vec<i64>,
+    /// Run decoder activations at twice the rate between low-pass filters.
+    aa: bool,
 }
 
 impl Config {
@@ -104,6 +109,7 @@ impl Config {
                 .collect::<Result<_>>()?,
             upsample_rates: numbers(&list[12])?,
             upsample_kernels: numbers(&list[14])?,
+            aa: false,
         };
         let hop = config
             .upsample_rates
@@ -133,6 +139,14 @@ impl Config {
         Ok(config)
     }
 
+    fn leaky(&self, x: &Tensor, slope: f64) -> Tensor {
+        if self.aa {
+            alias_free::leaky(x, slope)
+        } else {
+            leaky(x, slope)
+        }
+    }
+
     fn decoder_context(&self, hop: i64) -> Option<i64> {
         let depth = if self.resblock == 1 { 3 } else { 2 };
         let extra = i64::from(self.resblock == 1);
@@ -149,6 +163,12 @@ impl Config {
                         .sum::<i64>()
             })
             .max()?;
+        // Each anti-aliased activation reads its filter taps on both sides.
+        let residual = if self.aa {
+            residual + alias_free::CONTEXT * depth as i64 * (1 + extra)
+        } else {
+            residual
+        };
         // Indices changed by cropping can spread across each convolution.
         // Count the affected samples starting at conv_pre, then conv_post.
         let mut context = 3;
@@ -156,6 +176,9 @@ impl Config {
             let difference = kernel - stride;
             if difference % 2 != 0 {
                 return None;
+            }
+            if self.aa {
+                context += alias_free::CONTEXT;
             }
             context = context * stride + difference / 2 + residual;
         }
@@ -193,12 +216,13 @@ impl Synth {
             .sample_rate
             .filter(|rate| matches!(rate, 32_000 | 40_000 | 48_000))
             .context("unsupported RVC sample rate")?;
-        let config = Config::read(
+        let mut config = Config::read(
             checkpoint
                 .metadata("config")?
                 .context("missing generator config")?,
             rate,
         )?;
+        config.aa = info.format.dec_aa;
         let mut weights = Weights::new(checkpoint.weights(Some("weight"), Device::Cpu)?);
         weights.remove_weight_norm(0)?;
         #[cfg(feature = "onnx")]
@@ -245,10 +269,16 @@ impl Synth {
         })
     }
 
+    /// Whether this generator reads source high-band features.
+    pub fn uses_bands(&self) -> bool {
+        self.weights.get(bands::WEIGHT).is_ok()
+    }
+
     pub fn infer(
         &self,
         phone: &Tensor,
         pitch: Option<(&Tensor, &Tensor)>,
+        bands: Option<&Tensor>,
         speaker: i64,
         window: Window,
     ) -> Result<Tensor> {
@@ -268,10 +298,10 @@ impl Synth {
         let speaker = self.speaker(&ids)?;
         let flow_head = (window.skip - 24).max(0);
         let coarse = pitch.map(|(coarse, _)| coarse);
-        let (mean, logs, mask) = self.inference_prior(phone, coarse, flow_head)?;
+        let (mean, logs, mask) = self.inference_prior(phone, coarse, bands, flow_head)?;
         // Keep the seeded noise in logical channel order across convolution layouts.
         let noise = Tensor::randn(mean.size(), (mean.kind(), mean.device()));
-        let latent = (&mean + logs.exp() * noise * 0.66666) * &mask;
+        let latent = (&mean + logs.exp() * noise * self.info.format.default_noise_scale) * &mask;
         let z = self.flow(latent, &mask, &speaker, true)?;
         let z = z.narrow(2, window.skip - flow_head, window.frames);
         let f0 = pitch.map(|(_, hz)| hz.narrow(1, window.skip, window.frames));
@@ -281,6 +311,7 @@ impl Synth {
             &speaker,
             window.stretched_frames,
             window.trim_frames,
+            false,
         )
     }
 
@@ -288,24 +319,29 @@ impl Synth {
         &self,
         phone: &Tensor,
         pitch: Option<(&Tensor, &Tensor)>,
+        bands: Option<&Tensor>,
         speaker: i64,
         window: Window,
         pool: &Cache,
     ) -> Result<Tensor> {
         #[cfg(feature = "onnx")]
         if self.onnx.prior.is_some() || self.onnx.flow.is_some() || self.onnx.decoder.is_some() {
-            return self.infer(phone, pitch, speaker, window);
+            return self.infer(phone, pitch, bands, speaker, window);
         }
         let key = [speaker, window.skip, window.frames, window.stretched_frames];
         let mut graph = self.graph.borrow_mut();
-        match pitch {
-            Some((coarse, hz)) => graph.run(key, &[phone, coarse, hz], Some(pool), |args| {
-                self.infer(args[0], Some((args[1], args[2])), speaker, window)
-            }),
-            None => graph.run(key, &[phone], Some(pool), |args| {
-                self.infer(args[0], None, speaker, window)
-            }),
-        }
+        let mut inputs = vec![phone];
+        inputs.extend(pitch.map(|(coarse, hz)| [coarse, hz]).into_iter().flatten());
+        inputs.extend(bands);
+        let has_pitch = pitch.is_some();
+        graph.run(key, &inputs, Some(pool), |args| {
+            let (pitch, rest) = if has_pitch {
+                (Some((args[1], args[2])), &args[3..])
+            } else {
+                (None, &args[1..])
+            };
+            self.infer(args[0], pitch, rest.first().copied(), speaker, window)
+        })
     }
 
     fn speaker(&self, ids: &Tensor) -> Result<Tensor> {
@@ -320,20 +356,26 @@ impl Synth {
         &self,
         phone: &Tensor,
         pitch: Option<&Tensor>,
+        bands: Option<&Tensor>,
         skip: i64,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         #[cfg(feature = "onnx")]
         if let Some(prior) = &self.onnx.prior {
+            ensure!(
+                bands.is_none(),
+                "the ONNX prior does not support source band features"
+            );
             return prior.stats(phone, pitch, skip);
         }
         let lengths = Tensor::full([1], phone.size()[1], (Kind::Int64, phone.device()));
-        self.prior(phone, pitch, &lengths, skip, false)
+        self.prior(phone, pitch, bands, &lengths, skip, false)
     }
 
     fn prior(
         &self,
         phone: &Tensor,
         pitch: Option<&Tensor>,
+        bands: Option<&Tensor>,
         lengths: &Tensor,
         skip: i64,
         training: bool,
@@ -349,6 +391,13 @@ impl Synth {
                     .f_index_select(0, &coarse.reshape([-1]))?
                     .view([size[0], frames, c.hidden]),
             )?;
+        }
+        if let (Ok(weight), Some(bands)) = (w.get(bands::WEIGHT), bands) {
+            ensure!(
+                bands.size() == [size[0], frames, bands::COUNT],
+                "source band features do not match the content frames"
+            );
+            x = x.f_add(&bands.to_kind(x.kind()).f_matmul(&weight.transpose(0, 1))?)?;
         }
         x = leaky(&(x * (c.hidden as f64).sqrt()), SLOPE).transpose(1, 2);
         let mask = sequence_mask(lengths, frames, x.kind());
@@ -532,6 +581,7 @@ impl Synth {
         speaker: &Tensor,
         frames: i64,
         trim_frames: i64,
+        checkpointing: bool,
     ) -> Result<Tensor> {
         let c = &self.config;
         let w = &self.weights;
@@ -585,7 +635,14 @@ impl Synth {
         } else {
             latent.narrow(2, crop, frames - 2 * crop)
         };
-        let output = self.decode_convolutions(&latent, excitation.as_ref(), speaker, crop, hop)?;
+        let output = self.decode_convolutions(
+            &latent,
+            excitation.as_ref(),
+            speaker,
+            crop,
+            hop,
+            checkpointing,
+        )?;
         if trim_frames == 0 {
             return Ok(output);
         }
@@ -605,6 +662,7 @@ impl Synth {
         speaker: &Tensor,
         crop: i64,
         hop: i64,
+        checkpointing: bool,
     ) -> Result<Tensor> {
         #[cfg(feature = "onnx")]
         if let Some(decoder) = &self.onnx.decoder {
@@ -622,68 +680,149 @@ impl Synth {
         for (i, (&stride, &kernel)) in c.upsample_rates.iter().zip(&c.upsample_kernels).enumerate()
         {
             stage_hop *= stride;
-            x = w.deconv(
-                &leaky(&x, SLOPE),
-                &format!("dec.ups.{i}"),
+            let stage = UpsampleStage {
+                index: i,
                 stride,
-                (kernel - stride) / 2,
-            )?;
-            if let Some(source) = excitation {
-                let stride = hop / stage_hop;
-                let padding = stride / 2;
-                let name = format!("dec.noise_convs.{i}");
-                // The full excitation retains phase and noise from the
-                // discarded frames. Take only the taps for this window.
-                let (restricted, padding) = if crop == 0 {
-                    (None, padding)
-                } else {
-                    let shape = w.get(&format!("{name}.weight"))?.size();
-                    let kernel = shape.get(2).context("invalid excitation kernel")?;
-                    let length = (x.size()[2] - 1) * stride + kernel;
-                    (Some(source.f_narrow(2, crop * hop - padding, length)?), 0)
-                };
-                x = x.f_add(&w.conv(
-                    restricted.as_ref().unwrap_or(source),
-                    &name,
-                    stride,
-                    padding,
+                kernel,
+                stage_hop,
+                crop,
+                hop,
+            };
+            x = if checkpointing {
+                stage.checkpoint(c, w, &x, excitation)?
+            } else {
+                stage.forward(c, w, &x, excitation)?
+            };
+        }
+        Ok(w.conv(&c.leaky(&x, 0.01), "dec.conv_post", 1, 3, 1, 1)?
+            .tanh())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UpsampleStage {
+    index: usize,
+    stride: i64,
+    kernel: i64,
+    stage_hop: i64,
+    crop: i64,
+    hop: i64,
+}
+
+impl UpsampleStage {
+    fn checkpoint(
+        self,
+        config: &Config,
+        weights: &Weights,
+        x: &Tensor,
+        excitation: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let up = format!("dec.ups.{}.", self.index);
+        let noise = format!("dec.noise_convs.{}.", self.index);
+        let first = self.index * config.kernels.len();
+        let blocks = first..first + config.kernels.len();
+        let entries = weights.matching(|name| {
+            name.starts_with(&up)
+                || excitation.is_some() && name.starts_with(&noise)
+                || name
+                    .strip_prefix("dec.resblocks.")
+                    .and_then(|rest| rest.split_once('.'))
+                    .and_then(|(index, _)| index.parse().ok())
+                    .is_some_and(|index| blocks.contains(&index))
+        });
+        let mut inputs = vec![x];
+        inputs.extend(excitation);
+        let weight_start = inputs.len();
+        let names: Vec<_> = entries.iter().map(|(name, _)| (*name).to_owned()).collect();
+        inputs.extend(entries.into_iter().map(|(_, value)| value));
+        let config = config.clone();
+        super::train::activation::checkpoint(&inputs, move |tensors| {
+            let weights = Weights::new(
+                names
+                    .iter()
+                    .cloned()
+                    .zip(tensors[weight_start..].iter().map(Tensor::shallow_clone))
+                    .collect(),
+            );
+            let source = (weight_start == 2).then(|| &tensors[1]);
+            self.forward(&config, &weights, &tensors[0], source)
+        })
+    }
+
+    fn forward(
+        self,
+        c: &Config,
+        w: &Weights,
+        x: &Tensor,
+        excitation: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let Self {
+            index: i,
+            stride,
+            kernel,
+            stage_hop,
+            crop,
+            hop,
+        } = self;
+        let mut x = w.deconv(
+            &c.leaky(x, SLOPE),
+            &format!("dec.ups.{i}"),
+            stride,
+            (kernel - stride) / 2,
+        )?;
+        if let Some(source) = excitation {
+            let stride = hop / stage_hop;
+            let padding = stride / 2;
+            let name = format!("dec.noise_convs.{i}");
+            // The full excitation retains phase and noise from the
+            // discarded frames. Take only the taps for this window.
+            let (restricted, padding) = if crop == 0 {
+                (None, padding)
+            } else {
+                let shape = w.get(&format!("{name}.weight"))?.size();
+                let kernel = shape.get(2).context("invalid excitation kernel")?;
+                let length = (x.size()[2] - 1) * stride + kernel;
+                (Some(source.f_narrow(2, crop * hop - padding, length)?), 0)
+            };
+            x = x.f_add(&w.conv(
+                restricted.as_ref().unwrap_or(source),
+                &name,
+                stride,
+                padding,
+                1,
+                1,
+            )?)?;
+        }
+        let mut combined = Tensor::zeros_like(&x);
+        for (j, (&kernel, dilations)) in c.kernels.iter().zip(&c.dilations).enumerate() {
+            let layer = format!("dec.resblocks.{}", i * c.kernels.len() + j);
+            let mut branch = x.shallow_clone();
+            let depth = if c.resblock == 1 { 3 } else { 2 };
+            for (n, &dilation) in dilations.iter().take(depth).enumerate() {
+                let group = if c.resblock == 1 { "convs1" } else { "convs" };
+                let mut y = w.conv(
+                    &c.leaky(&branch, SLOPE),
+                    &format!("{layer}.{group}.{n}"),
                     1,
+                    (kernel - 1) * dilation / 2,
+                    dilation,
                     1,
-                )?)?;
-            }
-            let mut combined = Tensor::zeros_like(&x);
-            for (j, (&kernel, dilations)) in c.kernels.iter().zip(&c.dilations).enumerate() {
-                let layer = format!("dec.resblocks.{}", i * c.kernels.len() + j);
-                let mut branch = x.shallow_clone();
-                let depth = if c.resblock == 1 { 3 } else { 2 };
-                for (n, &dilation) in dilations.iter().take(depth).enumerate() {
-                    let group = if c.resblock == 1 { "convs1" } else { "convs" };
-                    let mut y = w.conv(
-                        &leaky(&branch, SLOPE),
-                        &format!("{layer}.{group}.{n}"),
+                )?;
+                if c.resblock == 1 {
+                    y = w.conv(
+                        &c.leaky(&y, SLOPE),
+                        &format!("{layer}.convs2.{n}"),
                         1,
-                        (kernel - 1) * dilation / 2,
-                        dilation,
+                        (kernel - 1) / 2,
+                        1,
                         1,
                     )?;
-                    if c.resblock == 1 {
-                        y = w.conv(
-                            &leaky(&y, SLOPE),
-                            &format!("{layer}.convs2.{n}"),
-                            1,
-                            (kernel - 1) / 2,
-                            1,
-                            1,
-                        )?;
-                    }
-                    branch = branch.f_add(&y)?;
                 }
-                combined += branch;
+                branch = branch.f_add(&y)?;
             }
-            x = combined / c.kernels.len() as f64;
+            combined += branch;
         }
-        Ok(w.conv(&leaky(&x, 0.01), "dec.conv_post", 1, 3, 1, 1)?
-            .tanh())
+        Ok(combined / c.kernels.len() as f64)
     }
 }
 

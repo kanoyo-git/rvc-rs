@@ -17,12 +17,12 @@ use regex::Regex;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use rvc::checkpoint::Checkpoint;
+use crate::checkpoint::Checkpoint;
 
 use super::super::{
     ANALYSIS_RATE, Action, ConversionSettings, Convert, Format, ModelInfo, StateData, audio,
-    conversion_jobs, convert_voice, finish_job, installed_model, job_progress, lock, model,
-    model_output, reserve_job, separation,
+    compute, conversion_jobs, convert_voice, finish_job, installed_model, job_progress, lock,
+    model, model_output, reserve_job, separation,
 };
 
 const MAX_AUDIO: u64 = 128 * 1024 * 1024;
@@ -209,7 +209,17 @@ fn trim_path(value: &str) -> &str {
 
 fn index_path(state: &StateData, path: &str) -> Option<PathBuf> {
     let path = trim_path(path);
-    (!path.is_empty()).then(|| state.paths.root.join(path.replace("trained", "added")))
+    (!path.is_empty()).then(|| {
+        let path = Path::new(path);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        state
+            .paths
+            .root
+            .join(path.with_file_name(crate::catalog::added_name(name)))
+    })
 }
 
 fn selected_index(state: &StateData, model: &str, speaker: Option<i64>) -> Value {
@@ -316,6 +326,7 @@ fn conversion(state: &StateData, args: &Args, settings_start: usize) -> Result<C
         index,
         device: "auto".to_owned(),
         settings,
+        auto_register: false,
     })
 }
 
@@ -417,6 +428,7 @@ fn convert(state: &StateData, args: &Args) -> Result<Option<Value>> {
     if args.at(2).is_null() {
         return Ok(None);
     }
+    let _permit = compute(state)?;
     let staging = TempDir::new()?;
     let input = audio_input(state, args.at(2), staging.path())?;
     let request = conversion(state, args, 3)?;
@@ -424,7 +436,7 @@ fn convert(state: &StateData, args: &Args) -> Result<Option<Value>> {
     let [start, end] = input
         .crop
         .map(|value| (samples.len() as f64 * value / 100.0).round() as usize);
-    let result = convert_voice(state, &request, &samples[start..end])?;
+    let result = convert_voice(state, &request, &samples[start..end], None)?;
     let name = format!("{}.wav", uuid::Uuid::new_v4());
     audio::write_audio(
         &state.legacy.files.path().join(&name),
@@ -442,6 +454,7 @@ fn batch(
     cancelled: &AtomicBool,
     mut progress: impl FnMut(Vec<Value>),
 ) -> Result<Vec<Value>> {
+    let _permit = compute(state)?;
     let request = conversion(state, args, 5)?;
     let input = trim_path(args.text(2)?);
     let destination = trim_path(args.text(3)?);
@@ -488,7 +501,7 @@ fn batch(
             "batch conversion cancelled"
         );
         let outcome = audio::read_mono(&path, ANALYSIS_RATE)
-            .and_then(|samples| convert_voice(state, &request, &samples))
+            .and_then(|samples| convert_voice(state, &request, &samples, Some(&path)))
             .and_then(|audio| {
                 audio::write_audio(&output, &audio.samples, audio.rate, format, true)
             });
@@ -580,8 +593,9 @@ fn work(
     cancelled: Arc<AtomicBool>,
     mut progress: impl FnMut(Vec<Value>),
 ) -> Result<Vec<Value>> {
+    let _permit = compute(state)?;
     ensure!(
-        reserve_job(state, action.name(), &cancelled)?,
+        reserve_job(state, action.name(), &cancelled)?.is_some(),
         "another WebUI task is running"
     );
     let title = match index {
@@ -622,7 +636,7 @@ fn work(
             &format!("{error:#}"),
         ),
     };
-    finish_job(state, &cancelled, result);
+    finish_job(&mut *lock(&state.job)?, &cancelled, result);
     job_output(state, index, &message, false)
 }
 

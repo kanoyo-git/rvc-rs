@@ -80,17 +80,10 @@ pub use configurable::{
     separate_configured, separate_configured_with_params,
 };
 
+pub use crate::model::weights::device;
+
 pub fn optional_config(model_type: &str) -> bool {
     model_type == "vr" || demucs::legacy::is_legacy(model_type)
-}
-
-pub fn device(requested: &str) -> Result<Device> {
-    let device = crate::model::weights::device(requested)?;
-    #[cfg(target_os = "macos")]
-    if requested == "auto" && device == Device::Cpu && tch::utils::has_mps() {
-        return Ok(Device::Mps);
-    }
-    Ok(device)
 }
 
 const SAMPLE_RATE: u32 = 44_100;
@@ -141,7 +134,7 @@ pub struct Preset {
     pub overlap: usize,
 }
 
-pub const PRESETS: [Preset; 5] = [
+pub const PRESETS: [Preset; 8] = [
     Preset {
         id: "dereverb-less-aggressive-18.8050",
         label: "去混响",
@@ -202,6 +195,42 @@ pub const PRESETS: [Preset; 5] = [
         batch: 1,
         overlap: 264_600,
     },
+    Preset {
+        id: "vocals-bs-roformer-ft1-anvuew",
+        label: "vocals (BS-RoFormer FT1, anvuew)",
+        architecture: Architecture::BandSplitRoformer,
+        checkpoint: "bs_roformer_ft1_anvuew_sdr_12.55.ckpt",
+        config: "bs_roformer_anvuew.yaml",
+        model_stem: "vocals",
+        other_stem: "instrument",
+        suffixes: ["vocals", "instrumental"],
+        batch: 1,
+        overlap: 176_400,
+    },
+    Preset {
+        id: "karaoke-bs-roformer-anvuew",
+        label: "lead / backing vocals (BS-RoFormer karaoke, anvuew)",
+        architecture: Architecture::BandSplitRoformer,
+        checkpoint: "karaoke_bs_roformer_anvuew.ckpt",
+        config: "karaoke_bs_roformer_anvuew.yaml",
+        model_stem: "Vocals",
+        other_stem: "Instrumental",
+        suffixes: ["lead", "backing"],
+        batch: 1,
+        overlap: 176_400,
+    },
+    Preset {
+        id: "dereverb-bs-roformer-anvuew-22.5050",
+        label: "dereverb (BS-RoFormer, anvuew)",
+        architecture: Architecture::BandSplitRoformer,
+        checkpoint: "dereverb_bs_roformer_anvuew_sdr_22.5050.ckpt",
+        config: "dereverb_bs_roformer_anvuew.yaml",
+        model_stem: "noreverb",
+        other_stem: "reverb",
+        suffixes: ["noreverb", "reverb"],
+        batch: 1,
+        overlap: 176_400,
+    },
 ];
 
 fn preset(name: &str) -> Option<&'static Preset> {
@@ -221,7 +250,7 @@ pub struct Options<'a> {
     pub overwrite: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct StemFiles {
     pub input: PathBuf,
     pub primary: PathBuf,
@@ -235,6 +264,70 @@ pub struct JobProgress {
     pub file_count: usize,
     pub chunks_done: usize,
     pub chunks_total: usize,
+}
+
+/// A preset's model kept loaded for several in-memory separations.
+pub struct Separator {
+    spec: &'static Preset,
+    model: Roformer,
+}
+
+impl Separator {
+    pub fn load(root: &Path, preset_name: &str, device: Device) -> Result<Self> {
+        let spec =
+            preset(preset_name).with_context(|| format!("unknown separation preset {preset_name}"))?;
+        let directory = weights_directory(root);
+        let model_path = directory.join(spec.checkpoint);
+        let document = configurable::load_document(&directory.join(spec.config))?;
+        let weight_device = match device {
+            Device::Cuda(_) => device,
+            _ => Device::Cpu,
+        };
+        let weights = configurable::checkpoint_weights(&model_path, weight_device)?;
+        let config = ModelConfig::from_document(
+            &document,
+            spec.architecture == Architecture::MelBandRoformer,
+        )?;
+        let model = Roformer::load(config, &weights, device)
+            .with_context(|| format!("loading separation model {}", model_path.display()))?;
+        ensure!(
+            model.channels() == PRESET_PCM.channels && model.num_stems() == 1,
+            "PyMSS preset requires a stereo model that predicts one stem"
+        );
+        Ok(Self { spec, model })
+    }
+
+    /// Model stem and residual of interleaved stereo audio at 44.1 kHz, interleaved.
+    pub fn split(&self, interleaved: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        // The models read channel planes, not interleaved frames.
+        let frames = interleaved.len() / 2;
+        let mut mix = Vec::with_capacity(frames * 2);
+        mix.extend(interleaved.iter().step_by(2).take(frames));
+        mix.extend(interleaved.iter().skip(1).step_by(2).take(frames));
+        let mix = mix.as_slice();
+        let geometry = Geometry {
+            frames_per_chunk: 352_800,
+            overlap: self.spec.overlap,
+            batch_size: 1,
+        };
+        let primary = demix(
+            mix,
+            PRESET_PCM.channels,
+            1,
+            &[0],
+            geometry,
+            |samples, count| self.model.predict_batch(samples, count),
+            |_| ControlFlow::Continue(()),
+        )
+        .map_err(demix_error)?;
+        let secondary =
+            residual(mix, &primary).context("separation changed the track duration")?;
+        let interleave = |planes: &[f32]| -> Vec<f32> {
+            let (left, right) = planes.split_at(planes.len() / 2);
+            left.iter().zip(right).flat_map(|(&l, &r)| [l, r]).collect()
+        };
+        Ok((interleave(&primary), interleave(&secondary)))
+    }
 }
 
 /// Runs the preset on a file or a directory of audio files. Both stems go to
@@ -321,7 +414,13 @@ fn demix_error(error: DemixError<anyhow::Error>) -> anyhow::Error {
     }
 }
 
-fn weights_directory(root: &Path) -> PathBuf {
+/// Whether the checkpoint and config of `preset` are installed under `root`.
+pub fn installed(root: &Path, preset: &Preset) -> bool {
+    let directory = weights_directory(root);
+    directory.join(preset.checkpoint).is_file() && directory.join(preset.config).is_file()
+}
+
+pub(crate) fn weights_directory(root: &Path) -> PathBuf {
     let configured = std::env::var_os("weight_pymss_root")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())

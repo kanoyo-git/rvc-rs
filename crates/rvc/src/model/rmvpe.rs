@@ -14,6 +14,8 @@ pub struct Rmvpe {
     device: Device,
     kind: Kind,
     gru: Vec<Tensor>,
+    filtered: bool,
+    reflect_mel: bool,
     pub(super) graph: RefCell<Cache>,
 }
 
@@ -46,6 +48,16 @@ impl MelSpectrogram {
     }
 
     pub(super) fn extract(&self, x: &Tensor, kind: Kind, device: Device) -> Result<(Tensor, i64)> {
+        self.extract_with_padding(x, kind, device, false)
+    }
+
+    fn extract_with_padding(
+        &self,
+        x: &Tensor,
+        kind: Kind,
+        device: Device,
+        reflect: bool,
+    ) -> Result<(Tensor, i64)> {
         let fft = x.f_stft(FFT, HOP, FFT, Some(&self.window), false, true, true, false)?;
         let spectrum = fft
             .f_real()?
@@ -62,7 +74,13 @@ impl MelSpectrogram {
         let frames = mel.size()[2];
         let padding = (32 - frames.rem_euclid(32)) % 32;
         if padding != 0 {
-            mel = mel.f_constant_pad_nd([0, padding])?;
+            mel = if !reflect {
+                mel.f_constant_pad_nd([0, padding])?
+            } else if padding < frames {
+                mel.f_reflection_pad1d([0, padding])?
+            } else {
+                mel.f_replication_pad1d([0, padding])?
+            };
         }
         Ok((mel, frames))
     }
@@ -70,7 +88,22 @@ impl MelSpectrogram {
 
 impl Rmvpe {
     pub fn load(path: &Path, device: Device, kind: Kind) -> Result<Self> {
-        let mut weights = Weights::load(path, None, Device::Cpu)?;
+        Self::from_weights(
+            Weights::load(path, None, Device::Cpu)?,
+            device,
+            kind,
+            false,
+            false,
+        )
+    }
+
+    pub(super) fn from_weights(
+        mut weights: Weights,
+        device: Device,
+        kind: Kind,
+        filtered: bool,
+        reflect_mel: bool,
+    ) -> Result<Self> {
         weights.move_to(device, kind)?;
         weights.prepare_cpu_convolutions(device)?;
         let mut gru = Vec::with_capacity(8);
@@ -112,6 +145,8 @@ impl Rmvpe {
             device,
             kind,
             gru,
+            filtered,
+            reflect_mel,
             graph: RefCell::default(),
         })
     }
@@ -122,6 +157,14 @@ impl Rmvpe {
         threshold: f32,
         graph_pool: Option<&Cache>,
     ) -> Result<Vec<f32>> {
+        decode(&self.infer_salience(samples, graph_pool)?, threshold)
+    }
+
+    pub(super) fn infer_salience(
+        &self,
+        samples: &[f32],
+        graph_pool: Option<&Cache>,
+    ) -> Result<Vec<f32>> {
         let x = self.features.input(samples)?;
         let salience = if let Some(pool) = graph_pool {
             self.graph
@@ -130,12 +173,16 @@ impl Rmvpe {
         } else {
             self.infer_tensor(&x)?
         };
-        let salience = Vec::<f32>::try_from(salience.to_device(Device::Cpu))?;
-        decode(&salience, threshold)
+        Ok(Vec::<f32>::try_from(salience.to_device(Device::Cpu))?)
     }
 
     fn infer_tensor(&self, x: &Tensor) -> Result<Tensor> {
-        let (mel, frames) = self.features.extract(x, self.kind, self.device)?;
+        let (mel, frames) = if self.reflect_mel {
+            self.features
+                .extract_with_padding(x, self.kind, self.device, true)?
+        } else {
+            self.features.extract(x, self.kind, self.device)?
+        };
         Ok(self
             .salience(&mel)?
             .narrow(1, 0, frames)
@@ -149,7 +196,12 @@ impl Rmvpe {
         let mut skip_connections = Vec::new();
         for i in 0..5 {
             x = self.residual_stack(x, &format!("unet.encoder.layers.{i}.conv"))?;
-            skip_connections.push(x.shallow_clone());
+            let skip = if self.filtered {
+                self.residual_block(x.shallow_clone(), &format!("unet.tf.layers.{i}"))?
+            } else {
+                x.shallow_clone()
+            };
+            skip_connections.push(skip);
             x = x.avg_pool2d([2, 2], [2, 2], [0, 0], false, true, None);
         }
         for i in 0..4 {
@@ -177,17 +229,20 @@ impl Rmvpe {
 
     fn residual_stack(&self, mut x: Tensor, prefix: &str) -> Result<Tensor> {
         for i in 0..4 {
-            let layer = format!("{prefix}.{i}");
-            let hidden = self.weights.conv2(&x, &format!("{layer}.conv.0"), 1)?;
-            let hidden = self.batch_norm(&hidden, &format!("{layer}.conv.1"))?.relu();
-            let hidden = self.weights.conv2(&hidden, &format!("{layer}.conv.3"), 1)?;
-            let hidden = self.batch_norm(&hidden, &format!("{layer}.conv.4"))?.relu();
-            if self.weights.contains(&format!("{layer}.shortcut.weight")) {
-                x = self.weights.conv2(&x, &format!("{layer}.shortcut"), 0)?;
-            }
-            x = x.f_add(&hidden)?;
+            x = self.residual_block(x, &format!("{prefix}.{i}"))?;
         }
         Ok(x)
+    }
+
+    fn residual_block(&self, mut x: Tensor, layer: &str) -> Result<Tensor> {
+        let hidden = self.weights.conv2(&x, &format!("{layer}.conv.0"), 1)?;
+        let hidden = self.batch_norm(&hidden, &format!("{layer}.conv.1"))?.relu();
+        let hidden = self.weights.conv2(&hidden, &format!("{layer}.conv.3"), 1)?;
+        let hidden = self.batch_norm(&hidden, &format!("{layer}.conv.4"))?.relu();
+        if self.weights.contains(&format!("{layer}.shortcut.weight")) {
+            x = self.weights.conv2(&x, &format!("{layer}.shortcut"), 0)?;
+        }
+        Ok(x.f_add(&hidden)?)
     }
 
     fn batch_norm(&self, x: &Tensor, layer: &str) -> Result<Tensor> {
@@ -224,6 +279,10 @@ fn local_average(salience: &[f32], threshold: f32) -> f32 {
     if salience[center] <= threshold {
         return 0.0;
     }
+    centered_pitch(salience, center)
+}
+
+pub(super) fn centered_pitch(salience: &[f32], center: usize) -> f32 {
     let first = center.saturating_sub(4);
     let last = (center + 4).min(BINS - 1);
     let mut weight = 0.0;
@@ -233,6 +292,10 @@ fn local_average(salience: &[f32], threshold: f32) -> f32 {
         let bin = first + offset;
         weight += value;
         cents += value * (20.0 * bin as f64 + 1_997.379_408_437_619);
+    }
+    if weight <= 1e-12 {
+        cents = 20.0 * center as f64 + 1_997.379_408_437_619;
+        weight = 1.0;
     }
     (10.0 * (cents / (weight * 1200.0)).exp2()) as f32
 }

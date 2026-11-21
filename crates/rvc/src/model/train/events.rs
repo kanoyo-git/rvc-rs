@@ -1,9 +1,11 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
+use prost::Message;
 use tch::{Device, Kind, Tensor};
 
 pub(super) struct Events(BufWriter<File>);
@@ -80,6 +82,105 @@ impl Events {
         self.0.flush()?;
         Ok(())
     }
+}
+
+#[derive(Message)]
+struct ScalarEvent {
+    #[prost(int64, tag = "2")]
+    step: i64,
+    #[prost(message, optional, tag = "5")]
+    summary: Option<ScalarSummary>,
+}
+
+#[derive(Message)]
+struct ScalarSummary {
+    #[prost(message, repeated, tag = "1")]
+    values: Vec<ScalarValue>,
+}
+
+#[derive(Message)]
+struct ScalarValue {
+    #[prost(string, tag = "1")]
+    tag: String,
+    #[prost(float, optional, tag = "2")]
+    number: Option<f32>,
+}
+
+pub(crate) fn paths(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("events.out.tfevents.")
+            && entry.path().is_file()
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+pub(crate) fn scalars(directory: &Path) -> Result<BTreeMap<String, VecDeque<(i64, f32)>>> {
+    let mut series: BTreeMap<String, VecDeque<(i64, f32)>> = BTreeMap::new();
+    for path in paths(directory)? {
+        let mut reader = BufReader::new(File::open(&path)?);
+        let mut bytes = Vec::new();
+        while let Some(record) = read_record(&mut reader, &mut bytes)
+            .with_context(|| format!("reading {}", path.display()))?
+        {
+            let event = ScalarEvent::decode(record)?;
+            if let Some(summary) = event.summary {
+                for value in summary.values {
+                    let Some(number) = value.number.filter(|n| n.is_finite()) else {
+                        continue;
+                    };
+                    if series.len() >= 64 && !series.contains_key(&value.tag) {
+                        continue;
+                    }
+                    let values = series.entry(value.tag).or_default();
+                    while values.back().is_some_and(|point| point.0 >= event.step) {
+                        values.pop_back();
+                    }
+                    if values.len() == 600 {
+                        values.pop_front();
+                    }
+                    values.push_back((event.step, number));
+                }
+            }
+        }
+    }
+    Ok(series)
+}
+
+fn read_record<'a>(reader: &mut impl Read, bytes: &'a mut Vec<u8>) -> Result<Option<&'a [u8]>> {
+    let mut header = [0u8; 12];
+    let mut crc = [0u8; 4];
+    let mut read = |buffer: &mut [u8]| match reader.read_exact(buffer) {
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        result => result.map(|()| true),
+    };
+    if !read(&mut header)? {
+        return Ok(None);
+    }
+    let (size, header_crc) = header.split_at(8);
+    ensure!(
+        masked_crc32c(size) == u32::from_le_bytes(header_crc.try_into()?),
+        "invalid event header checksum"
+    );
+    let length = u64::from_le_bytes(size.try_into()?);
+    ensure!(length <= 32 * 1024 * 1024, "training event exceeds 32 MiB");
+    bytes.resize(length as usize, 0);
+    if !read(bytes)? || !read(&mut crc)? {
+        return Ok(None);
+    }
+    ensure!(
+        masked_crc32c(bytes) == u32::from_le_bytes(crc),
+        "invalid event checksum"
+    );
+    Ok(Some(bytes))
 }
 
 fn event_time() -> Result<Vec<u8>> {
@@ -187,11 +288,23 @@ fn zlib(data: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::crc32;
+    use super::*;
 
     #[test]
     fn checksums_match_the_standard_test_vector() {
         assert_eq!(crc32(b"123456789", 0x82f6_3b78), 0xe306_9283);
         assert_eq!(crc32(b"123456789", 0xedb8_8320), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn reads_scalars_while_the_next_record_is_being_written() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut events = Events::new(directory.path())?;
+        events.summary(10, &[("loss/g/total".into(), 1.5)], &[])?;
+        events.0.write_all(&[12, 0, 0])?;
+        events.0.flush()?;
+        let values = scalars(directory.path())?;
+        assert_eq!(values["loss/g/total"].as_slices().0, &[(10, 1.5)]);
+        Ok(())
     }
 }

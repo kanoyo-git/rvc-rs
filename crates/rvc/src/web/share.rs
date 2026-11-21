@@ -11,7 +11,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-const RELAY_REQUEST: &str = "https://api.gradio.app/v2/tunnel-request";
+/// Gradio 5+ relay API: the reply also carries the relay's root certificate for TLS (frpc 0.3).
+const RELAY_REQUEST: &str = "https://api.gradio.app/v3/tunnel-request";
 
 pub fn share_client() -> PathBuf {
     std::env::var_os("RVC_SHARE_CLIENT").map_or_else(|| "frpc-gradio".into(), PathBuf::from)
@@ -21,6 +22,9 @@ pub fn share_client() -> PathBuf {
 struct Relay {
     host: String,
     port: u16,
+    /// PEM root certificate of the relay; the connector then talks TLS to it.
+    #[serde(default)]
+    root_ca: Option<String>,
 }
 
 impl Relay {
@@ -75,6 +79,10 @@ pub(super) struct Access {
 
 impl Access {
     fn new(address: &str, password: &str) -> Result<Self> {
+        Self::parse(address, password, true)
+    }
+
+    fn parse(address: &str, password: &str, relay_only: bool) -> Result<Self> {
         let url = if address.starts_with("https://") {
             address.to_owned()
         } else if let Some(host) = address.strip_prefix("http://") {
@@ -88,7 +96,7 @@ impl Access {
         let authority = uri.authority().cloned().context("missing share hostname")?;
         let host = authority.host().to_ascii_lowercase();
         ensure!(
-            (host.ends_with(".gradio.live") || host.ends_with(".gradio.app"))
+            (!relay_only || host.ends_with(".gradio.live") || host.ends_with(".gradio.app"))
                 && uri.path() == "/"
                 && uri.query().is_none()
                 && authority.port_u16().is_none()
@@ -122,6 +130,48 @@ impl Access {
     }
 }
 
+/// Access through a tunnel started outside the Studio (cloudflared, localtunnel, bore over
+/// HTTPS). Requests for that origin need the same `rvc` login as the Gradio relay; the
+/// password comes from `RVC_SHARE_PASSWORD` or is generated and announced.
+pub(super) struct External {
+    access: Access,
+    generated_password: Option<String>,
+}
+
+impl External {
+    pub(super) fn new(url: &str) -> Result<Self> {
+        ensure!(
+            url.starts_with("https://"),
+            "--public-url must be the tunnel's https:// address"
+        );
+        let configured = std::env::var("RVC_SHARE_PASSWORD").ok();
+        let password = configured
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        ensure!(!password.is_empty(), "RVC_SHARE_PASSWORD is empty");
+        let address = url.trim_end_matches('/');
+        let access = Access::parse(&format!("{address}/"), &password, false)
+            .context("--public-url must be a bare https:// origin without a path or port")?;
+        Ok(Self {
+            access,
+            generated_password: configured.is_none().then_some(password),
+        })
+    }
+
+    pub(super) fn access(&self) -> Access {
+        self.access.clone()
+    }
+
+    pub(super) fn announce(&self, panel: &str) {
+        println!("https://{}/{panel}", self.access.authority);
+        if let Some(password) = &self.generated_password {
+            println!("RVC share login rvc, password {password}");
+        } else {
+            println!("RVC share login rvc, password from RVC_SHARE_PASSWORD");
+        }
+    }
+}
+
 pub(super) struct Tunnel {
     connector: Connector,
     access: Access,
@@ -135,8 +185,23 @@ impl Tunnel {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         ensure!(!password.is_empty(), "RVC_SHARE_PASSWORD is empty");
-        let relay = relay().await?.address()?;
-        let (connector, origin) = Connector::open(client, listener, &relay).await?;
+        let relay = relay().await?;
+        let certificate = match &relay.root_ca {
+            Some(pem) => {
+                let file = tempfile::NamedTempFile::new()?;
+                std::fs::write(file.path(), pem)?;
+                Some(file)
+            }
+            None => None,
+        };
+        let (mut connector, origin) = Connector::open(
+            client,
+            listener,
+            &relay.address()?,
+            certificate.as_ref().map(tempfile::NamedTempFile::path),
+        )
+        .await?;
+        connector.certificate = certificate;
         let access = Access::new(&origin, &password)?;
         Ok(Self {
             connector,
@@ -173,27 +238,47 @@ impl Tunnel {
 struct Connector {
     child: Child,
     output: JoinHandle<()>,
+    /// Kept for the connector's reconnects.
+    certificate: Option<tempfile::NamedTempFile>,
 }
 
 impl Connector {
-    async fn open(client: &Path, listener: SocketAddr, relay: &str) -> Result<(Self, String)> {
-        let mut child = Command::new(client)
-            .args([
-                "http",
-                "-n",
-                "random",
-                "-l",
-                &listener.port().to_string(),
-                "-i",
-                &listener.ip().to_string(),
-                "--uc",
-                "--sd",
-                "random",
-                "--ue",
-                "--server_addr",
-                relay,
-                "--disable_log_color",
-            ])
+    async fn open(
+        client: &Path,
+        listener: SocketAddr,
+        relay: &str,
+        certificate: Option<&Path>,
+    ) -> Result<(Self, String)> {
+        // The relay keys proxies by this name, so it has to be unique per tunnel.
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut command = Command::new(client);
+        command.args([
+            "http",
+            "-n",
+            &token,
+            "-l",
+            &listener.port().to_string(),
+            "-i",
+            &listener.ip().to_string(),
+            "--uc",
+            "--sd",
+            "random",
+            "--ue",
+            "--server_addr",
+            relay,
+            "--disable_log_color",
+        ]);
+        if let Some(certificate) = certificate {
+            command
+                .arg("--tls_enable")
+                .arg("--tls_trusted_ca_file")
+                .arg(certificate);
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -244,7 +329,14 @@ impl Connector {
         };
         let output =
             tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-        Ok((Self { child, output }, origin))
+        Ok((
+            Self {
+                child,
+                output,
+                certificate: None,
+            },
+            origin,
+        ))
     }
 }
 
@@ -284,6 +376,7 @@ mod tests {
             &client,
             "127.0.0.1:7865".parse().unwrap(),
             "127.0.0.1:7000",
+            None,
         ));
         let pid: u32 = tokio::select! {
             _ = &mut startup => panic!("stalled connector exited before cancellation"),
@@ -318,8 +411,13 @@ mod tests {
             dir.path(),
             "echo 'login to server failed: connection refused'\nexit 1\n",
         );
-        let result =
-            Connector::open(&client, "127.0.0.1:7865".parse().unwrap(), "127.0.0.1:7000").await;
+        let result = Connector::open(
+            &client,
+            "127.0.0.1:7865".parse().unwrap(),
+            "127.0.0.1:7000",
+            None,
+        )
+        .await;
         let error = result.err().expect("connector unexpectedly started");
         let message = format!("{error:#}");
         assert!(

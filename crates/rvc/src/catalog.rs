@@ -6,10 +6,98 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::checkpoint::Checkpoint;
+
+mod embedder;
+pub use embedder::Embedder;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Unvoiced {
+    #[default]
+    Interpolate,
+    Zero,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct VoiceFormat {
+    pub embedder: Embedder,
+    pub f0_unvoiced: Unvoiced,
+    pub default_noise_scale: f64,
+    /// Decoder activations run anti-aliased (see `synth::alias_free`).
+    #[serde(default)]
+    pub dec_aa: bool,
+    #[serde(skip)]
+    pub normalize_input: bool,
+}
+
+impl Default for VoiceFormat {
+    fn default() -> Self {
+        Self {
+            embedder: Embedder::default(),
+            f0_unvoiced: Unvoiced::default(),
+            default_noise_scale: 0.66666,
+            dec_aa: false,
+            normalize_input: false,
+        }
+    }
+}
+
+impl VoiceFormat {
+    pub(crate) fn read(checkpoint: &Checkpoint, sample_rate: Option<u32>) -> Result<Self> {
+        let mut options = Self::default();
+        let legacy = checkpoint
+            .metadata("embedder_model")?
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value::<Embedder>)
+            .transpose()
+            .context("unsupported model embedder")?;
+        if let Some(embedder) = legacy {
+            options.embedder = embedder;
+            options.normalize_input = true;
+        }
+        if let Some(meta) = checkpoint.metadata("nvc")?.filter(|value| !value.is_null()) {
+            ensure!(
+                meta["format"] == "nvc" && meta["format_version"] == 1,
+                "unsupported NVC model metadata format or version"
+            );
+            if let Some(rate) = meta.get("sample_rate")
+                && let Some(expected) = sample_rate
+            {
+                ensure!(
+                    rate.as_u64() == Some(u64::from(expected)),
+                    "NVC metadata and generator sample rates disagree"
+                );
+            }
+            let embedder: Embedder = serde_json::from_value(meta["embedder"].clone())
+                .context("unsupported NVC model embedder")?;
+            ensure!(
+                legacy.is_none_or(|declared| declared == embedder),
+                "NVC and embedder_model metadata disagree"
+            );
+            options.embedder = embedder;
+            options.f0_unvoiced = serde_json::from_value(meta["f0_unvoiced"].clone())
+                .context("unsupported NVC unvoiced F0 mode")?;
+            if let Some(scale) = meta.get("default_noise_scale") {
+                options.default_noise_scale = scale.as_f64().context("invalid NVC noise scale")?;
+            }
+            ensure!(
+                options.default_noise_scale.is_finite() && options.default_noise_scale >= 0.0,
+                "invalid NVC noise scale"
+            );
+            if let Some(aa) = meta.get("dec_aa") {
+                options.dec_aa = aa
+                    .as_bool()
+                    .context("invalid NVC decoder activation flag")?;
+            }
+            options.normalize_input = true;
+        }
+        Ok(options)
+    }
+}
 
 #[derive(Clone)]
 pub struct Paths {
@@ -22,6 +110,17 @@ pub struct Paths {
 }
 
 impl Paths {
+    #[cfg(feature = "inference")]
+    pub(crate) fn nmvpe(&self) -> PathBuf {
+        self.root
+            .join(
+                std::env::var_os("nmvpe_root")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("assets/nmvpe")),
+            )
+            .join("nmvpe.pt")
+    }
+
     pub fn new(root: &Path) -> Result<Self> {
         let root = std::path::absolute(root)?;
         let directory = |key, default: &str| {
@@ -79,70 +178,68 @@ impl Paths {
         Ok(found)
     }
 
+    /// Every usable (`added`) index under `assets/indices` and the experiments, by path.
+    pub fn indexes(&self) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = [&self.indices, &self.experiments]
+            .into_iter()
+            .flat_map(|directory| walkdir::WalkDir::new(directory).follow_links(true))
+            .filter_map(std::result::Result::ok)
+            .map(walkdir::DirEntry::into_path)
+            .filter(|path| is_added_index(path))
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    /// The index that belongs to `model`: one named after the model's experiment (standard
+    /// `added_IVF…_<name>_v2`, `<name>_added_…` or just `<name>.index`), else the only index
+    /// next to the model file itself (a voice folder on Drive, an unpacked zip).
     pub fn select_index(&self, model: &Path, speaker_id: Option<i64>) -> Option<PathBuf> {
         static EPOCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)_e\d+_s\d+$").unwrap());
-        static SPEAKER: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"(?i)_spkid(\d+)$").unwrap());
-        let stem = model.file_stem()?.to_str()?.to_lowercase();
-        let experiment = EPOCH.replace(&stem, "");
+        let stem = model.file_stem()?.to_str()?;
+        let experiment = normalize_name(&EPOCH.replace(stem, ""));
         if experiment.is_empty() {
             return None;
         }
-        let prefix = format!("{experiment}_added_");
-        let v1 = format!("_{experiment}_v1");
-        let v2 = format!("_{experiment}_v2");
         let mut candidates = Vec::new();
-        for (order, directory) in [&self.indices, &self.experiments].into_iter().enumerate() {
-            for file in walkdir::WalkDir::new(directory)
-                .into_iter()
-                .filter_map(std::result::Result::ok)
-            {
-                if !file.path().is_file()
-                    || file
-                        .path()
-                        .extension()
-                        .is_none_or(|ext| !ext.eq_ignore_ascii_case("index"))
-                {
-                    continue;
-                }
-                let name = file
-                    .path()
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or_default()
-                    .to_lowercase();
-                if name.contains("trained") {
-                    continue;
-                }
-                let indexed = SPEAKER
-                    .captures(&name)
-                    .and_then(|capture| capture[1].parse::<i64>().ok());
-                if indexed.is_some() && indexed != speaker_id {
-                    continue;
-                }
-                let standard =
-                    name.starts_with(&prefix) || name.contains(&v1) || name.contains(&v2);
-                if standard || name.contains(&stem) {
-                    let modified = file
-                        .metadata()
-                        .ok()
-                        .and_then(|metadata| metadata.modified().ok())
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
-                    let score = (
-                        indexed != speaker_id,
-                        !standard,
-                        order,
-                        std::cmp::Reverse(modified),
-                        file.path().to_string_lossy().to_lowercase(),
-                    );
-                    candidates.push((score, file.into_path()));
-                }
+        for path in self.indexes() {
+            let name = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
+            let (owners, indexed) = index_owners(name);
+            if indexed.is_some() && indexed != speaker_id {
+                continue;
             }
+            let Some(rank) = owners.iter().position(|owner| *owner == experiment) else {
+                continue;
+            };
+            let order = usize::from(!path.starts_with(&self.indices));
+            let modified = path
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let score = (
+                indexed != speaker_id,
+                rank,
+                order,
+                std::cmp::Reverse(modified),
+            );
+            candidates.push((score, path));
         }
-        candidates
-            .into_iter()
-            .min_by(|(a, _), (b, _)| a.cmp(b))
-            .map(|(_, path)| path)
+        if let Some((_, path)) = candidates.into_iter().min_by(|(a, _), (b, _)| a.cmp(b)) {
+            return Some(path);
+        }
+        // A voice folder that holds exactly one index: it is that voice's index.
+        let real = std::fs::canonicalize(model).ok()?;
+        let siblings: Vec<PathBuf> = std::fs::read_dir(real.parent()?)
+            .ok()?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| is_added_index(path))
+            .collect();
+        match siblings.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
     }
 
     #[cfg(feature = "inference")]
@@ -156,18 +253,82 @@ impl Paths {
         if rate == 0.0 {
             return Ok(None);
         }
-        let index = if let Some(path) = requested {
-            let path = self.root.join(path);
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .map(|name| path.with_file_name(name.replace("trained", "added")))
-        } else {
-            self.select_index(model, Some(speaker_id))
+        let Some(path) = requested else {
+            // No index chosen: use the voice's own one, or convert without an index.
+            let index = self.select_index(model, Some(speaker_id));
+            if index.is_none() {
+                eprintln!(
+                    "No index found for {}: converting without one",
+                    model.file_name().map_or_else(
+                        || model.display().to_string(),
+                        |name| name.to_string_lossy().into_owned()
+                    )
+                );
+            }
+            return Ok(index);
         };
-        Ok(Some(index.filter(|path| path.is_file()).with_context(|| format!(
-            "No usable added index for speaker ID {speaker_id}. Supply --index or use --index-rate 0."
-        ))?))
+        let path = self.root.join(path);
+        let index = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .map(|name| path.with_file_name(added_name(name)));
+        Ok(Some(index.filter(|path| path.is_file()).with_context(
+            || format!("Index not found: {}", path.display()),
+        )?))
     }
+}
+
+fn is_added_index(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("index"))
+        && !path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| TRAINED.is_match(name))
+}
+
+/// The training-only half of an index pair (`trained_IVF…`), not "Pretrained" in a voice name.
+static TRAINED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(^|_)trained_ivf").unwrap());
+
+/// The usable `added_IVF…` twin of a `trained_IVF…` index name; other names stay.
+pub fn added_name(name: &str) -> String {
+    TRAINED.replace(name, "${1}added_IVF").into_owned()
+}
+
+/// Lowercase, with spaces, dots and dashes read as underscores.
+fn normalize_name(name: &str) -> String {
+    name.to_lowercase()
+        .split(|c: char| c == '_' || c == '-' || c == '.' || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// Voice names an index file name can stand for, most specific first, and its speaker.
+fn index_owners(stem: &str) -> (Vec<String>, Option<i64>) {
+    static SPEAKER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"_spkid(\d+)$").unwrap());
+    static STANDARD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"added_ivf\d+_flat_nprobe_\d+_(.+?)_v[12]$").unwrap());
+    static PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(.+?)_added_").unwrap());
+    static PLAIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(_v[12])?(_index)?$").unwrap());
+    let mut name = normalize_name(stem);
+    let speaker = SPEAKER
+        .captures(&name)
+        .and_then(|capture| capture[1].parse().ok());
+    name = SPEAKER.replace(&name, "").into_owned();
+    let mut owners = Vec::new();
+    if let Some(capture) = STANDARD.captures(&name) {
+        owners.push(capture[1].to_owned());
+    }
+    if let Some(capture) = PREFIX.captures(&name) {
+        owners.push(capture[1].to_owned());
+    }
+    if !name.contains("added_ivf") {
+        owners.push(PLAIN.replace(&name, "").into_owned());
+    }
+    (owners, speaker)
 }
 
 #[derive(Debug, Serialize)]
@@ -178,6 +339,8 @@ pub struct ModelInfo {
     pub uses_f0: bool,
     pub sample_rate: Option<u32>,
     pub info: Option<String>,
+    #[serde(flatten)]
+    pub format: VoiceFormat,
 }
 
 impl ModelInfo {
@@ -222,6 +385,8 @@ impl ModelInfo {
                 .and_then(|array| array.last().and_then(sample_rate))
         });
         let info = checkpoint.metadata("info")?.as_ref().map(python_string);
+        let format = VoiceFormat::read(checkpoint, sample_rate)?;
+        format.embedder.supports(&version)?;
         Ok(Self {
             speaker_count,
             speakers,
@@ -229,6 +394,7 @@ impl ModelInfo {
             uses_f0,
             sample_rate,
             info,
+            format,
         })
     }
 
@@ -287,5 +453,61 @@ pub fn sample_rate(value: &Value) -> Option<u32> {
         Some("40k") => Some(40000),
         Some("48k") => Some(48000),
         _ => integer(value).and_then(|value| value.try_into().ok()),
+    }
+}
+
+#[cfg(test)]
+mod index_name_tests {
+    use super::{index_owners, normalize_name};
+
+    fn owns(index: &str, voice: &str) -> bool {
+        index_owners(index).0.contains(&normalize_name(voice))
+    }
+
+    #[test]
+    fn index_names_match_their_voice_only() {
+        assert!(owns("added_IVF1371_Flat_nprobe_1_Lover_ru_v2", "Lover_ru"));
+        assert!(owns(
+            "Lover_ru_added_IVF1371_Flat_nprobe_1_Lover_ru_v2",
+            "Lover_ru"
+        ));
+        assert!(owns("My Voice", "my-voice"));
+        assert!(owns("MyVoice_v2", "MyVoice"));
+        assert!(owns(
+            "added_IVF908_Flat_nprobe_1_prince_v2_spkid3",
+            "prince"
+        ));
+        assert_eq!(
+            index_owners("added_IVF908_Flat_nprobe_1_prince_v2_spkid3").1,
+            Some(3)
+        );
+        // A longer name that starts with the voice is another voice.
+        assert!(!owns(
+            "Lovern_scream_added_IVF1598_Flat_nprobe_1_Lovern_scream_v2",
+            "Lover"
+        ));
+        assert!(!owns("added_IVF1371_Flat_nprobe_1_Lover_ru_v2", "Lover"));
+        // "Pretrained" in a voice name is not a trained_IVF index.
+        assert!(owns(
+            "Platina_NVC_Pretrained_added_IVF651_Flat_nprobe_1_Platina_NVC_Pretrained_v2",
+            "Platina_NVC_Pretrained"
+        ));
+    }
+
+    #[test]
+    fn trained_indexes_map_to_added_ones() {
+        use super::added_name;
+        assert_eq!(
+            added_name("trained_IVF651_Flat_nprobe_1_Platina_NVC_Pretrained_v2.index"),
+            "added_IVF651_Flat_nprobe_1_Platina_NVC_Pretrained_v2.index"
+        );
+        assert_eq!(
+            added_name("Platina_NVC_Pretrained_added_IVF651_Flat_nprobe_1_x_v2.index"),
+            "Platina_NVC_Pretrained_added_IVF651_Flat_nprobe_1_x_v2.index"
+        );
+        assert_eq!(
+            added_name("voice_trained_IVF8_Flat.index"),
+            "voice_added_IVF8_Flat.index"
+        );
     }
 }
