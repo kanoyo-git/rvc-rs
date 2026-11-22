@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -53,6 +53,7 @@ pub(super) async fn training_log(
 
 pub(in crate::web) struct Files {
     pub(super) workspace: TempDir,
+    pub(super) tickets: Arc<super::transfers::Tickets>,
     results: Mutex<VecDeque<ResultSet>>,
 }
 
@@ -66,6 +67,7 @@ impl Files {
         Ok(Self {
             workspace: tempfile::Builder::new().prefix("rvc-studio-").tempdir()?,
             results: Mutex::default(),
+            tickets: Arc::default(),
         })
     }
 
@@ -248,18 +250,30 @@ impl Uploads {
         Ok(&self.files[0])
     }
 
-    pub(super) fn into_dataset(self, workspace: &Path) -> Result<DatasetPaths> {
+    pub(super) fn into_dataset(
+        self,
+        workspace: &Path,
+        transfer: Option<super::transfers::Transfer>,
+    ) -> Result<Option<DatasetPaths>> {
         ensure!(
             !self.files.is_empty(),
             "upload a dataset ZIP or audio files"
         );
-        if let [archive] = self.files.as_slice()
+        let (directory, paths) = if let [archive] = self.files.as_slice()
             && archive
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
         {
             let extracted = TempDir::new_in(workspace)?;
-            let audio = unzip(archive, extracted.path(), crate::audio::is_audio, || Ok(()))?;
+            let cancelled = || transfer.as_ref().is_some_and(|t| t.cancelled());
+            let extracted_audio = unzip(archive, extracted.path(), crate::audio::is_audio, || {
+                ensure!(!cancelled(), "upload cancelled");
+                Ok(())
+            });
+            if cancelled() {
+                return Ok(None);
+            }
+            let audio = extracted_audio?;
             ensure!(
                 !audio.is_empty(),
                 "the dataset archive contains no audio files"
@@ -269,28 +283,40 @@ impl Uploads {
             let wrapper = entries.next().is_none() && first.is_dir();
             let has_speaker_folder =
                 wrapper && crate::dataset::scan_speakers(extracted.path()).is_ok();
-            let root = extracted.keep();
+            let root = extracted.path().to_path_buf();
             let single = if wrapper { first } else { root.clone() };
             let multi_folder = if has_speaker_folder {
                 root
             } else {
                 single.clone()
             };
-            return Ok(DatasetPaths {
-                single,
-                multi_folder,
-            });
-        }
-        ensure!(
-            self.files.iter().all(|path| crate::audio::is_audio(path)),
-            "choose one ZIP archive or a selection of audio files"
-        );
-        let root = TempDir::new_in(workspace)?;
-        let single = root.path().join("speaker_0_1");
-        fs::rename(self.directory.path(), &single)?;
-        Ok(DatasetPaths {
-            single,
-            multi_folder: root.keep(),
+            (
+                extracted,
+                DatasetPaths {
+                    single,
+                    multi_folder,
+                },
+            )
+        } else {
+            ensure!(
+                self.files.iter().all(|path| crate::audio::is_audio(path)),
+                "choose one ZIP archive or a selection of audio files"
+            );
+            let root = TempDir::new_in(workspace)?;
+            let single = root.path().join("speaker_0_1");
+            fs::rename(self.directory.path(), &single)?;
+            let multi_folder = root.path().to_owned();
+            (
+                root,
+                DatasetPaths {
+                    single,
+                    multi_folder,
+                },
+            )
+        };
+        super::transfers::handoff(transfer, || {
+            let _ = directory.keep();
+            Ok(paths)
         })
     }
 }
@@ -377,6 +403,7 @@ pub(super) fn unzip(
     ensure!(zip.len() <= MAX_ARCHIVE_ENTRIES, "too many ZIP entries");
     let mut written = 0;
     let mut extracted = Vec::new();
+    let mut buffer = vec![0; 64 * 1024];
     for i in 0..zip.len() {
         check()?;
         let mut member = zip.by_index(i)?;
@@ -401,8 +428,17 @@ pub(super) fn unzip(
             expected <= ARCHIVE_LIMIT - written,
             "expanded ZIP exceeds 4 GiB"
         );
-        let mut bounded = io::Read::take(&mut member, (ARCHIVE_LIMIT - written) + 1);
-        let size = io::copy(&mut bounded, &mut file)?;
+        let mut bounded = (&mut member).take((ARCHIVE_LIMIT - written) + 1);
+        let mut size = 0;
+        loop {
+            check()?;
+            let n = bounded.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buffer[..n])?;
+            size += n as u64;
+        }
         ensure!(size == expected, "invalid ZIP member size");
         written += size;
         extracted.push(target);
@@ -413,8 +449,28 @@ pub(super) fn unzip(
 #[cfg(test)]
 mod dataset_tests {
     use super::*;
-    use std::io::Write;
+    use std::io;
     use zip::{ZipWriter, write::SimpleFileOptions};
+
+    #[test]
+    fn dataset_zip_can_stop_partway_through_one_recording() -> Result<()> {
+        let directory = TempDir::new()?;
+        let archive = directory.path().join("dataset.zip");
+        let mut zip = ZipWriter::new(File::create(&archive)?);
+        zip.start_file("long.wav", SimpleFileOptions::default())?;
+        let bytes = vec![0; 512 * 1024];
+        zip.write_all(&bytes)?;
+        zip.finish()?;
+
+        let target = directory.path().join("long.wav");
+        let result = unzip(&archive, directory.path(), crate::audio::is_audio, || {
+            ensure!(!target.metadata().is_ok_and(|m| m.len() > 0), "cancelled");
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().to_string(), "cancelled");
+        assert!(target.metadata()?.len() < bytes.len() as u64);
+        Ok(())
+    }
 
     #[test]
     fn loose_audio_keeps_every_file_in_the_preprocess_folder() -> Result<()> {
@@ -430,7 +486,9 @@ mod dataset_tests {
             fs::write(&path, contents)?;
             files.push(path);
         }
-        let paths = Uploads { directory, files }.into_dataset(workspace.path())?;
+        let paths = Uploads { directory, files }
+            .into_dataset(workspace.path(), None)?
+            .unwrap();
         let manifest = crate::dataset::scan_speakers(&paths.multi_folder)?;
         assert_eq!(manifest.entries.len(), 3);
         assert!(manifest.entries.iter().all(|entry| entry.speaker_id == 0
@@ -461,7 +519,10 @@ mod dataset_tests {
                 directory,
                 files: vec![archive],
             };
-            let root = uploads.into_dataset(workspace.path())?.multi_folder;
+            let root = uploads
+                .into_dataset(workspace.path(), None)?
+                .unwrap()
+                .multi_folder;
             assert_eq!(crate::dataset::scan_speakers(&root)?.entries.len(), 1);
             assert_eq!(fs::read(root.join("Lover_0_1/vocal.wav"))?, b"test");
         }

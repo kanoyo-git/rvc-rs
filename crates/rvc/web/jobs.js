@@ -1,3 +1,4 @@
+import { audioUpload } from "/studio/transfers.js";
 import { api, upload, log, t, toast, facts } from "/studio/ui.js";
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -150,10 +151,20 @@ export function studioJobs({ tally, progressBar, displayLine, completed, availab
     showing.delete(output.id);
     try {
       log(output, t("working"));
-      const reply = await upload("/api/studio/job", settings, files, files.length ? pct => log(output, `${t("uploading")} · ${pct}%`) : null);
+      const stop = files.length && document.querySelector(`[data-upload-cancel="${CSS.escape(settings.operation)}"]`);
+      const progress = pct => log(output, `${t("uploading")} · ${pct}%`);
+      let reply;
+      if (stop) {
+        progress(0);
+        const transfer = audioUpload(stop, () => log(output, t("cancellingUpload")));
+        reply = await transfer.send("/api/studio/job", settings, files, progress);
+        if (reply.uploadCancelled) { log(output, t("uploadCancelled")); return; }
+      } else {
+        reply = await upload("/api/studio/job", settings, files, files.length ? progress : null);
+      }
       task.id = reply.id;
       try { localStorage.setItem(snapshotKey + "pending:" + output.id, task.id); } catch {}
-      await track(task, output, { status: "running" }, true);
+      await track(task, output, { operation: settings.operation, status: "running", studio: stop ? { stop: stop.id } : null }, true);
     } finally { if (active === task) active = null; }
   }
 

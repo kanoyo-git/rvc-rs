@@ -1249,11 +1249,21 @@ fn launch_job(
     studio: Option<studio::jobs::Metadata>,
     run: impl FnOnce(&StateData, &AtomicBool) -> Result<Value> + Send + 'static,
 ) -> Result<Option<uuid::Uuid>> {
+    launch_job_with_id(state, operation, studio, None, run)
+}
+
+fn launch_job_with_id(
+    state: Shared,
+    operation: &str,
+    studio: Option<studio::jobs::Metadata>,
+    id: Option<uuid::Uuid>,
+    run: impl FnOnce(&StateData, &AtomicBool) -> Result<Value> + Send + 'static,
+) -> Result<Option<uuid::Uuid>> {
     let Ok(permit) = compute(&state) else {
         return Ok(None);
     };
     let cancelled = Arc::new(AtomicBool::new(false));
-    let Some(id) = reserve_job_for(&state, operation, &cancelled, studio)? else {
+    let Some(id) = reserve_job_for(&state, operation, &cancelled, studio, id)? else {
         return Ok(None);
     };
     tokio::spawn(async move {
@@ -1275,7 +1285,7 @@ fn reserve_job(
     operation: &str,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Option<uuid::Uuid>> {
-    reserve_job_for(state, operation, cancelled, None)
+    reserve_job_for(state, operation, cancelled, None, None)
 }
 
 fn reserve_job_for(
@@ -1283,6 +1293,7 @@ fn reserve_job_for(
     operation: &str,
     cancelled: &Arc<AtomicBool>,
     studio: Option<studio::jobs::Metadata>,
+    id: Option<uuid::Uuid>,
 ) -> Result<Option<uuid::Uuid>> {
     let mut job = lock(&state.job)?;
     if job.status == JobState::Running {
@@ -1292,7 +1303,7 @@ fn reserve_job_for(
     let journal = studio
         .map(|meta| studio::jobs::Journal::new(meta, &state.studio))
         .transpose()?;
-    let id = uuid::Uuid::new_v4();
+    let id = id.unwrap_or_else(uuid::Uuid::new_v4);
     let previous = std::mem::replace(
         &mut *job,
         Job {

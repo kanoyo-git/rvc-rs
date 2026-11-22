@@ -1,4 +1,5 @@
 import { refreshDrop, t, toast } from "/studio/ui.js";
+import { preference, storePreference } from "/studio/session.js";
 
 // IndexedDB can clone a user-selected File, including its filename and MIME type.
 // Only the current selection for each input is retained. Restoring it is local.
@@ -6,27 +7,51 @@ export function savedFiles() {
   let db, scope;
   const edits = new Map();
   const inputs = [...document.querySelectorAll('input[type="file"][id]')];
-  function save(input) {
-    const revision = edits.get(input);
+  const page = Math.random().toString(36).slice(2);
+  let sequence = 0;
+  const marker = input => "rvc-studio-file-edit:" + JSON.stringify([scope, input.id]);
+  function forget(key, revision) {
+    try { if (localStorage.getItem(key) === revision) localStorage.removeItem(key); } catch {}
+  }
+  function show(input, files) {
+    if (!files.length && !input.files.length) return;
+    if (files.length) {
+      const transfer = new DataTransfer();
+      for (const file of files) transfer.items.add(file);
+      input.files = transfer.files;
+    } else input.value = "";
+    const zone = document.querySelector(`[data-drop-for="${input.id}"]`);
+    if (zone) refreshDrop(zone, true);
+  }
+  function save(input, revision) {
     const tx = db.transaction("files", "readwrite");
     const store = tx.objectStore("files");
     const key = [scope, input.id];
-    if (input.files.length) store.put([...input.files], key);
+    const intent = marker(input);
+    if (input.files.length) store.put({ revision, files: [...input.files] }, key);
     else store.delete(key);
+    tx.oncomplete = () => forget(intent, revision);
     tx.onabort = () => {
-      // Never show a previous selection in place of a new file that exceeded the quota.
       if (!db || edits.get(input) !== revision) return;
+      const latest = preference(intent, revision);
+      if (latest !== revision) return;
       const cleanup = db.transaction("files", "readwrite");
       cleanup.objectStore("files").delete(key);
+      cleanup.oncomplete = () => forget(intent, revision);
       toast(t("fileNotSaved"), true);
     };
+    tx.commit?.();
   }
-  for (const input of inputs) input.addEventListener("change", () => {
-    edits.set(input, (edits.get(input) || 0) + 1);
-    if (db) save(input);
-  });
+  function changed(input) {
+    const revision = (input.files.length ? "file:" : "clear:") + page + ":" + ++sequence;
+    edits.set(input, revision);
+    if (scope !== undefined) storePreference(marker(input), revision);
+    if (db) save(input, revision);
+  }
+  for (const input of inputs) input.addEventListener("change", () => changed(input));
   return async workspace => {
     scope = workspace;
+    for (const [input, revision] of edits) storePreference(marker(input), revision);
     try {
       db = await new Promise((resolve, reject) => {
         const req = indexedDB.open("nvc-studio-files", 1);
@@ -36,15 +61,30 @@ export function savedFiles() {
       });
       db.onversionchange = () => { db.close(); db = null; };
       for (const input of inputs) {
-        if (edits.has(input) || input.files.length) { save(input); continue; }
-        const req = db.transaction("files").objectStore("files").get([scope, input.id]);
+        if (edits.has(input)) { save(input, edits.get(input)); continue; }
+        const intent = marker(input);
+        const pending = preference(intent, null);
+        if (!pending && input.files.length) { changed(input); continue; }
+        // A tab can close after Clear but before its IndexedDB deletion commits.
+        const tx = db.transaction("files", pending?.startsWith("clear:") ? "readwrite" : "readonly");
+        const store = tx.objectStore("files");
+        const key = [scope, input.id];
+        const req = store.get(key);
         req.onsuccess = () => {
-          if (edits.has(input) || !req.result?.length) return;
-          const transfer = new DataTransfer();
-          for (const file of req.result) transfer.items.add(file);
-          input.files = transfer.files;
-          const zone = document.querySelector(`[data-drop-for="${input.id}"]`);
-          if (zone) refreshDrop(zone, true);
+          if (edits.has(input)) return;
+          const latest = preference(intent, null);
+          const value = req.result;
+          if (latest && latest !== value?.revision) {
+            show(input, []);
+            if (latest === pending && tx.mode === "readwrite") {
+              store.delete(key);
+              tx.oncomplete = () => forget(intent, latest);
+            }
+            return;
+          }
+          if (latest) forget(intent, latest);
+          // Studio 0.2.3 stored an array of Files directly.
+          show(input, Array.isArray(value) ? value : value?.files || []);
         };
       }
     } catch {

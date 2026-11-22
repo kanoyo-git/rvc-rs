@@ -2,6 +2,7 @@ mod files;
 pub(super) mod jobs;
 mod library;
 mod shared_link;
+mod transfers;
 
 use std::fs;
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use uuid::Uuid;
 
 use super::{
     Action, Convert, JobState, Shared, StateData, WebResult, asset, automatic, checkpoint_model,
-    installed_model, job_progress, launch_job, lock,
+    installed_model, job_progress, launch_job_with_id, lock,
 };
 use crate::audio::{self, ANALYSIS_RATE, Format};
 use crate::catalog::{Embedder, ModelInfo};
@@ -61,6 +62,15 @@ pub(super) fn routes() -> Router<Shared> {
                 asset(
                     "text/javascript; charset=utf-8",
                     include_str!("../../web/files.js"),
+                )
+            }),
+        )
+        .route(
+            "/studio/transfers.js",
+            get(|| async {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_str!("../../web/transfers.js"),
                 )
             }),
         )
@@ -137,6 +147,7 @@ pub(super) fn routes() -> Router<Shared> {
         .route("/api/studio/metrics", get(metrics))
         .route("/api/studio/train-log/{name}", get(files::training_log))
         .route("/api/studio/media/{id}", get(files::media))
+        .route("/api/studio/conversion-ticket", post(transfers::ticket))
         .route("/api/studio/jobs", get(jobs::list))
         .route("/api/studio/job/{id}", get(jobs::status).delete(cancel))
         .route(
@@ -401,12 +412,27 @@ async fn metrics(
     Ok(Json(json!(values)))
 }
 
-async fn dataset(State(state): State<Shared>, form: Multipart) -> WebResult<Json<Value>> {
-    let (settings, uploads) = files::upload(&state, form, true).await?;
-    let paths =
-        tokio::task::spawn_blocking(move || uploads.into_dataset(state.studio.workspace.path()))
-            .await
-            .map_err(anyhow::Error::from)??;
+async fn dataset(
+    State(state): State<Shared>,
+    Query(query): Query<transfers::Query>,
+    form: Multipart,
+) -> WebResult<Response> {
+    let Some(transfers::Received {
+        settings,
+        uploads,
+        transfer,
+    }) = transfers::receive(&state, form, query.ticket, true).await?
+    else {
+        return Ok(StatusCode::GONE.into_response());
+    };
+    let paths = tokio::task::spawn_blocking(move || {
+        uploads.into_dataset(state.studio.workspace.path(), transfer)
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    let Some(paths) = paths else {
+        return Ok(StatusCode::GONE.into_response());
+    };
     let selected = if settings["mode"] == "multi_folder" {
         &paths.multi_folder
     } else {
@@ -414,7 +440,8 @@ async fn dataset(State(state): State<Shared>, form: Multipart) -> WebResult<Json
     };
     Ok(Json(
         json!({ "path": selected, "single": paths.single, "multi_folder": paths.multi_folder }),
-    ))
+    )
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -660,6 +687,8 @@ struct CoverJob {
     #[serde(default)]
     vocal_gain: f32,
     format: Format,
+    #[serde(default = "enabled")]
+    use_cache: bool,
     #[serde(default = "automatic")]
     device: String,
 }
@@ -741,6 +770,7 @@ impl CoverJob {
             vocal_gain: self.vocal_gain,
             device: self.device,
             format: self.format,
+            use_cache: Some(self.use_cache),
         };
         let rendered = cover::render(paths, &request, report)?;
         let media = state.studio.publish(
@@ -941,44 +971,67 @@ fn native(
     }
 }
 
-async fn start(State(state): State<Shared>, form: Multipart) -> WebResult<Response> {
-    let (settings, uploads) = files::upload(&state, form, false).await?;
+async fn start(
+    State(state): State<Shared>,
+    Query(query): Query<transfers::Query>,
+    form: Multipart,
+) -> WebResult<Response> {
+    let Some(transfers::Received {
+        settings,
+        uploads,
+        transfer,
+    }) = transfers::receive(&state, form, query.ticket, false).await?
+    else {
+        return Ok(StatusCode::GONE.into_response());
+    };
     let operation = settings["operation"]
         .as_str()
         .context("job operation is required")?
         .to_owned();
     let meta = jobs::Metadata::from_settings(&operation, &settings)?;
-    let id = match operation.as_str() {
+    let accepted = transfers::handoff(transfer, || match operation.as_str() {
         "single" | "pitch_profile" | "import" | "pretrained" | "install_embedder"
         | "build_feature_pool" | "resume" | "cover" | "layer_aug" | "fx_profile" => {
             let action: Extra = serde_json::from_value(settings).map_err(anyhow::Error::from)?;
-            launch_job(state, &operation, Some(meta), move |state, cancelled| {
-                action.run(state, uploads, cancelled)
-            })?
+            launch_job_with_id(
+                state,
+                &operation,
+                Some(meta),
+                query.ticket,
+                move |state, cancelled| action.run(state, uploads, cancelled),
+            )
         }
         _ => {
             let action: Action = serde_json::from_value(settings).map_err(anyhow::Error::from)?;
-            launch_job(state, &operation, Some(meta), move |state, cancelled| {
-                native(action, state, uploads, cancelled)
-            })?
+            launch_job_with_id(
+                state,
+                &operation,
+                Some(meta),
+                query.ticket,
+                move |state, cancelled| native(action, state, uploads, cancelled),
+            )
         }
-    };
-    Ok(match id {
-        Some(id) => (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response(),
-        None => (StatusCode::CONFLICT, Json(json!({ "error": "Stop the active audio stream or wait for the current task to finish." }))).into_response(),
+    })?;
+    Ok(match accepted {
+        None => StatusCode::GONE.into_response(),
+        Some(Some(id)) => (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response(),
+        Some(None) => (StatusCode::CONFLICT, Json(json!({ "error": "Stop the active audio stream or wait for the current task to finish." }))).into_response(),
     })
 }
 
 async fn cancel(
     State(state): State<Shared>,
     RoutePath(id): RoutePath<Uuid>,
-) -> WebResult<StatusCode> {
+) -> WebResult<Response> {
+    if state.studio.tickets.revoke(id)? {
+        return Ok(Json(json!({ "upload_cancelled": true })).into_response());
+    }
     let job = lock(&state.job)?;
     if job.id != id {
-        return Ok(StatusCode::NOT_FOUND);
+        return Ok(StatusCode::NOT_FOUND.into_response());
     }
     if job.status == JobState::Running {
         job.cancelled.store(true, Ordering::Relaxed);
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }

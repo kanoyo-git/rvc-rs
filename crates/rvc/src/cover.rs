@@ -27,6 +27,8 @@ use crate::catalog::{ModelInfo, Paths};
 use crate::model::{self, ConversionSettings};
 use crate::separation;
 
+mod cache;
+
 const RATE: u32 = 44_100;
 
 #[derive(Args, Debug)]
@@ -78,6 +80,9 @@ pub struct Request {
     pub device: String,
     #[arg(long, value_enum, default_value = "flac")]
     pub format: Format,
+    /// Enable the Cover cache. Pass false to render and cache a fresh take.
+    #[arg(long, value_name = "BOOL")]
+    pub use_cache: Option<bool>,
 }
 
 #[derive(clap::ValueEnum, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,14 +143,19 @@ pub fn render(
         request.instrumental.is_empty() || request.instrumental.len() == request.input.len(),
         "give one --instrumental per --input"
     );
-    for preset in [
-        "vocals-bs-roformer-ft1-anvuew",
-        "karaoke-bs-roformer-anvuew",
-        "dereverb-bs-roformer-anvuew-22.5050",
-    ] {
-        if preset.starts_with("vocals") && request.vocals_only {
-            continue;
-        }
+    let presets = if request.vocals_only {
+        &[
+            "karaoke-bs-roformer-anvuew",
+            "dereverb-bs-roformer-anvuew-22.5050",
+        ][..]
+    } else {
+        &[
+            "vocals-bs-roformer-ft1-anvuew",
+            "karaoke-bs-roformer-anvuew",
+            "dereverb-bs-roformer-anvuew-22.5050",
+        ][..]
+    };
+    for preset in presets {
         crate::assets::separation(paths, preset, &mut progress)?;
     }
     crate::assets::voice(paths, &request.model, request.f0_method, &mut progress)?;
@@ -154,16 +164,6 @@ pub fn render(
         Ok(())
     };
     let device = separation::device(&request.device)?;
-    let mut load = |preset: &str| -> Result<separation::Separator> {
-        step(&format!("Loading {preset}"))?;
-        separation::Separator::load(&paths.root, preset, device)
-    };
-    let vocal_split = (!request.vocals_only)
-        .then(|| load("vocals-bs-roformer-ft1-anvuew"))
-        .transpose()?;
-    let karaoke = load("karaoke-bs-roformer-anvuew")?;
-    let dereverb = load("dereverb-bs-roformer-anvuew-22.5050")?;
-
     let info = ModelInfo::read(&request.model)?;
     let speaker = info.speaker(request.speaker_id)?;
     let index = paths.require_index(
@@ -181,24 +181,24 @@ pub fn render(
         ..Default::default()
     };
     settings.validate()?;
-    let engine = model::Rvc::load(
-        paths,
-        &request.model,
-        Some(speaker),
-        index.as_deref(),
-        settings,
-        model::weights::device(&request.device)?,
-    )?;
-    let convert = |dry: &[f32], settings: ConversionSettings| -> Result<Vec<f32>> {
-        let analysis = audio::resample(dry, RATE, audio::ANALYSIS_RATE);
-        let hires = engine
-            .needs_hires(settings)
-            .then(|| audio::resample(dry, RATE, engine.rate()));
-        let converted = engine.convert_hires(&analysis, hires.as_deref(), settings)?;
-        let mut out = audio::resample(&converted.samples, converted.rate, RATE);
-        out.resize(dry.len(), 0.0);
-        Ok(out)
+    let debug = ["RVC_COVER_DEBUG", "RVC_DUMP_F0", "RVC_F0_OVERRIDE"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+    let cache = if debug || request.use_cache.is_none() {
+        None
+    } else {
+        Some(cache::Cache::new(
+            paths,
+            request,
+            &info,
+            speaker,
+            index.as_deref(),
+            presets,
+        )?)
     };
+    let mut models = None;
+    let mut used_stems = std::collections::HashSet::new();
+    std::fs::create_dir_all(&request.output)?;
     let mono = |stereo: &[f32]| Stereo(stereo.to_vec()).mono();
 
     let mut outputs = Vec::new();
@@ -209,6 +209,94 @@ pub fn render(
             .context("input has no file name")?
             .to_string_lossy()
             .into_owned();
+        // Different extensions can have the same stem; each result in a batch needs its own names.
+        let mut unique = stem.clone();
+        for number in 2.. {
+            if used_stems.insert(unique.clone()) {
+                break;
+            }
+            unique = format!("{stem}_{number}");
+        }
+        let stem = unique;
+        let filename = input
+            .file_name()
+            .context("missing Cover input filename")?
+            .to_string_lossy();
+        let staging = tempfile::Builder::new()
+            .prefix(".rvc-cover-")
+            .tempdir_in(&request.output)?;
+        let source_instrumental = request
+            .instrumental
+            .get(number)
+            .filter(|_| request.vocals_only)
+            .map(PathBuf::as_path);
+        let entry = cache
+            .as_ref()
+            .map(|cache| cache.entry(input, source_instrumental))
+            .transpose()?;
+        if let Some(cache) = &cache {
+            cache.check_assets()?;
+        }
+        if request.use_cache == Some(true)
+            && let Some(entry) = &entry
+        {
+            match cache::restore(
+                entry,
+                staging.path(),
+                &stem,
+                request.format.extension(),
+                !request.vocals_only || source_instrumental.is_some(),
+            ) {
+                Ok(Some(mut files)) => {
+                    step(&format!("Cover cache hit · {filename}"))?;
+                    cache::publish(&mut files, &request.output, true)?;
+                    outputs.push(Rendered {
+                        input: input.clone(),
+                        files,
+                    });
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => step(&format!(
+                    "Cover cache entry unreadable · {filename} · {error:#}"
+                ))?,
+            }
+            step(&format!("Cover cache miss · {filename}"))?;
+        } else if request.use_cache.is_some() {
+            step(&format!("Cover cache bypass · {filename}"))?;
+        }
+        if models.is_none() {
+            let mut load = |preset: &str| -> Result<separation::Separator> {
+                step(&format!("Loading {preset}"))?;
+                separation::Separator::load(&paths.root, preset, device)
+            };
+            let vocal_split = (!request.vocals_only)
+                .then(|| load("vocals-bs-roformer-ft1-anvuew"))
+                .transpose()?;
+            let karaoke = load("karaoke-bs-roformer-anvuew")?;
+            let dereverb = load("dereverb-bs-roformer-anvuew-22.5050")?;
+            let engine = model::Rvc::load(
+                paths,
+                &request.model,
+                Some(speaker),
+                index.as_deref(),
+                settings,
+                model::weights::device(&request.device)?,
+            )?;
+            models = Some((vocal_split, karaoke, dereverb, engine));
+        }
+        let (vocal_split, karaoke, dereverb, engine) =
+            models.as_ref().context("Cover models were not loaded")?;
+        let convert = |dry: &[f32], settings: ConversionSettings| -> Result<Vec<f32>> {
+            let analysis = audio::resample(dry, RATE, audio::ANALYSIS_RATE);
+            let hires = engine
+                .needs_hires(settings)
+                .then(|| audio::resample(dry, RATE, engine.rate()));
+            let converted = engine.convert_hires(&analysis, hires.as_deref(), settings)?;
+            let mut out = audio::resample(&converted.samples, converted.rate, RATE);
+            out.resize(dry.len(), 0.0);
+            Ok(out)
+        };
         let mut stage = |name: &str| step(&format!("{} / {total} · {stem} · {name}", number + 1));
         let mut files = Vec::new();
         stage("Separating vocals")?;
@@ -222,7 +310,7 @@ pub fn render(
             }
         };
         let source = Stereo::read(input)?;
-        let (vocals, instrumental) = match &vocal_split {
+        let (vocals, instrumental) = match vocal_split {
             Some(model) => {
                 let (vocals, instrumental) = model.split(&source.0)?;
                 (Stereo(vocals), Some(Stereo(instrumental)))
@@ -302,11 +390,11 @@ pub fn render(
         stage("Mixing")?;
         let extension = request.format.extension();
         for (name, samples) in &stems {
-            let path = request.output.join(format!("{stem}_{name}.{extension}"));
+            let path = staging.path().join(format!("{stem}_{name}.{extension}"));
             audio::write_audio(&path, samples, RATE, request.format, true)?;
             files.push((*name, path));
         }
-        let vocal_path = request.output.join(format!("{stem}_vocals.{extension}"));
+        let vocal_path = staging.path().join(format!("{stem}_vocals.{extension}"));
         audio::write_audio(&vocal_path, &limit(&bus, 1), RATE, request.format, true)?;
         files.push(("vocals", vocal_path));
         if let Some(instrumental) = instrumental {
@@ -316,7 +404,7 @@ pub fn render(
                 *l += v;
                 *r += v;
             }
-            let mix_path = request.output.join(format!("{stem}_cover.{extension}"));
+            let mix_path = staging.path().join(format!("{stem}_cover.{extension}"));
             audio::write_audio_channels(
                 &mix_path,
                 &limit(&mix, 2),
@@ -345,6 +433,30 @@ pub fn render(
             started.elapsed().as_secs_f64(),
             timing.join(", ")
         );
+        let archive = if let (Some(entry), Some(cache)) = (&entry, &cache) {
+            cache.check_assets()?;
+            ensure!(
+                cache.entry(input, source_instrumental)? == *entry,
+                "Cover input changed during rendering: {filename}"
+            );
+            match cache::pack(entry, &files) {
+                Ok(file) => Some((file, entry)),
+                Err(error) => {
+                    step(&format!(
+                        "Cover cache write skipped · {filename} · {error:#}"
+                    ))?;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        cache::publish(&mut files, &request.output, false)?;
+        if let Some((file, entry)) = archive
+            && let Err(error) = file.persist(entry)
+        {
+            step(&format!("Cover cache write skipped · {filename} · {error}"))?;
+        }
         // The files are written: a stop request from here on is seen at the next input.
         let _ = step(&summary);
         outputs.push(Rendered {

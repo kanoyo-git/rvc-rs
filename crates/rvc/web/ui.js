@@ -62,15 +62,20 @@ export const send = (url, body, method = "POST") => api(url, {
   body: JSON.stringify(body),
 });
 
-export function upload(url, settings, files, onProgress) {
+export function upload(url, settings, files, onProgress, signal) {
   const data = new FormData();
   if (settings) data.set("settings", JSON.stringify(settings));
   for (const file of files) data.append("files", file);
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    if (signal?.aborted) { reject(new DOMException("Upload aborted", "AbortError")); return; }
+    const abort = () => xhr.abort();
     xhr.open("POST", url);
+    signal?.addEventListener("abort", abort, { once: true });
+    xhr.addEventListener("loadend", () => signal?.removeEventListener("abort", abort), { once: true });
+    xhr.addEventListener("abort", () => reject(new DOMException("Upload aborted", "AbortError")), { once: true });
     if (onProgress) xhr.upload.addEventListener("progress", event => {
-      if (event.lengthComputable) onProgress(Math.round(100 * event.loaded / event.total));
+      if (!signal?.aborted && event.lengthComputable) onProgress(Math.round(100 * event.loaded / event.total));
     });
     xhr.addEventListener("load", () => {
       if (xhr.status < 200 || xhr.status >= 300) {
@@ -104,11 +109,15 @@ export function toast(message, error = false) {
   item.append(body, close);
   host.append(item);
   if (host.children.length > 4) host.firstElementChild.remove();
-  const timer = setTimeout(() => item.remove(), error ? 9000 : 4500);
-  close.addEventListener("click", () => {
+  const dismiss = () => {
     clearTimeout(timer);
-    item.remove();
-  });
+    item.classList.add("is-leaving");
+    const exit = item.getAnimations?.().find(animation => animation.animationName === "toast-out");
+    if (exit) exit.finished.then(() => item.remove(), () => item.remove());
+    else item.remove();
+  };
+  const timer = setTimeout(dismiss, error ? 9000 : 4500);
+  close.addEventListener("click", dismiss, { once: true });
 }
 
 export function syncRange(number) {

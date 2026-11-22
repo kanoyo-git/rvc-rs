@@ -1,7 +1,8 @@
 import {
-  $, $$, api, send, upload, value, checked, radio, t, log, fill, facts, toast, clock,
+  $, $$, api, send, value, checked, radio, t, log, fill, facts, toast, clock,
   bindRanges, syncRange, bindDrops, refreshDrop, enhanceAudioPlayers, repaintPlayers,
 } from "/studio/ui.js";
+import { audioUpload } from "/studio/transfers.js";
 import { savedFiles } from "/studio/files.js";
 import { studioJobs, rememberOutput } from "/studio/jobs.js";
 import { realtime } from "/studio/realtime.js";
@@ -202,6 +203,8 @@ function progressBar(output) {
 }
 
 function displayJobLine(line) {
+  const cache = /^Cover cache (hit|miss|bypass|entry unreadable|write skipped) · ([\s\S]*)$/.exec(line);
+  if (cache) return t("coverCache_" + cache[1]).replace("{file}", () => cache[2]);
   const match = /^Epoch (\d+\/\d+) completed in (\d+(?:\.\d+)?) s(?: · ETA (\d+ (?:d|h|min|s)(?: \d+ (?:d|h|min|s))*))?$/.exec(line);
   if (!match) return line;
   const seconds = Number(match[2]).toLocaleString(document.documentElement.lang, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -472,7 +475,7 @@ action("runCover", "cLog", async output => {
     files.push(instFile);
   }
   await runJob({
-    operation: "cover", ...coverVoice.request(),
+    operation: "cover", ...coverVoice.request(), use_cache: checked("cUseCache"),
     index_rate: coverVoice.usesIndex() ? number("cIndexRate") : 0,
     pitch: number("cPitch"), f0_method: value("cF0"), vocals_only: vocals, backing: radio("cBacking"), dry: !checked("cReverb"),
     vocal_gain: number("cVocalGain"), aperiodic: optionalNumber("cAperiodic"),
@@ -672,32 +675,51 @@ function embedderOptions() {
 }
 
 let datasetRevision = 0;
+let datasetTransfer;
+let clearingCancelledSelection = false;
 listen("#trainsetZip", "change", async () => {
+  if (clearingCancelledSelection) return;
   const revision = ++datasetRevision;
-  const files = fileList("trainsetZip");
-  if (value("trainset") === datasetPath) {
-    $("#trainset").value = "";
-    session.remember("field:trainset", "");
-  }
-  session.remember("dataset", null);
-  datasetPath = undefined;
-  datasetPaths = undefined;
+  datasetTransfer?.cancel();
+  datasetTransfer = null;
   datasetUploading = false;
-  if (!files.length) return;
+  const input = $("#trainsetZip");
+  const files = fileList("trainsetZip");
+  if (!files.length) {
+    if (value("trainset") === datasetPath) {
+      $("#trainset").value = "";
+      session.remember("field:trainset", "");
+    }
+    session.remember("dataset", null);
+    datasetPath = datasetPaths = undefined;
+    return;
+  }
   const output = $("#preLog");
   const original = value("trainset");
   const archive = files.length === 1 && /\.zip$/i.test(files[0].name);
-  const mode = radio("mode");
   try {
     if (!archive && files.some(file => /\.zip$/i.test(file.name))) throw new Error(t("chooseDatasetUpload"));
     datasetUploading = true;
-    const data = await upload("/api/studio/dataset", { mode }, files, pct => {
-      if (revision === datasetRevision) log(output, `${t("uploading")} · ${pct}%`);
+    const progress = pct => { if (revision === datasetRevision) log(output, `${t("uploading")} · ${pct}%`); };
+    progress(0);
+    datasetTransfer = audioUpload($("#cancelDatasetUpload"), () => {
+      if (revision !== datasetRevision) return;
+      // Record the cleared file before a reload, keeping the previous server dataset selected.
+      clearingCancelledSelection = true;
+      try { input.value = ""; input.dispatchEvent(new Event("change", { bubbles: true })); }
+      finally { clearingCancelledSelection = false; }
+      log(output, t("cancellingUpload"));
     });
+    const data = await datasetTransfer.send("/api/studio/dataset", { mode: radio("mode") }, files, progress);
     if (revision !== datasetRevision) return;
+    if (data.uploadCancelled) {
+      log(output, t("uploadCancelled"));
+      return;
+    }
+    const useUploaded = value("trainset") === original || value("trainset") === datasetPath;
     datasetPaths = data;
     datasetPath = data[radio("mode")] || data.path;
-    if (value("trainset") === original) {
+    if (useUploaded) {
       $("#trainset").value = datasetPath;
       session.remember("field:trainset", datasetPath);
       session.remember("dataset", session.safeFields(data));
@@ -706,7 +728,7 @@ listen("#trainsetZip", "change", async () => {
   } catch (error) {
     if (revision === datasetRevision) explain(error, output);
   } finally {
-    if (revision === datasetRevision) { datasetUploading = false; rememberOutput(output); }
+    if (revision === datasetRevision) { datasetTransfer = null; datasetUploading = false; rememberOutput(output); }
   }
 });
 
