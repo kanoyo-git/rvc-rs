@@ -248,7 +248,7 @@ export const messages = {
     "loadingPretrained": "Wait for the pretrained weights for this sample rate to load.",
     "contentvecNvcPretrainedHint": "NVC-Pretrained uses ContentVec at 40 kHz, RMVPE, 60 epochs, batch 8 and a save every 60 epochs.",
 
-    "preCatalogHelp": "Community RVC v2 pretrains for the selected rate. Downloads are checked against the architecture and saved to assets/pretrained_v2 without optimizer state.",
+    "preCatalogHelp": "Choosing a catalog entry selects its generator and discriminator for this sample rate. Studio downloads missing weights when training starts.",
     "qualityOptions": "Quality and experiments",
     "unvoicedF0": "Pitch on unvoiced frames",
     "unvoicedZero": "Zero, cleaner voicing",
@@ -668,7 +668,7 @@ export const messages = {
     "loadingPretrained": "Дождитесь загрузки списка весов для выбранной частоты.",
     "contentvecNvcPretrainedHint": "NVC-Pretrained использует ContentVec на 40 кГц, RMVPE, 60 эпох, batch 8 и сохранение каждые 60 эпох.",
 
-    "preCatalogHelp": "Претрейны RVC v2 от сообщества для выбранной частоты. Загрузка проверяется на совместимость и сохраняется в assets/pretrained_v2 без состояния оптимизатора.",
+    "preCatalogHelp": "Выбор в каталоге задаёт генератор и дискриминатор для текущей частоты. Studio скачает недостающие веса при запуске обучения.",
     "qualityOptions": "Качество и эксперименты",
     "unvoicedF0": "Высота на глухих кадрах",
     "unvoicedZero": "Ноль, чище озвончённость",

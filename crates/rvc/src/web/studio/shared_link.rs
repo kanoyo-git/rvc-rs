@@ -689,6 +689,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_mega_key_returns_an_error() -> Result<()> {
+        let origin = serve(1, |_, _| {
+            let body = br#"[{"g":"https://unused.invalid/","s":17,"at":"ziHCcIgVF8IvKsuk217bvmIiYYanMFdn7vkaMSph7Mo"}]"#.to_vec();
+            (format!("200 OK\r\nContent-Length: {}", body.len()), body)
+        });
+        let api = mega::Client::builder()
+            .origin(http_url(&origin)?)
+            .build(Client::new())?;
+        let mut key = [0u8; 32];
+        key[2] = 3;
+        let link = format!(
+            "https://mega.nz/file/test1234#{}",
+            URL_SAFE_NO_PAD.encode(key)
+        );
+        let tmp = NamedTempFile::new()?;
+        let err = download_mega_node(api, link, tmp.reopen()?, &Cell::new(0))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid MEGA file attributes or decryption key"),
+            "{err:#}"
+        );
+        assert_eq!(tmp.as_file().metadata()?.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn public_mega_stream_checks_file_mac_and_decodes_name() -> Result<()> {
         // Independently encrypted fixture: AES-128-CTR body, AES-128-CBC attributes and condensed MAC.
         const KEY: &str = "MTMxNzEzMT9iIYNPm6ZDHDEyMzQ1Njc4aiiJRJerTRM";
