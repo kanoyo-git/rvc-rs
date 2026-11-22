@@ -980,11 +980,11 @@ async function afterTraining(result, output, experimentName) {
   link.dataset.i18n = "downloadTrainingLog";
   link.textContent = t("downloadTrainingLog");
   output.append(` ${result.model} · ${t("completedEpoch")} ${result.epochs_completed}\n`, link);
-  await Promise.all([updateModels(), refreshRuns()]);
+  await Promise.all([updateModels(), refreshRuns(true)]);
   $("#trainExport").replaceChildren(exportLink(fileName(result.model), "btn"));
 }
 
-async function refreshRuns() {
+async function refreshRuns(refreshResume = false) {
   experiments = await api("/api/studio/experiments");
   const { runs, resumable, all } = experiments;
   fill($("#metricRun"), runs.length ? runs : [{ value: "", key: "metricsEmpty" }]);
@@ -993,7 +993,7 @@ async function refreshRuns() {
   fill($("#layerAug"), [{ value: "", key: "off" }, ...all]);
   fill($("#laSource"), all.length ? all : [{ value: "", key: "noExperiments" }]);
   syncTrainingControls();
-  if (current !== value("resumeExp") || !$("#resumeInfo").children.length) await showResume();
+  if (refreshResume || current !== value("resumeExp") || !$("#resumeInfo").children.length) await showResume();
 }
 let resumeRevision = 0;
 let manualResumeTotal;
@@ -1028,7 +1028,7 @@ async function showResume() {
     [t("checkpoints"), fileName(info.generator) + " + " + fileName(info.discriminator)],
   ]);
 }
-listen("#refreshResume", "click", refreshRuns);
+listen("#refreshResume", "click", () => refreshRuns(true));
 listen("#resumeExp", "change", showResume);
 action("runResume", "resumeLog", async output => {
   const name = requireValue(value("resumeExp"), "resumeEmpty");
@@ -1036,10 +1036,7 @@ action("runResume", "resumeLog", async output => {
     operation: "resume", name, epochs: number("resumeTotal"),
     ...trainingPrecision("resumePrecision"), gradient_checkpointing: checkpointing("resumeCheckpointing"),
   }, [], output, "stopResume");
-  if (result) {
-    await afterTraining(result, output, name);
-    await showResume();
-  }
+  if (result) await afterTraining(result, output, name);
 }, () => !$("#resumeTotal").disabled);
 
 /* Layers and effects */
