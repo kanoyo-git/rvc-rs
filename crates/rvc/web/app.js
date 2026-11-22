@@ -2,11 +2,13 @@ import {
   $, $$, api, send, upload, value, checked, radio, t, log, fill, facts, toast, clock,
   bindRanges, syncRange, bindDrops, refreshDrop, enhanceAudioPlayers, repaintPlayers,
 } from "/studio/ui.js";
+import { savedFiles } from "/studio/files.js";
+import { studioJobs, rememberOutput } from "/studio/jobs.js";
 import { realtime } from "/studio/realtime.js";
+import * as session from "/studio/session.js";
 
 let options;
 let live;
-let activeJob;
 let metrics = {};
 let datasetPath;
 let datasetUploading = false;
@@ -50,6 +52,8 @@ function action(id, output, run, available = () => true) {
   listen("#" + id, "click", async event => {
     const button = event.currentTarget;
     const target = $("#" + output);
+    if (jobs.busy() && target.dataset.jobId && $(".btn[data-job-lock]")) { toast(t("busyTask"), true); return; }
+    const previousJob = target.dataset.jobId;
     button.disabled = true;
     try {
       log(target, "");
@@ -57,15 +61,16 @@ function action(id, output, run, available = () => true) {
     } catch (error) {
       explain(error, target);
     } finally {
-      button.disabled = !available();
+      if (target.dataset.jobId === previousJob) rememberOutput(target);
+      button.disabled = !available() || Boolean(button.dataset.jobLock);
     }
   });
 }
 
 /* Language and theme */
 const prefs = {
-  theme: localStorage.getItem("rvc-studio-theme") === "light" ? "light" : "dark",
-  lang: localStorage.getItem("rvc-studio-lang") || (navigator.language.startsWith("ru") ? "ru" : "en"),
+  theme: session.preference("rvc-studio-theme", "dark") === "light" ? "light" : "dark",
+  lang: session.preference("rvc-studio-lang", navigator.language.startsWith("ru") ? "ru" : "en"),
 };
 function localize() {
   const root = document.documentElement;
@@ -99,22 +104,27 @@ const capital = (name) => ({ infer: "Infer", cover: "Cover", realtime: "Realtime
   layers: "Layers", metrics: "Metrics", speakers: "Speakers", library: "Library", ckpt: "Ckpt", faq: "Faq" })[name] || "Infer";
 listen("#langSelect", "change", () => {
   prefs.lang = value("langSelect");
-  localStorage.setItem("rvc-studio-lang", prefs.lang);
+  session.storePreference("rvc-studio-lang", prefs.lang);
   localize();
 });
 listen("#themeToggle", "click", () => {
   prefs.theme = prefs.theme === "light" ? "dark" : "light";
-  localStorage.setItem("rvc-studio-theme", prefs.theme);
+  session.storePreference("rvc-studio-theme", prefs.theme);
   localize();
 });
 
 /* Navigation */
 let currentPanel = "infer";
+function addressPanel() {
+  const query = new URLSearchParams(location.search);
+  return query.get("panel") || query.get("tab");
+}
 const panelAliases = { convert: "infer", training: "train", separation: "separate", models: "ckpt", tensorboard: "metrics", helper: "speakers" };
 function showPanel(name, updateLocation = false) {
   name = panelAliases[name] || name;
   if (!$$(".nav-item").some(tab => tab.dataset.tab === name && !tab.hidden)) name = "infer";
   currentPanel = name;
+  session.remember("panel", name);
   for (const tab of $$(".nav-item")) {
     const active = tab.dataset.tab === name;
     tab.classList.toggle("is-active", active);
@@ -123,23 +133,28 @@ function showPanel(name, updateLocation = false) {
   }
   for (const panel of $$(".panel")) panel.classList.toggle("is-active", panel.dataset.panel === name);
   for (const audio of $$("audio")) if (!audio.closest(".panel.is-active")) audio.pause();
-  $("#workspace").scrollTop = 0;
+  $("#workspace").scrollTop = Number(session.saved("scroll:" + name)) || 0;
   document.title = "NVC Studio · " + t("tab" + capital(name));
   if (updateLocation) {
     const url = new URL(location.href);
-    if (name === "infer") url.searchParams.delete("panel");
-    else url.searchParams.set("panel", name);
-    if (url.href !== location.href) history.pushState(null, "", url);
+    const key = url.searchParams.has("tab") && !url.searchParams.has("panel") ? "tab" : "panel";
+    url.searchParams.delete("panel");
+    url.searchParams.delete("tab");
+    if (name !== "infer") url.searchParams.set(key, name);
+    if (url.href !== location.href) history.pushState({ studioPanel: name }, "", url);
+  } else if (history.state?.studioPanel !== name) {
+    history.replaceState({ ...history.state, studioPanel: name }, "");
   }
   live?.activate(name === "realtime");
-  if (!options) return;
-  if (name === "metrics") refreshRuns().then(loadMetrics).catch(error => explain(error, $("#tbStatus")));
-  if (name === "train") Promise.all([loadPretrained(), refreshRuns()]).catch(error => explain(error, $("#trainLog")));
-  if (name === "layers") refreshRuns().catch(error => explain(error, $("#laLog")));
   requestAnimationFrame(repaintPlayers);
+  if (!options) return;
+  if (name === "metrics") return refreshRuns().then(loadMetrics).catch(error => explain(error, $("#tbStatus")));
+  if (name === "train") return Promise.all([loadPretrained(), refreshRuns()]).catch(error => explain(error, $("#trainLog")));
+  if (name === "layers") return refreshRuns().catch(error => explain(error, $("#laLog")));
 }
 listen(".nav-item", "click", event => showPanel(event.currentTarget.dataset.tab, true));
-window.addEventListener("popstate", () => showPanel(new URLSearchParams(location.search).get("panel")));
+window.addEventListener("popstate", () => showPanel(addressPanel() || history.state?.studioPanel || "infer"));
+$("#workspace").addEventListener("scroll", event => session.remember("scroll:" + currentPanel, event.target.scrollTop), { passive: true });
 
 /* Signature: the tally lamp shows the one task the studio runs */
 const tally = {
@@ -187,84 +202,17 @@ function progressBar(output) {
 }
 
 function displayJobLine(line) {
-  const match = /^Epoch (\d+\/\d+) completed in (\d+\.\d+) s$/.exec(line);
+  const match = /^Epoch (\d+\/\d+) completed in (\d+(?:\.\d+)?) s(?: · ETA (\d+ (?:d|h|min|s)(?: \d+ (?:d|h|min|s))*))?$/.exec(line);
   if (!match) return line;
   const seconds = Number(match[2]).toLocaleString(document.documentElement.lang, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return t("epochDuration").replace("{epoch}", match[1]).replace("{seconds}", seconds);
+  const duration = t("epochDuration").replace("{epoch}", match[1]).replace("{seconds}", seconds);
+  if (!match[3]) return duration;
+  const eta = match[3].replace(/\b(d|h|min|s)\b/g, unit => t("etaUnit_" + unit));
+  return duration + " · " + t("epochEta").replace("{time}", eta);
 }
 
-async function runJob(settings, files, output, stopId) {
-  if (activeJob) throw new Error(t("busyTask"));
-  const showProgress = progressBar(output);
-  const stop = stopId ? $("#" + stopId) : null;
-  const task = { url: null };
-  activeJob = task;
-  if (stop) {
-    stop.disabled = false;
-    stop.onclick = async () => {
-      stop.disabled = true;
-      try {
-        await api(task.url, { method: "DELETE" });
-      } catch (error) {
-        explain(error, output);
-        stop.disabled = false;
-      }
-    };
-  }
-  try {
-    log(output, t("working"));
-    const { id } = await upload("/api/studio/job", settings, files, files.length ? (pct) => {
-      log(output, `${t("uploading")} · ${pct}%`);
-    } : null);
-    task.url = "/api/studio/job/" + id;
-    tally.start(settings.operation);
-    if (stop) stop.hidden = false;
-    let previous = "";
-    for (;;) {
-      const job = await api(task.url);
-      const text = job.log.map(displayJobLine).join("\n");
-      showProgress(job.status === "running" ? job.message : "");
-      if (job.status === "complete") {
-        log(output, text ? text + "\n" + t("done") : t("done"));
-        toast(t("doneShort") + " · " + t("op_" + settings.operation));
-        return job.result;
-      }
-      if (job.status === "cancelled") {
-        log(output, t("cancelled") + (text ? "\n" + text : ""));
-        return null;
-      }
-      if (job.status === "failed") throw new Error(job.message);
-      if (text && text !== previous) {
-        log(output, text);
-        output.scrollTop = output.scrollHeight;
-        previous = text;
-      }
-      await new Promise(resolve => setTimeout(resolve, 600));
-    }
-  } finally {
-    activeJob = null;
-    showProgress("");
-    tally.stop();
-    if (stop) {
-      stop.onclick = null;
-      stop.hidden = true;
-    }
-  }
-}
-
-async function watchForeignJob() {
-  const job = await api("/api/job").catch(() => null);
-  if (!job || job.status !== "running" || activeJob) return;
-  tally.start(job.operation);
-  const timer = setInterval(async () => {
-    const now = await api("/api/job").catch(() => null);
-    if (activeJob) return clearInterval(timer);
-    if (!now || now.status !== "running") {
-      clearInterval(timer);
-      tally.stop();
-    }
-  }, 2000);
-}
+const jobs = studioJobs({ tally, progressBar, displayLine: displayJobLine, completed: presentResult, explain });
+const runJob = jobs.run;
 
 /* Voices */
 const embedderLabels = { hubert_base: "ContentVec (RVC)", contentvec: "ContentVec (Applio)", spin: "Spin", "spin-v2": "Spin-v2", mhubert147: "mHuBERT-147", w2v_ru: "wav2vec 2.0 ru" };
@@ -300,8 +248,15 @@ function voicePicker(prefix, onChange) {
     const query = new URLSearchParams();
     if (speaker) query.set("speaker", speaker);
     try {
-      const result = await api("/api/studio/voice/" + encodeURIComponent(model) + "?" + query);
+      const path = "/api/studio/voice/" + encodeURIComponent(model) + "?";
+      let result = await api(path + query);
       if (current !== revision) return;
+      const storedSpeaker = session.waiting("field:" + prefix + "Speaker");
+      if (!speakerChanged && storedSpeaker && storedSpeaker !== String(result.speaker) && Object.hasOwn(result.info.speakers, storedSpeaker)) {
+        query.set("speaker", storedSpeaker);
+        result = await api(path + query);
+        if (current !== revision) return;
+      }
       data = result;
       const info = result.info;
       // Only multi-speaker models name their speakers; the rest always use speaker 0.
@@ -329,7 +284,10 @@ function voicePicker(prefix, onChange) {
     }
     sync();
   }
-  el("Model").addEventListener("change", () => load());
+  el("Model").addEventListener("change", () => {
+    for (const field of ["Speaker", "Index"]) session.remember("field:" + prefix + field, null);
+    load();
+  });
   el("Speaker").addEventListener("change", () => load(true));
   el("Index").addEventListener("change", sync);
   return {
@@ -337,6 +295,9 @@ function voicePicker(prefix, onChange) {
     get data() { return data; },
     setModels(models) {
       fill(el("Model"), models.length ? models : [{ value: "", key: "noVoices" }]);
+      if (session.saved("field:" + prefix + "Model") !== el("Model").value) {
+        for (const field of ["Speaker", "Index"]) session.take("field:" + prefix + field);
+      }
       return load();
     },
     usesIndex: () => Boolean(el("Index").value),
@@ -417,11 +378,10 @@ function syncProfile() {
 listen("#iAutoRegister", "change", syncProfile);
 action("iBuildProfile", "iProfileLog", async output => {
   requireValue(inferVoice.data, "chooseVoice");
-  const result = await runJob({
+  await runJob({
     operation: "pitch_profile", model: value("iModel"),
     input: value("iProfileDataset") || null, method: radio("iF0"),
-  }, fileList("iProfileFile"), output, "iStopProfile");
-  if (result) log(output, `${result.path}\n${t("voicedFrames")} · ${result.profile.voiced_frames}`);
+  }, fileList("iProfileFile"), output);
 });
 
 function setAudio(audio, media) {
@@ -471,22 +431,17 @@ function renderTracks(id, groups) {
 action("runSingle", "sLog", async output => {
   const files = fileList("sAudio");
   requireValue(files[0], "chooseAudio");
-  const result = await runJob({ operation: "single", ...conversion() }, files, output, "stopSingle");
-  if (result) {
-    setAudio($("#sOut"), result);
-    $("#sResult").hidden = false;
-  }
+  await runJob({ operation: "single", ...conversion() }, files, output);
 });
 action("runBatch", "bLog", async output => {
   const input = value("bIn");
   const files = input ? [] : fileList("bFiles");
   if (!input) requireValue(files.length, "chooseAudio");
-  const result = await runJob({
+  await runJob({
     operation: "batch", ...conversion(), input,
     output: requireValue(value("bOut"), "chooseOutput"), format: radio("bFmt"),
     recursive: checked("bRecursive"), overwrite: checked("bOverwrite"),
-  }, files, output, "stopBatch");
-  if (result) renderTracks("bResults", result.map(track => ({ name: track.name, tracks: [track] })));
+  }, files, output);
 });
 
 /* Cover */
@@ -508,7 +463,7 @@ action("runCover", "cLog", async output => {
     if (files.length !== 1) throw new Error(t("oneVocalForInstrumental"));
     files.push(instFile);
   }
-  const result = await runJob({
+  await runJob({
     operation: "cover", ...coverVoice.request(),
     index_rate: coverVoice.usesIndex() ? number("cIndexRate") : 0,
     pitch: number("cPitch"), f0_method: value("cF0"), vocals_only: vocals, backing: radio("cBacking"), dry: !checked("cReverb"),
@@ -516,8 +471,7 @@ action("runCover", "cLog", async output => {
     voice_gate: coverVoice.data?.gate ? number("cGate") : 0, format: radio("cFmt"), device: value("cDevice") || "auto",
     input: input || null, output: value("cOut") || null,
     instrumental: vocals && !instFile ? value("cInstPath") || null : null, instrumental_upload: Boolean(instFile),
-  }, files, output, "stopCover");
-  if (result) renderTracks("cResults", result);
+  }, files, output);
 });
 
 /* Separation */
@@ -542,12 +496,11 @@ action("runSep", "pLog", async output => {
   const input = value("pIn");
   const files = input ? [] : fileList("pFiles");
   if (!input) requireValue(files.length, "chooseAudio");
-  const result = await runJob({
+  await runJob({
     operation: "separate", input, preset: value("pModel"),
     output: requireValue(value("pVocal"), "chooseOutput"), secondary_output: value("pResidual") || null,
     format: radio("pFmt"), overwrite: checked("sepOverwrite"),
-  }, files, output, "stopSep");
-  if (result) renderTracks("pResults", result);
+  }, files, output);
 });
 
 /* Library */
@@ -567,11 +520,7 @@ action("runLib", "libLog", async output => {
     generator: value("libGUrl").trim() || null, discriminator: value("libDUrl").trim() || null,
   } : { operation: "import", name: name || null, url: value("libUrl") || null };
   if (pair && !settings.generator && !settings.discriminator) throw new Error(t("chooseUrl"));
-  const result = await runJob(settings, pair ? [] : fileList("libFile"), output, "stopLib");
-  if (result) {
-    log(output, result.paths.join("\n"));
-    await (pair ? loadPretrained() : updateModels());
-  }
+  await runJob(settings, pair ? [] : fileList("libFile"), output);
 });
 function renderVoiceList() {
   const models = options.models;
@@ -679,6 +628,7 @@ function syncTrainingControls() {
   if (datasetPaths && source !== "manifest" && value("trainset") === datasetPath) {
     datasetPath = datasetPaths[source];
     $("#trainset").value = datasetPath;
+    session.remember("field:trainset", datasetPath);
   }
   $("#multiHelp").hidden = source !== "multi_folder";
   $("#spkWrap").hidden = source !== "single";
@@ -717,7 +667,11 @@ let datasetRevision = 0;
 listen("#trainsetZip", "change", async () => {
   const revision = ++datasetRevision;
   const files = fileList("trainsetZip");
-  if (value("trainset") === datasetPath) $("#trainset").value = "";
+  if (value("trainset") === datasetPath) {
+    $("#trainset").value = "";
+    session.remember("field:trainset", "");
+  }
+  session.remember("dataset", null);
   datasetPath = undefined;
   datasetPaths = undefined;
   datasetUploading = false;
@@ -735,12 +689,16 @@ listen("#trainsetZip", "change", async () => {
     if (revision !== datasetRevision) return;
     datasetPaths = data;
     datasetPath = data[radio("mode")] || data.path;
-    if (value("trainset") === original) $("#trainset").value = datasetPath;
+    if (value("trainset") === original) {
+      $("#trainset").value = datasetPath;
+      session.remember("field:trainset", datasetPath);
+      session.remember("dataset", session.safeFields(data));
+    }
     log(output, `${t("datasetReady")} ${datasetPath}`);
   } catch (error) {
     if (revision === datasetRevision) explain(error, output);
   } finally {
-    if (revision === datasetRevision) datasetUploading = false;
+    if (revision === datasetRevision) { datasetUploading = false; rememberOutput(output); }
   }
 });
 
@@ -749,8 +707,7 @@ listen('#trainEmbedder, #timbreMode, #layerAug, #trainVersion, #noiseReduce, inp
 listen('#trainVersion, input[name="sr"], input[name="ifF0"]', "change", () => loadPretrained());
 action("runPre", "preLog", async output => {
   const config = configTraining();
-  await runJob({ operation: "preprocess", experiment: config.experiment, sample_rate: config.sample_rate, ...prepParams() }, [], output, "stopPre");
-  await refreshRuns();
+  await runJob({ operation: "preprocess", experiment: config.experiment, sample_rate: config.sample_rate, ...prepParams() }, [], output);
 });
 action("runExt", "extLog", async output => {
   const config = configTraining();
@@ -758,49 +715,34 @@ action("runExt", "extLog", async output => {
     operation: "extract", experiment: config.experiment, version: config.version,
     f0_method: config.f0 ? radio("tf0") : null, embedder: config.embedder,
     overwrite: checked("overwriteFeatures"), unvoice_fricatives: checked("unvoiceFricatives"),
-  }, [], output, "stopExt");
+  }, [], output);
 });
 action("downloadEmbedder", "extLog", async output => {
-  const result = await runJob({
+  await runJob({
     operation: "install_embedder", embedder: requireValue(value("trainEmbedder"), "chooseEmbedder"),
-  }, [], output, "stopEmbedder");
-  if (result) {
-    log(output, t("done") + " " + result.path);
-    const item = options.embedders.find(entry => entry.name === value("trainEmbedder"));
-    if (item) item.installed = true;
-    renderEmbedders();
-  }
+  }, [], output);
 });
 action("buildFeaturePool", "trainLog", async output => {
-  const result = await runJob({
+  await runJob({
     operation: "build_feature_pool", spec: requireValue(value("poolSpec"), "choosePoolSpec"),
     output: requireValue(value("poolOutput"), "chooseOutput"), max_minutes: number("poolMinutes"),
     embedder: value("trainEmbedder") || "hubert_base",
-  }, [], output, "stopFeaturePool");
-  if (result) {
-    $("#timbreMode").value = "pool";
-    $("#timbrePool").value = result.path;
-    syncTrainingControls();
-    const speakers = Object.entries(result.frames).map(([speaker, frames]) => speaker + " · " + frames);
-    log(output, [t("done") + " " + result.path, ...speakers].join("\n"));
-  }
+  }, [], output);
 });
 action("runTrain", "trainLog", async output => {
   const settings = trainParams();
-  const result = await runJob({ operation: "train", ...settings }, [], output, "stopTrain");
-  if (result) await afterTraining(result, output, settings.name);
+  await runJob({ operation: "train", ...settings }, [], output);
 });
 action("runIndex", "trainLog", async output => {
   await runJob({
     operation: "index", ...configTraining(), mode: radio("mode") === "single" ? "single" : "multi", workers: number("cpuWorkers"),
-  }, [], output, "stopIndex");
+  }, [], output);
 });
 action("runAll", "trainLog", async output => {
   const settings = trainParams();
-  const result = await runJob({
+  await runJob({
     operation: "train_all", ...settings, ...prepParams(), f0_method: radio("tf0"),
-  }, [], output, "stopAll");
-  if (result) await afterTraining(result.training, output, settings.name);
+  }, [], output);
 });
 
 const CONTENTVEC_NVC_DIRECTORY = "NVC-Pretrained-Rage-ContentVec";
@@ -936,7 +878,8 @@ let beforeRecipe;
 let appliedRecipe;
 function syncNvcPretrained() {
   const path = value("preG") === "custom" ? value("preGPath") : value("preG");
-  const recipe = NVC_PRETRAINS.get(path.split(/[\\/]/).at(-2));
+  const folder = path.split(/[\\/]/).at(-2);
+  const recipe = NVC_PRETRAINS.get(folder);
   const hint = $("#nvcPretrainedHint");
   hint.hidden = !recipe;
   if (recipe) {
@@ -944,6 +887,14 @@ function syncNvcPretrained() {
     hint.textContent = t(recipe.hint);
   }
   if (recipe === activeRecipe) return;
+  const remembered = session.take("recipe");
+  if (recipe && remembered?.folder === folder && remembered.before && remembered.applied) {
+    const fields = Object.keys(NVC_RECIPE);
+    beforeRecipe = Object.fromEntries(fields.filter(id => Object.hasOwn(remembered.before, id)).map(id => [id, remembered.before[id]]));
+    appliedRecipe = remembered.applied;
+    activeRecipe = recipe;
+    return;
+  }
   if (activeRecipe) {
     const current = readRecipeSettings();
     const restore = Object.entries(beforeRecipe).filter(([id]) => current[id] === appliedRecipe[id]);
@@ -956,6 +907,15 @@ function syncNvcPretrained() {
   }
   activeRecipe = recipe;
 }
+listen("#preCatalog, #preG, #preD, #preGPath, #preDPath", "change", () => {
+  for (const id of ["preG", "preD", "preCatalog"]) session.remember("field:" + id, value(id));
+  for (const [id, v] of Object.entries(session.safeFields(readRecipeSettings()))) {
+    session.remember(($("#" + id) ? "field:" : "radio:") + id, v);
+  }
+  const generator = value("preG") === "custom" ? value("preGPath") : value("preG");
+  session.remember("recipe", activeRecipe ? { folder: generator.split(/[\\/]/).at(-2),
+    before: session.safeFields(beforeRecipe), applied: session.safeFields(appliedRecipe) } : null);
+});
 listen("#downloadPretrained", "click", async () => {
   const output = $("#trainLog");
   const pair = selectedSet();
@@ -964,7 +924,7 @@ listen("#downloadPretrained", "click", async () => {
   log(output, "");
   try {
     await runJob({ operation: "pretrained", name: pair.name, sample_rate: parseInt(radio("sr"), 10) * 1000 },
-      [], output, "stopPretrained");
+      [], output);
   } catch (error) {
     explain(error, output);
   } finally {
@@ -973,15 +933,83 @@ listen("#downloadPretrained", "click", async () => {
 });
 listen("#refreshPretrained", "click", () => loadPretrained());
 
-async function afterTraining(result, output, experimentName) {
+async function presentResult(job, output, refresh, keepNote) {
+  const { result, operation, studio } = job;
+  const append = text => { if (!keepNote) output.append("\n" + text); };
+  switch (operation) {
+    case "train": case "train_all": case "resume":
+      return afterTraining(operation === "train_all" ? result.training : result, output, job, refresh, keepNote);
+    case "single":
+      setAudio($("#sOut"), result);
+      $("#sResult").hidden = false;
+      break;
+    case "batch":
+      renderTracks("bResults", result.map(track => ({ name: track.name, tracks: [track] })));
+      break;
+    case "cover": case "separate":
+      renderTracks(operation === "cover" ? "cResults" : "pResults", result);
+      break;
+    case "pitch_profile":
+      append(`${result.path}\n${t("voicedFrames")} · ${result.profile.voiced_frames}`);
+      break;
+    case "pretrained": case "import":
+      if (studio.stop === "stopLib") append(result.paths.join("\n"));
+      if (refresh) await (operation === "pretrained" ? loadPretrained() : updateModels());
+      break;
+    case "preprocess":
+      if (refresh) await refreshRuns();
+      break;
+    case "install_embedder": {
+      append(result.path);
+      const item = options.embedders.find(entry => entry.name === studio.detail);
+      if (item) item.installed = true;
+      if (refresh) renderEmbedders();
+      break;
+    }
+    case "build_feature_pool":
+      append([result.path, ...Object.entries(result.frames).map(([speaker, frames]) => speaker + " · " + frames)].join("\n"));
+      if (refresh) {
+        $("#timbreMode").value = "pool";
+        $("#timbrePool").value = result.path;
+        syncTrainingControls();
+      }
+      break;
+    case "layer_aug": {
+      const r = result.report;
+      append([result.path, t("layersReport").replace("%clips", r.clips).replace("%doubled", r.doubled)
+        .replace("%backed", r.backed).replace("%reverb", r.reverberated).replace("%fx", r.processed).replace("%bleed", r.bled)].join("\n"));
+      if (refresh) {
+        await refreshRuns();
+        $("#layerAug").value = studio.detail;
+        syncTrainingControls();
+      }
+      break;
+    }
+    case "fx_profile":
+      append(`${result.path} · ${t("filesRead").replace("%s", result.files)}`);
+      if (refresh) {
+        $("#laFx").checked = true;
+        $("#laFxProfile").value = studio.detail;
+        syncLayers();
+      }
+      break;
+  }
+}
+
+let exportedTrainingStarted = 0;
+async function afterTraining(result, output, job, refresh, keepNote) {
+  const experimentName = job.studio.name;
   const link = document.createElement("a");
   link.href = "/api/studio/train-log/" + encodeURIComponent(experimentName);
   link.download = experimentName + "-train.log";
   link.dataset.i18n = "downloadTrainingLog";
   link.textContent = t("downloadTrainingLog");
-  output.append(` ${result.model} · ${t("completedEpoch")} ${result.epochs_completed}\n`, link);
-  await Promise.all([updateModels(), refreshRuns(true)]);
-  $("#trainExport").replaceChildren(exportLink(fileName(result.model), "btn"));
+  if (!keepNote) output.append(` ${result.model} · ${t("completedEpoch")} ${result.epochs_completed}\n`, link);
+  if (job.started_at >= exportedTrainingStarted) {
+    exportedTrainingStarted = job.started_at;
+    $("#trainExport").replaceChildren(exportLink(fileName(result.model), "btn"));
+  }
+  if (refresh) await Promise.all([updateModels(), refreshRuns(true)]);
 }
 
 async function refreshRuns(refreshResume = false) {
@@ -996,8 +1024,9 @@ async function refreshRuns(refreshResume = false) {
   if (refreshResume || current !== value("resumeExp") || !$("#resumeInfo").children.length) await showResume();
 }
 let resumeRevision = 0;
-let manualResumeTotal;
-listen("#resumeTotal", "input", event => { manualResumeTotal = event.currentTarget.value; });
+listen("#resumeTotal", "input", event => {
+  if (value("resumeExp")) session.remember("resume:" + value("resumeExp"), event.currentTarget.value);
+});
 async function showResume() {
   const revision = ++resumeRevision;
   const name = value("resumeExp");
@@ -1019,7 +1048,10 @@ async function showResume() {
   total.disabled = atLimit;
   run.disabled = atLimit;
   $("#resumeLimit").hidden = !atLimit;
-  if (!atLimit) total.value = manualResumeTotal ?? Math.min(info.epoch + 10, maximum);
+  if (!atLimit) {
+    const wanted = Number(session.saved("resume:" + name));
+    total.value = Number.isInteger(wanted) && wanted >= Number(total.min) && wanted <= maximum ? wanted : Math.min(info.epoch + 10, maximum);
+  }
   facts($("#resumeInfo"), [
     [t("model"), `RVC ${info.version} · ${info.sample_rate / 1000} kHz · ${embedderLabels[info.embedder] || info.embedder}`],
     [t("completedEpoch"), String(info.epoch)],
@@ -1032,11 +1064,10 @@ listen("#refreshResume", "click", () => refreshRuns(true));
 listen("#resumeExp", "change", showResume);
 action("runResume", "resumeLog", async output => {
   const name = requireValue(value("resumeExp"), "resumeEmpty");
-  const result = await runJob({
+  await runJob({
     operation: "resume", name, epochs: number("resumeTotal"),
     ...trainingPrecision("resumePrecision"), gradient_checkpointing: checkpointing("resumeCheckpointing"),
-  }, [], output, "stopResume");
-  if (result) await afterTraining(result, output, name);
+  }, [], output);
 }, () => !$("#resumeTotal").disabled);
 
 /* Layers and effects */
@@ -1051,7 +1082,7 @@ listen("#laSource", "change", () => {
 action("runLayers", "laLog", async output => {
   const source = requireValue(value("laSource"), "chooseExperiment");
   const target = requireValue(value("laOutput"), "chooseOutputName");
-  const result = await runJob({
+  await runJob({
     operation: "layer_aug", experiment: source, output: target, sample_rate: Number(radio("laSr")),
     seed: number("laSeed"), layers: checked("laLayers"), fx: checked("laFx"),
     fx_profile: checked("laFx") ? value("laFxProfile") || null : null, bleed: value("laBleed") || null,
@@ -1059,26 +1090,12 @@ action("runLayers", "laLog", async output => {
       version: value("trainVersion"), f0_method: radio("laF0"), embedder: value("laEmbedder") || null,
       unvoice_fricatives: checked("unvoiceFricatives"),
     } : null,
-  }, [], output, "stopLayers");
-  if (result) {
-    const r = result.report;
-    log(output, [result.path, t("layersReport").replace("%clips", r.clips).replace("%doubled", r.doubled)
-      .replace("%backed", r.backed).replace("%reverb", r.reverberated).replace("%fx", r.processed).replace("%bleed", r.bled)].join("\n"));
-    await refreshRuns();
-    $("#layerAug").value = target;
-    syncTrainingControls();
-  }
+  }, [], output);
 });
 action("runFx", "fxLog", async output => {
-  const result = await runJob({
+  await runJob({
     operation: "fx_profile", input: requireValue(value("fxIn"), "chooseInput"), output: requireValue(value("fxOut"), "chooseOutput"),
-  }, [], output, "stopFx");
-  if (result) {
-    log(output, `${result.path} · ${t("filesRead").replace("%s", result.files)}`);
-    $("#laFx").checked = true;
-    $("#laFxProfile").value = value("fxOut");
-    syncLayers();
-  }
+  }, [], output);
 });
 
 /* Metrics */
@@ -1162,6 +1179,20 @@ const speakers = [newSpeaker(0), newSpeaker(1)];
 const pageSize = 10;
 let speakerPage = 0;
 function newSpeaker(id) { return { path: "", speaker_name: "", speaker_id: String(id), repeat: "1" }; }
+function saveSpeakerEditor() {
+  session.remember("speakerEditor", { page: speakerPage, rows: speakers.map(row => session.safeFields(row)) });
+}
+function restoreSpeakerEditor() {
+  const editor = session.saved("speakerEditor");
+  if (!Array.isArray(editor?.rows) || !editor.rows.length) return;
+  speakers.splice(0, speakers.length, ...editor.rows.slice(0, 110).map((row, i) => {
+    const fields = newSpeaker(i);
+    for (const key of Object.keys(fields)) if (typeof row?.[key] === "string") fields[key] = row[key];
+    return fields;
+  }));
+  speakerPage = Number.isInteger(editor.page) ? editor.page : 0;
+  renderSpeakers();
+}
 function renderSpeakers() {
   const pages = Math.ceil(speakers.length / pageSize);
   speakerPage = Math.max(0, Math.min(speakerPage, pages - 1));
@@ -1180,20 +1211,21 @@ function renderSpeakers() {
       if (mono) input.classList.add("mono");
       input.setAttribute("aria-label", t(label));
       input.value = row[key];
-      input.addEventListener("input", () => { row[key] = input.value; });
+      input.addEventListener("input", () => { row[key] = input.value; saveSpeakerEditor(); });
       wrap.append(input);
     }
     return wrap;
   }));
 }
-listen("#hPrev", "click", () => { speakerPage--; renderSpeakers(); });
-listen("#hNext", "click", () => { speakerPage++; renderSpeakers(); });
+listen("#hPrev", "click", () => { speakerPage--; renderSpeakers(); saveSpeakerEditor(); });
+listen("#hNext", "click", () => { speakerPage++; renderSpeakers(); saveSpeakerEditor(); });
 listen("#hAdd", "click", () => {
   speakers.push(newSpeaker(speakers.length));
   speakerPage = Math.floor((speakers.length - 1) / pageSize);
   renderSpeakers();
+  saveSpeakerEditor();
 });
-listen("#hDel", "click", () => { speakers.pop(); renderSpeakers(); });
+listen("#hDel", "click", () => { speakers.pop(); renderSpeakers(); saveSpeakerEditor(); });
 action("hSubmit", "hStatus", async output => {
   const rows = speakers.filter(row => row.path.trim() || row.speaker_name.trim());
   requireValue(rows.length, "fillSpeaker");
@@ -1250,9 +1282,11 @@ function renderEmbedders() {
 async function start() {
   bindRanges();
   bindDrops();
+  const restoreFiles = savedFiles();
   enhanceAudioPlayers();
   localize();
   options = await api("/api/studio/options");
+  session.openDraft(options.experiments);
   $("#deviceName").textContent = options.device;
   $("#cpuWorkers").value = options.workers;
   syncRange($("#cpuWorkers"));
@@ -1274,13 +1308,25 @@ async function start() {
     live = realtime(options);
   }
   renderEmbedders();
+  session.restoreFields();
+  restoreSpeakerEditor();
+  const dataset = session.saved("dataset");
+  if (dataset?.single && dataset?.multi_folder && [dataset.single, dataset.multi_folder].includes(value("trainset"))) {
+    datasetPaths = dataset;
+    datasetPath = value("trainset");
+  }
+  $$(".range-row input[type=number]").forEach(syncRange);
+  syncTrainingControls();
+  syncProfile();
   syncLibrary();
   syncMode();
   syncCover();
   syncLayers();
   syncSeparationModel();
-  showPanel(new URLSearchParams(location.search).get("panel"));
-  await Promise.all([updateModels(), refreshRuns(), watchForeignJob()]);
+  void restoreFiles(options.experiments);
+  const panelReady = showPanel(addressPanel() || session.saved("panel") || "infer");
+  await Promise.all([updateModels(), panelReady ?? refreshRuns()]);
+  await jobs.restore(options.experiments);
 }
 start().catch(error => {
   $("#startup").hidden = false;

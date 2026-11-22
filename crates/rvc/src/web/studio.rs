@@ -1,4 +1,5 @@
 mod files;
+pub(super) mod jobs;
 mod library;
 mod shared_link;
 
@@ -55,11 +56,38 @@ pub(super) fn routes() -> Router<Shared> {
             }),
         )
         .route(
+            "/studio/files.js",
+            get(|| async {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_str!("../../web/files.js"),
+                )
+            }),
+        )
+        .route(
+            "/studio/jobs.js",
+            get(|| async {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_str!("../../web/jobs.js"),
+                )
+            }),
+        )
+        .route(
             "/studio/ui.js",
             get(|| async {
                 asset(
                     "text/javascript; charset=utf-8",
                     include_str!("../../web/ui.js"),
+                )
+            }),
+        )
+        .route(
+            "/studio/session.js",
+            get(|| async {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_str!("../../web/session.js"),
                 )
             }),
         )
@@ -109,7 +137,8 @@ pub(super) fn routes() -> Router<Shared> {
         .route("/api/studio/metrics", get(metrics))
         .route("/api/studio/train-log/{name}", get(files::training_log))
         .route("/api/studio/media/{id}", get(files::media))
-        .route("/api/studio/job/{id}", get(job).delete(cancel))
+        .route("/api/studio/jobs", get(jobs::list))
+        .route("/api/studio/job/{id}", get(jobs::status).delete(cancel))
         .route(
             "/api/studio/job",
             post(start).layer(DefaultBodyLimit::max(files::UPLOAD_LIMIT)),
@@ -475,7 +504,7 @@ impl Extra {
                 let output = tempfile::TempDir::new_in(state.studio.workspace.path())?;
                 let file = output.path().join("converted.wav");
                 audio::write_audio(&file, &result.samples, result.rate, Format::Wav, false)?;
-                let result = state.studio.publish([file], Some(output))?;
+                let result = state.studio.publish("single", [file], Some(output))?;
                 Ok(json!(result[0]))
             }
             Self::PitchProfile {
@@ -715,6 +744,7 @@ impl CoverJob {
         };
         let rendered = cover::render(paths, &request, report)?;
         let media = state.studio.publish(
+            "cover",
             rendered
                 .iter()
                 .flat_map(|item| item.files.iter().map(|(_, path)| path.clone())),
@@ -893,7 +923,7 @@ fn native(
         let paths = stems
             .iter()
             .flat_map(|file| [file.primary.clone(), file.secondary.clone()]);
-        let media = state.studio.publish(paths, None)?;
+        let media = state.studio.publish("separate", paths, None)?;
         let results: Vec<_> = stems
             .iter()
             .zip(media.as_chunks::<2>().0)
@@ -905,7 +935,7 @@ fn native(
         Ok(json!(results))
     } else if is_batch {
         let paths: Vec<PathBuf> = serde_json::from_value(result)?;
-        Ok(json!(state.studio.publish(paths, None)?))
+        Ok(json!(state.studio.publish("batch", paths, None)?))
     } else {
         Ok(result)
     }
@@ -917,17 +947,18 @@ async fn start(State(state): State<Shared>, form: Multipart) -> WebResult<Respon
         .as_str()
         .context("job operation is required")?
         .to_owned();
+    let meta = jobs::Metadata::from_settings(&operation, &settings)?;
     let id = match operation.as_str() {
         "single" | "pitch_profile" | "import" | "pretrained" | "install_embedder"
         | "build_feature_pool" | "resume" | "cover" | "layer_aug" | "fx_profile" => {
             let action: Extra = serde_json::from_value(settings).map_err(anyhow::Error::from)?;
-            launch_job(state, &operation, move |state, cancelled| {
+            launch_job(state, &operation, Some(meta), move |state, cancelled| {
                 action.run(state, uploads, cancelled)
             })?
         }
         _ => {
             let action: Action = serde_json::from_value(settings).map_err(anyhow::Error::from)?;
-            launch_job(state, &operation, move |state, cancelled| {
+            launch_job(state, &operation, Some(meta), move |state, cancelled| {
                 native(action, state, uploads, cancelled)
             })?
         }
@@ -936,18 +967,6 @@ async fn start(State(state): State<Shared>, form: Multipart) -> WebResult<Respon
         Some(id) => (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response(),
         None => (StatusCode::CONFLICT, Json(json!({ "error": "Stop the active audio stream or wait for the current task to finish." }))).into_response(),
     })
-}
-
-async fn job(State(state): State<Shared>, RoutePath(id): RoutePath<Uuid>) -> WebResult<Response> {
-    let job = lock(&state.job)?;
-    if job.id == id {
-        return Ok(Json(json!(*job)).into_response());
-    }
-    let recent = lock(&state.recent_jobs)?;
-    Ok(recent.iter().find(|job| job.id == id).map_or_else(
-        || StatusCode::NOT_FOUND.into_response(),
-        |job| Json(json!(job)).into_response(),
-    ))
 }
 
 async fn cancel(

@@ -79,9 +79,19 @@ struct Job {
     status: JobState,
     message: String,
     log: VecDeque<String>,
-    result: Option<Value>,
+    #[serde(serialize_with = "serialize_job_result")]
+    result: Option<Arc<Value>>,
+    #[serde(skip)]
+    studio: Option<studio::jobs::Journal>,
     #[serde(skip)]
     cancelled: Arc<AtomicBool>,
+}
+
+fn serialize_job_result<S: serde::Serializer>(
+    result: &Option<Arc<Value>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    result.as_deref().serialize(serializer)
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -1221,7 +1231,7 @@ async fn start_job(
     Json(action): Json<Action>,
 ) -> WebResult<StatusCode> {
     let operation = action.name();
-    let id = launch_job(state, operation, move |state, cancelled| {
+    let id = launch_job(state, operation, None, move |state, cancelled| {
         action.run(state, cancelled, |message| {
             job_progress(state, cancelled, message)
         })
@@ -1236,13 +1246,14 @@ async fn start_job(
 fn launch_job(
     state: Shared,
     operation: &str,
+    studio: Option<studio::jobs::Metadata>,
     run: impl FnOnce(&StateData, &AtomicBool) -> Result<Value> + Send + 'static,
 ) -> Result<Option<uuid::Uuid>> {
     let Ok(permit) = compute(&state) else {
         return Ok(None);
     };
     let cancelled = Arc::new(AtomicBool::new(false));
-    let Some(id) = reserve_job(&state, operation, &cancelled)? else {
+    let Some(id) = reserve_job_for(&state, operation, &cancelled, studio)? else {
         return Ok(None);
     };
     tokio::spawn(async move {
@@ -1264,10 +1275,23 @@ fn reserve_job(
     operation: &str,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Option<uuid::Uuid>> {
+    reserve_job_for(state, operation, cancelled, None)
+}
+
+fn reserve_job_for(
+    state: &StateData,
+    operation: &str,
+    cancelled: &Arc<AtomicBool>,
+    studio: Option<studio::jobs::Metadata>,
+) -> Result<Option<uuid::Uuid>> {
     let mut job = lock(&state.job)?;
     if job.status == JobState::Running {
         return Ok(None);
     }
+    let mut recent = lock(&state.recent_jobs)?;
+    let journal = studio
+        .map(|meta| studio::jobs::Journal::new(meta, &state.studio))
+        .transpose()?;
     let id = uuid::Uuid::new_v4();
     let previous = std::mem::replace(
         &mut *job,
@@ -1275,27 +1299,34 @@ fn reserve_job(
             id,
             operation: operation.to_owned(),
             status: JobState::Running,
+            studio: journal,
             cancelled: Arc::clone(cancelled),
             ..Default::default()
         },
     );
     if previous.status != JobState::Idle {
-        let mut recent = lock(&state.recent_jobs)?;
-        if recent.len() == 8 {
-            recent.pop_front();
-        }
         recent.push_back(previous);
+        studio::jobs::retain_recent(&mut recent, &job);
     }
     Ok(Some(id))
 }
 
 fn job_progress(state: &StateData, cancelled: &AtomicBool, message: &str) -> ControlFlow<()> {
-    if cancelled.load(Ordering::Relaxed) {
+    let mut job = state.job.lock().unwrap_or_else(|error| error.into_inner());
+    if cancelled.load(Ordering::Relaxed)
+        || job.status != JobState::Running
+        || !std::ptr::eq(job.cancelled.as_ref(), cancelled)
+    {
         return ControlFlow::Break(());
     }
-    if let Ok(mut job) = state.job.lock()
-        && job.message != message
+    if let Some(journal) = &mut job.studio
+        && let Err(error) = journal.append(message)
     {
+        journal.error = Some(format!("{error:#}"));
+        cancelled.store(true, Ordering::Relaxed);
+        return ControlFlow::Break(());
+    }
+    if job.message != message {
         job.message = message.to_owned();
         if job.log.len() == 40 {
             job.log.pop_front();
@@ -1306,10 +1337,15 @@ fn job_progress(state: &StateData, cancelled: &AtomicBool, message: &str) -> Con
 }
 
 fn finish_job(job: &mut Job, cancelled: &AtomicBool, result: Result<Value>) {
+    if let Some(error) = job.studio.as_mut().and_then(|journal| journal.error.take()) {
+        job.status = JobState::Failed;
+        job.message = error;
+        return;
+    }
     match result {
         Ok(result) => {
             job.status = JobState::Complete;
-            job.result = Some(result);
+            job.result = Some(Arc::new(result));
         }
         Err(error) => {
             job.status = if cancelled.load(Ordering::Relaxed) {

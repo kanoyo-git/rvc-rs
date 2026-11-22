@@ -1,3 +1,4 @@
+import { liveValues } from "/studio/session.js";
 import { $, api, send, fill, t, log, toast } from "/studio/ui.js";
 
 const editable = new Set(["pitch", "formant", "f0_method", "index_rate", "rms_mix_rate",
@@ -68,7 +69,8 @@ export function realtime(options) {
   }
 
   async function setup() {
-    const saved = await api("/api/realtime/profile");
+    const [saved, engine] = await Promise.all([api("/api/realtime/profile"), api("/api/realtime")]);
+    const draft = ["starting", "running"].includes(engine.status) ? {} : liveValues(form);
     for (const field of ["block_ms", "crossfade_ms", "extra_ms", "threshold_db", "index"]) {
       if (saved[field] != null) fields[field].value = saved[field];
     }
@@ -94,10 +96,17 @@ export function realtime(options) {
       if (options.models.includes(name)) fields.model.value = name;
       else fields.model_path.value = saved.model;
     }
-    await loadSpeakers(saved.speaker_id);
+    if (Object.hasOwn(draft, "model") && [...fields.model.options].some(item => item.value === draft.model)) fields.model.value = draft.model;
+    await loadSpeakers(draft.speaker_id ?? saved.speaker_id);
     const available = await api("/api/devices");
-    const host = available.available_hosts.find(name => name.toLowerCase() === saved.host?.toLowerCase());
-    await loadDevices(host, saved);
+    const host = available.available_hosts.find(name => name.toLowerCase() === (draft.host ?? saved.host)?.toLowerCase());
+    await loadDevices(host, { ...saved, ...draft });
+    for (const [name, value] of Object.entries(draft)) {
+      const field = fields[name];
+      if (field.type === "checkbox") field.checked = value === true;
+      else if (field.tagName !== "SELECT" || [...field.options].some(option => option.value === value && !option.disabled)) field.value = value;
+      if (field.closest(".range-row")) field.dispatchEvent(new Event("input"));
+    }
   }
 
   function liveSettings() {

@@ -1,3 +1,4 @@
+import { restoredSelection } from "/studio/session.js";
 import { messages } from "/studio/i18n.js";
 
 export const $ = (selector, root = document) => root.querySelector(selector);
@@ -21,6 +22,7 @@ export function fill(select, items, keep = select.value) {
     return option;
   });
   select.replaceChildren(...options);
+  keep = restoredSelection(select, options, keep);
   if (options.some(option => option.value === keep && !option.disabled)) select.value = keep;
 }
 
@@ -35,11 +37,11 @@ export function facts(node, rows) {
 }
 
 function responseError(status, text) {
-  try {
-    const detail = JSON.parse(text).error;
-    if (detail) return new Error(detail);
-  } catch {}
-  return new Error(`HTTP ${status}${text ? " · " + text.slice(0, 180) : ""}`);
+  let message;
+  try { message = JSON.parse(text).error; } catch { /* Plain-text HTTP error. */ }
+  const error = new Error(message || `HTTP ${status}${text ? " · " + text.slice(0, 180) : ""}`);
+  error.status = status;
+  return error;
 }
 
 export async function api(url, init) {

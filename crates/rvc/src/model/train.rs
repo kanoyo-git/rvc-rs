@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
@@ -651,6 +651,7 @@ fn run_on_devices(
     }
     let mut cached = Vec::new();
     let mut profile = Profile::new(device);
+    let mut epoch_times = EpochTimes::default();
     for epoch in first..=request.epochs {
         let epoch_started = Instant::now();
         let batches = if cached.is_empty() {
@@ -964,15 +965,8 @@ fn run_on_devices(
                 tch::Cuda::synchronize(*index as i64);
             }
         }
-        log_progress(
-            &mut log,
-            &mut progress,
-            &format!(
-                "Epoch {epoch}/{} completed in {:.2} s",
-                request.epochs,
-                epoch_started.elapsed().as_secs_f64()
-            ),
-        )?;
+        let summary = epoch_times.finish(epoch, request.epochs, epoch_started.elapsed());
+        log_progress(&mut log, &mut progress, &summary)?;
     }
     let model = paths.weights.join(format!("{name}.pth"));
     edit::compact(
@@ -1189,6 +1183,39 @@ fn log_progress(
 ) -> Result<()> {
     writeln!(log, "{message}").context("writing train.log")?;
     notify(progress, message)
+}
+
+#[derive(Default)]
+struct EpochTimes {
+    elapsed: Duration,
+    completed: u32,
+}
+
+impl EpochTimes {
+    fn finish(&mut self, epoch: usize, target: usize, duration: Duration) -> String {
+        self.elapsed += duration;
+        self.completed += 1;
+        // Mean of this run's completed epochs times the number still to train.
+        // Round up once, so a positive estimate never appears as zero seconds.
+        let nanos = self.elapsed.as_nanos() * (target - epoch) as u128;
+        let seconds = nanos.div_ceil(u128::from(self.completed) * 1_000_000_000);
+        let units = [
+            (seconds / 86_400, "d"),
+            (seconds / 3_600 % 24, "h"),
+            (seconds / 60 % 60, "min"),
+            (seconds % 60, "s"),
+        ];
+        let eta = units
+            .into_iter()
+            .filter(|&(n, unit)| n > 0 || (seconds == 0 && unit == "s"))
+            .map(|(n, unit)| format!("{n} {unit}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "Epoch {epoch}/{target} completed in {:.2} s · ETA {eta}",
+            duration.as_secs_f64()
+        )
+    }
 }
 
 fn epoch(checkpoint: &Checkpoint) -> Result<usize> {
@@ -1623,6 +1650,32 @@ fn finish_pending_pair<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eta_uses_all_epochs_measured_since_resume() {
+        let mut run = EpochTimes::default();
+        assert_eq!(
+            run.finish(97, 100, Duration::from_secs(60)),
+            "Epoch 97/100 completed in 60.00 s · ETA 3 min"
+        );
+        assert_eq!(
+            run.finish(98, 100, Duration::from_secs(10)),
+            "Epoch 98/100 completed in 10.00 s · ETA 1 min 10 s"
+        );
+        assert_eq!(
+            run.finish(99, 100, Duration::from_millis(500)),
+            "Epoch 99/100 completed in 0.50 s · ETA 24 s"
+        );
+        assert_eq!(
+            run.finish(100, 100, Duration::from_secs(1)),
+            "Epoch 100/100 completed in 1.00 s · ETA 0 s"
+        );
+        let mut resumed = EpochTimes::default();
+        assert_eq!(
+            resumed.finish(101, 102, Duration::from_secs(90_061)),
+            "Epoch 101/102 completed in 90061.00 s · ETA 1 d 1 h 1 min 1 s"
+        );
+    }
 
     #[test]
     fn resume_restores_an_active_phonetic_encoder_from_the_training_log() -> Result<()> {

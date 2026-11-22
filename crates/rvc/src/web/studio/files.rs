@@ -53,7 +53,12 @@ pub(super) async fn training_log(
 
 pub(in crate::web) struct Files {
     pub(super) workspace: TempDir,
-    results: Mutex<VecDeque<HashMap<Uuid, Artifact>>>,
+    results: Mutex<VecDeque<ResultSet>>,
+}
+
+struct ResultSet {
+    panel: &'static str,
+    artifacts: HashMap<Uuid, Artifact>,
 }
 
 impl Files {
@@ -66,6 +71,7 @@ impl Files {
 
     pub(super) fn publish(
         &self,
+        panel: &'static str,
         paths: impl IntoIterator<Item = PathBuf>,
         staging: Option<TempDir>,
     ) -> Result<Vec<Media>> {
@@ -93,10 +99,13 @@ impl Files {
             });
         }
         let mut results = lock(&self.results)?;
-        results.push_back(entries);
-        if results.len() > MAX_RESULT_SETS {
-            results.pop_front();
-        }
+        results.push_back(ResultSet {
+            panel,
+            artifacts: entries,
+        });
+        super::jobs::retain_recent_panels(&mut results, MAX_RESULT_SETS, None, |set| {
+            Some(set.panel)
+        });
         Ok(media)
     }
 }
@@ -130,7 +139,7 @@ pub(super) async fn media(
     let artifact = lock(&state.studio.results)?
         .iter()
         .rev()
-        .find_map(|entries| entries.get(&id))
+        .find_map(|set| set.artifacts.get(&id))
         .cloned();
     let Some(artifact) = artifact else {
         return Ok(StatusCode::NOT_FOUND.into_response());
