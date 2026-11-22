@@ -111,32 +111,32 @@
               </div>
               <small class="hint pitch-availability" data-i18n="pitchWeightsMissing">Install weights on the server to enable other pitch methods</small>
                   </div>
-                  <label class="field"><span class="label" data-i18n="indexRate"></span>
-                <span class="range-row"><input id="iIndexRate" type="range" min="0" max="1" step="0.01" value="0.75" /><output>0.75</output></span>
+                  <div class="field"><label class="label" id="iIndexRate-label" for="iIndexRate" data-i18n="indexRate"></label>
+                <span class="range-row"><input type="range" aria-labelledby="iIndexRate-label" /><input id="iIndexRate" type="number" min="0" max="1" step="0.01" value="0.75" required /></span>
                 <small class="hint" data-i18n="indexRateHint"></small>
-              </label>
-                  <label class="field"><span class="label" data-i18n="protect"></span>
-                <span class="range-row"><input id="iProtect" type="range" min="0" max="0.5" step="0.01" value="0.33" /><output>0.33</output></span>
+              </div>
+                  <div class="field"><label class="label" id="iProtect-label" for="iProtect" data-i18n="protect"></label>
+                <span class="range-row"><input type="range" aria-labelledby="iProtect-label" /><input id="iProtect" type="number" min="0" max="0.5" step="0.01" value="0.33" required /></span>
                 <small class="hint" data-i18n="protectHint"></small>
-              </label>
-                  <label class="field"><span class="label" data-i18n="rms"></span>
-                <span class="range-row"><input id="iRms" type="range" min="0" max="1" step="0.01" value="0.25" /><output>0.25</output></span>
+              </div>
+                  <div class="field"><label class="label" id="iRms-label" for="iRms" data-i18n="rms"></label>
+                <span class="range-row"><input type="range" aria-labelledby="iRms-label" /><input id="iRms" type="number" min="0" max="1" step="0.01" value="0.25" required /></span>
                 <small class="hint" data-i18n="rmsHint"></small>
-              </label>
+              </div>
                   <details class="more">
                     <summary data-i18n="fineTuning"></summary>
                     <div class="stack">
-                      <label class="field"><span class="label" data-i18n="formant"></span>
-                <span class="range-row"><input id="iFormant" type="range" min="-12" max="12" step="0.1" value="0" /><output>0</output></span>
+                      <div class="field"><label class="label" id="iFormant-label" for="iFormant" data-i18n="formant"></label>
+                <span class="range-row"><input type="range" aria-labelledby="iFormant-label" /><input id="iFormant" type="number" min="-12" max="12" step="0.1" value="0" required /></span>
                 <small class="hint" data-i18n="formantHint"></small>
-              </label>
+              </div>
                       <label class="field"><span class="label" data-i18n="aperiodic"></span>
                 <input id="iAperiodic" type="number" min="0" max="1" step="0.05" data-i18n-attr="placeholder:automatic" />
                 <small class="hint" data-i18n="aperiodicHint"></small>
               </label>
-                      <label class="field"><span class="label" data-i18n="voiceGate"></span>
-                <span class="range-row"><input id="iGate" type="range" min="0" max="60" step="1" value="0" /><output>0</output></span>
-              </label>
+                      <div class="field"><label class="label" id="iGate-label" for="iGate" data-i18n="voiceGate"></label>
+                <span class="range-row"><input type="range" aria-labelledby="iGate-label" /><input id="iGate" type="number" min="0" max="60" step="1" value="0" required /></span>
+              </div>
                       <small class="hint" id="iGateHint" data-i18n="voiceGateHint"></small>
                       <label class="switch"><input id="iLevelGuard" type="checkbox" role="switch" checked /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="levelGuard"></span><small class="hint" data-i18n="levelGuardHint"></small></span></label>
                       <label class="field"><span class="label" data-i18n="precision"></span><select id="iPrecision"><option value="auto" data-i18n="automatic"></option><option value="fp32">FP32</option><option value="fp16">FP16 (CUDA)</option></select></label>
@@ -243,10 +243,10 @@
                 <div class="stack">
                   <label class="field"><span class="label" data-i18n="pitch"></span><input id="cPitch" type="number" min="-24" max="24" step="1" value="0" /></label>
                   <label class="field"><span class="label" data-i18n="f0Method"></span><select id="cF0"><option value="rmvpe">RMVPE</option><option value="rmcpe">RMCPE</option><option value="fcpe">FCPE</option><option value="nmvpe">NMVPE</option><option value="pm">PM</option></select></label>
-                  <label class="field"><span class="label" data-i18n="indexRate"></span>
-                <span class="range-row"><input id="cIndexRate" type="range" min="0" max="1" step="0.01" value="0.5" /><output>0.5</output></span>
+                  <div class="field"><label class="label" id="cIndexRate-label" for="cIndexRate" data-i18n="indexRate"></label>
+                <span class="range-row"><input type="range" aria-labelledby="cIndexRate-label" /><input id="cIndexRate" type="number" min="0" max="1" step="0.01" value="0.5" required /></span>
                 <small class="hint" data-i18n="indexRateHint"></small>
-              </label>
+              </div>
                   <div class="field"><span class="label" data-i18n="backing"></span>
                     <div class="seg" role="radiogroup">
                       <label><input type="radio" name="cBacking" value="convert" checked /><span data-i18n="backingConvert"></span></label>
@@ -256,10 +256,10 @@
                     <small class="hint" data-i18n="backingHint"></small>
                   </div>
                   <label class="switch"><input id="cReverb" type="checkbox" role="switch" checked /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="rebuildReverb"></span><small class="hint" data-i18n="rebuildReverbHint"></small></span></label>
-                  <label class="field"><span class="label" data-i18n="vocalGain"></span>
-                <span class="range-row"><input id="cVocalGain" type="range" min="-12" max="12" step="0.5" value="0" /><output>0</output></span>
+                  <div class="field"><label class="label" id="cVocalGain-label" for="cVocalGain" data-i18n="vocalGain"></label>
+                <span class="range-row"><input type="range" aria-labelledby="cVocalGain-label" /><input id="cVocalGain" type="number" min="-12" max="12" step="0.5" value="0" required /></span>
                 <small class="hint" data-i18n="vocalGainHint"></small>
-              </label>
+              </div>
                   <details class="more">
                     <summary data-i18n="fineTuning"></summary>
                     <div class="stack">
@@ -267,9 +267,9 @@
                 <input id="cAperiodic" type="number" min="0" max="1" step="0.05" data-i18n-attr="placeholder:automatic" />
                 <small class="hint" data-i18n="aperiodicHint"></small>
               </label>
-                      <label class="field"><span class="label" data-i18n="voiceGate"></span>
-                <span class="range-row"><input id="cGate" type="range" min="0" max="60" step="1" value="0" /><output>0</output></span>
-              </label>
+                      <div class="field"><label class="label" id="cGate-label" for="cGate" data-i18n="voiceGate"></label>
+                <span class="range-row"><input type="range" aria-labelledby="cGate-label" /><input id="cGate" type="number" min="0" max="60" step="1" value="0" required /></span>
+              </div>
                       <small class="hint" id="cGateHint" data-i18n="voiceGateHint"></small>
                       <label class="field"><span class="label" data-i18n="device"></span><select id="cDevice"><option value="auto" data-i18n="automatic"></option><option value="cpu">CPU</option></select><small class="hint" data-i18n="coverDeviceHint"></small></label>
                     </div>
@@ -344,8 +344,8 @@
                     <label class="field"><span class="label" data-i18n="f0Method"></span><select name="f0_method"><option value="pm">pm</option><option value="rmvpe">rmvpe</option><option value="nmvpe">nmvpe</option><option value="fcpe">fcpe</option><option value="rmcpe">RMCPE</option></select></label>
                     <label class="field"><span class="label" data-i18n="silenceDb"></span><input name="threshold_db" type="number" min="-60" max="0" value="-60" required /></label>
                   </div>
-                  <label class="field"><span class="label" data-i18n="indexRate"></span><span class="range-row"><input name="index_rate" type="range" min="0" max="1" step="0.01" value="0.75" /><output>0.75</output></span></label>
-                  <label class="field"><span class="label" data-i18n="rms"></span><span class="range-row"><input name="rms_mix_rate" type="range" min="0" max="1" step="0.01" value="1" /><output>1</output></span></label>
+                  <div class="field"><label class="label" id="live-index-rate-label" for="live-index-rate" data-i18n="indexRate"></label><span class="range-row"><input type="range" aria-labelledby="live-index-rate-label" /><input id="live-index-rate" name="index_rate" type="number" min="0" max="1" step="0.01" value="0.75" required /></span></div>
+                  <div class="field"><label class="label" id="live-rms-mix-rate-label" for="live-rms-mix-rate" data-i18n="rms"></label><span class="range-row"><input type="range" aria-labelledby="live-rms-mix-rate-label" /><input id="live-rms-mix-rate" name="rms_mix_rate" type="number" min="0" max="1" step="0.01" value="1" required /></span></div>
                   <div class="row">
                     <label class="switch"><input name="monitor" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text" data-i18n="monitor"></span></label>
                     <label class="switch"><input name="input_noise_reduction" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text" data-i18n="inputNoise"></span></label>
@@ -451,9 +451,9 @@
                     <label><input type="radio" name="ifF0" value="0" /><span data-i18n="no"></span></label>
                   </div>
                 </div>
-                <label class="field"><span class="label" data-i18n="cpuWorkers"></span>
-                <span class="range-row"><input id="cpuWorkers" type="range" min="1" max="64" step="1" value="4" /><output>4</output></span>
-              </label>
+                <div class="field"><label class="label" id="cpuWorkers-label" for="cpuWorkers" data-i18n="cpuWorkers"></label>
+                <span class="range-row"><input type="range" aria-labelledby="cpuWorkers-label" /><input id="cpuWorkers" type="number" min="1" max="64" step="1" value="4" required /></span>
+              </div>
               </div>
             </section>
 
@@ -483,10 +483,10 @@
                   <label class="field"><span class="label" data-i18n="segmentSeconds"></span><input id="segmentSeconds" type="number" min="0.4" max="20" step="0.1" value="3" /></label>
                 </div>
                 <label class="switch"><input id="noiseReduce" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="noiseReduce"></span><small class="hint" data-i18n="noiseReduceHelp"></small></span></label>
-                <div id="reduceStrengthWrap" hidden><label class="field"><span class="label" data-i18n="reduceStrength"></span>
-                <span class="range-row"><input id="reduceStrength" type="range" min="0" max="1" step="0.05" value="0.75" /><output>0.75</output></span>
+                <div id="reduceStrengthWrap" hidden><div class="field"><label class="label" id="reduceStrength-label" for="reduceStrength" data-i18n="reduceStrength"></label>
+                <span class="range-row"><input type="range" aria-labelledby="reduceStrength-label" /><input id="reduceStrength" type="number" min="0" max="1" step="0.05" value="0.75" required /></span>
                 <small class="hint" data-i18n="reduceStrengthHelp"></small>
-              </label></div>
+              </div></div>
                 <div class="actions">
               <button type="button" id="runPre" class="btn primary" data-i18n="processData"></button>
               <button type="button" id="stopPre" class="btn danger" hidden data-i18n="stop"></button>
@@ -529,15 +529,15 @@
               <header class="card-head"><h2><span class="step-num mono">4</span><span data-i18n="step3"></span></h2></header>
               <div class="stack">
                 <div class="grid three">
-                  <label class="field"><span class="label" data-i18n="totalEpoch"></span>
-                <span class="range-row"><input id="totalEpoch" type="range" min="1" max="1200" step="1" value="20" /><output>20</output></span>
-              </label>
-                  <label class="field"><span class="label" data-i18n="saveEvery"></span>
-                <span class="range-row"><input id="saveEvery" type="range" min="1" max="1200" step="1" value="5" /><output>5</output></span>
-              </label>
-                  <label class="field"><span class="label" data-i18n="batchSize"></span>
-                <span class="range-row"><input id="batchSize" type="range" min="1" max="40" step="1" value="1" /><output>1</output></span>
-              </label>
+                  <div class="field"><label class="label" id="totalEpoch-label" for="totalEpoch" data-i18n="totalEpoch"></label>
+                <span class="range-row"><input type="range" aria-labelledby="totalEpoch-label" /><input id="totalEpoch" type="number" min="1" max="10000" step="1" value="20" required /></span>
+              </div>
+                  <div class="field"><label class="label" id="saveEvery-label" for="saveEvery" data-i18n="saveEvery"></label>
+                <span class="range-row"><input type="range" aria-labelledby="saveEvery-label" /><input id="saveEvery" type="number" min="1" max="10000" step="1" value="5" required /></span>
+              </div>
+                  <div class="field"><label class="label" id="batchSize-label" for="batchSize" data-i18n="batchSize"></label>
+                <span class="range-row"><input type="range" aria-labelledby="batchSize-label" /><input id="batchSize" type="number" min="1" max="40" step="1" value="1" required /></span>
+              </div>
                 </div>
                 <div class="grid three">
                   <label class="field"><span class="label" data-i18n="trainPrecision"></span><select id="trainPrecision"><option value="" data-i18n="automatic"></option><option value="fp32">FP32</option><option value="fp16">FP16 (CUDA)</option><option value="bf16">BF16 (CUDA)</option></select></label>
@@ -574,10 +574,10 @@
                       <label class="field"><span class="label" data-i18n="unvoicedF0"></span><select id="unvoicedF0"><option value="" data-i18n="automatic"></option><option value="zero" data-i18n="unvoicedZero"></option><option value="interpolate" data-i18n="unvoicedInterpolate"></option></select></label>
                       <label class="field"><span class="label" data-i18n="layerAug"></span><select id="layerAug"></select></label>
                     </div>
-                    <div id="layerAugProbWrap" hidden><label class="field"><span class="label" data-i18n="layerAugProb"></span>
-                <span class="range-row"><input id="layerAugProb" type="range" min="0.05" max="1" step="0.05" value="0.5" /><output>0.5</output></span>
+                    <div id="layerAugProbWrap" hidden><div class="field"><label class="label" id="layerAugProb-label" for="layerAugProb" data-i18n="layerAugProb"></label>
+                <span class="range-row"><input type="range" aria-labelledby="layerAugProb-label" /><input id="layerAugProb" type="number" min="0.05" max="1" step="0.05" value="0.5" required /></span>
                 <small class="hint" data-i18n="layerAugHint"></small>
-              </label></div>
+              </div></div>
                     <div class="toggles">
                       <label class="switch"><input id="hfBands" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="hfBands"></span><small class="hint" data-i18n="hfBandsHint"></small></span></label>
                       <label class="switch"><input id="emaWeights" type="checkbox" role="switch" /><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span data-i18n="emaWeights"></span><small class="hint" data-i18n="emaHint"></small></span></label>
@@ -589,7 +589,7 @@
                     <div class="grid three">
                       <label class="field"><span class="label" data-i18n="stftLoss"></span><input id="stftLoss" type="number" min="0" step="0.5" value="0" /></label>
                       <label class="field"><span class="label" data-i18n="phoneticLoss"></span><input id="phoneticLoss" type="number" min="0" step="5" value="0" /></label>
-                      <label class="field"><span class="label" data-i18n="phoneticEncoder"></span><select id="phoneticEncoder"></select></label>
+                      <label class="field"><span class="label" data-i18n="phoneticEncoder"></span><select id="phoneticEncoder" hidden disabled></select><small class="hint" id="phoneticEncoderOff" data-i18n="phoneticEncoderOff"></small></label>
                     </div>
                     <label class="field"><span class="label" data-i18n="trainOnly"></span><input id="trainOnly" type="text" spellcheck="false" placeholder="enc_p" /></label>
                     <small class="hint" data-i18n="trainOnlyHint"></small>
@@ -640,13 +640,14 @@
                 <p class="hint" data-i18n="resumeLead"></p>
                 <div class="grid four">
                   <label class="field"><span class="label" data-i18n="resumeExp"></span><select id="resumeExp"></select></label>
-                  <label class="field"><span class="label" data-i18n="resumeTotal"></span><input id="resumeTotal" type="number" min="2" step="1" value="600" /></label>
+                  <label class="field"><span class="label" data-i18n="resumeTotal"></span><input id="resumeTotal" type="number" min="2" max="10000" step="1" required disabled /></label>
                   <label class="field"><span class="label" data-i18n="trainPrecision"></span><select id="resumePrecision"><option value="" data-i18n="automatic"></option><option value="fp32">FP32</option><option value="fp16">FP16 (CUDA)</option><option value="bf16">BF16 (CUDA)</option></select></label>
                   <label class="field"><span class="label" data-i18n="gradientCheckpointing"></span><select id="resumeCheckpointing"><option value="" data-i18n="automatic"></option><option value="true" data-i18n="yes"></option><option value="false" data-i18n="no"></option></select></label>
                 </div>
                 <dl class="facts mono" id="resumeInfo"></dl>
+                <p class="hint" id="resumeLimit" data-i18n="resumeLimit" hidden></p>
                 <div class="actions">
-              <button type="button" id="runResume" class="btn primary" data-i18n="resumeTrain"></button>
+              <button type="button" id="runResume" class="btn primary" data-i18n="resumeTrain" disabled></button>
               <button type="button" id="stopResume" class="btn danger" hidden data-i18n="stop"></button>
             </div>
                 <pre class="log" id="resumeLog" aria-live="polite"></pre>
@@ -812,9 +813,9 @@
                   <label class="field"><span class="label" data-i18n="modelA"></span><input id="mA" list="modelNames" type="text" spellcheck="false" /></label>
                   <label class="field"><span class="label" data-i18n="modelB"></span><input id="mB" list="modelNames" type="text" spellcheck="false" /></label>
                 </div>
-                <label class="field"><span class="label" data-i18n="weightA"></span>
-                <span class="range-row"><input id="mAlpha" type="range" min="0" max="1" step="0.01" value="0.5" /><output>0.5</output></span>
-              </label>
+                <div class="field"><label class="label" id="mAlpha-label" for="mAlpha" data-i18n="weightA"></label>
+                <span class="range-row"><input type="range" aria-labelledby="mAlpha-label" /><input id="mAlpha" type="number" min="0" max="1" step="0.01" value="0.5" required /></span>
+              </div>
                 <label class="field"><span class="label" data-i18n="saveNameNoExt"></span><input id="mName" type="text" spellcheck="false" /></label>
                 <label class="field"><span class="label" data-i18n="modelInfo"></span><textarea id="mInfo" rows="2"></textarea></label>
                 <div class="actions"><button type="button" id="runMerge" class="btn primary" data-i18n="merge"></button></div>

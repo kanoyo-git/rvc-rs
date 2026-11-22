@@ -378,6 +378,7 @@ fn mel_filterbank(config: MelConfig, maximum: f64) -> Vec<f32> {
 /// languages that the English HuBERT used for content features hears poorly.
 pub(super) struct PhoneticLoss {
     weights: super::weights::Weights,
+    layers: super::hubert::Layers,
     resample: Option<SincResample>,
     normalize: bool,
     taps: Vec<usize>,
@@ -408,6 +409,7 @@ impl PhoneticLoss {
         weights.move_to(device, kind)?;
         Ok(Self {
             weights,
+            layers: super::hubert::layers(directory)?,
             resample: (sample_rate != 16_000)
                 .then(|| SincResample::new(sample_rate, 16_000, device))
                 .transpose()?,
@@ -429,7 +431,7 @@ impl PhoneticLoss {
         }
         let last = *self.taps.last().expect("phonetic taps");
         let mut outputs = Vec::with_capacity(self.taps.len());
-        drop(super::hubert::encode(
+        drop(self.layers.encode(
             &self.weights,
             audio,
             last + 1,

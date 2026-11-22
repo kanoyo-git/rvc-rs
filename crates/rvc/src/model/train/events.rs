@@ -123,10 +123,129 @@ pub(crate) fn paths(directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub(crate) fn scalars(directory: &Path) -> Result<BTreeMap<String, VecDeque<(i64, f32)>>> {
-    let mut series: BTreeMap<String, VecDeque<(i64, f32)>> = BTreeMap::new();
+type Point = (i64, f32);
+
+#[derive(Default)]
+struct ScalarCurve {
+    points: Vec<Point>,
+    // First record and step of each surviving run when a checkpoint is resumed.
+    runs: VecDeque<(u64, i64)>,
+    sampled: bool,
+    replay: bool,
+}
+
+impl ScalarCurve {
+    fn observe(&mut self, ordinal: u64, point: Point) {
+        let rewind = self
+            .points
+            .last()
+            .is_some_and(|previous| previous.0 >= point.0);
+        if rewind || self.runs.is_empty() {
+            while self.runs.back().is_some_and(|run| run.1 >= point.0) {
+                self.runs.pop_back();
+            }
+            self.runs.push_back((ordinal, point.0));
+        }
+        if rewind {
+            self.replay |= self.sampled;
+            self.points
+                .truncate(self.points.partition_point(|p| p.0 < point.0));
+        }
+        self.push(point);
+    }
+
+    fn survives_rewind(&mut self, ordinal: u64, step: i64) -> bool {
+        while self.runs.get(1).is_some_and(|next| next.0 <= ordinal) {
+            self.runs.pop_front();
+        }
+        self.runs.front().is_some_and(|run| ordinal >= run.0)
+            && self.runs.get(1).is_none_or(|next| step < next.1)
+    }
+
+    fn push(&mut self, point: Point) {
+        self.points.push(point);
+        if self.points.len() <= 600 {
+            return;
+        }
+        self.sampled = true;
+        let first = self.points[0];
+        // Coarser power-of-two step buckets align with all earlier buckets.
+        // Their minima and maxima still represent all original observations.
+        let mut shift = 0;
+        while i128::from(point.0 >> shift) - i128::from(first.0 >> shift) > 149 {
+            shift += 1;
+        }
+        let mut sampled = vec![first];
+        for bucket in self
+            .points
+            .chunk_by(|a, b| (a.0 >> shift) == (b.0 >> shift))
+        {
+            let (mut low, mut high) = (bucket[0], bucket[0]);
+            for &value in &bucket[1..] {
+                if value.1 < low.1 {
+                    low = value;
+                }
+                if value.1 > high.1 {
+                    high = value;
+                }
+            }
+            if low.0 > high.0 {
+                std::mem::swap(&mut low, &mut high);
+            }
+            for value in [low, high] {
+                if sampled.last() != Some(&value) {
+                    sampled.push(value);
+                }
+            }
+        }
+        if sampled.last() != Some(&point) {
+            sampled.push(point);
+        }
+        self.points = sampled;
+    }
+}
+
+pub(crate) fn scalars(directory: &Path) -> Result<BTreeMap<String, VecDeque<Point>>> {
+    let mut files = Vec::new();
     for path in paths(directory)? {
-        let mut reader = BufReader::new(File::open(&path)?);
+        let size = fs::metadata(&path)?.len();
+        files.push((path, size));
+    }
+
+    let mut series = BTreeMap::<String, ScalarCurve>::new();
+    visit_scalars(&files, |ordinal, tag, point| {
+        if series.len() < 64 || series.contains_key(&tag) {
+            series.entry(tag).or_default().observe(ordinal, point);
+        }
+    })?;
+    if series.values().any(|curve| curve.replay) {
+        // A rewind can cut through a sampled bucket. Replay the surviving runs
+        // to recover extrema that were hidden by now-overwritten observations.
+        for curve in series.values_mut().filter(|curve| curve.replay) {
+            curve.points.clear();
+        }
+        visit_scalars(&files, |ordinal, tag, point| {
+            if let Some(curve) = series.get_mut(&tag)
+                && curve.replay
+                && curve.survives_rewind(ordinal, point.0)
+            {
+                curve.push(point);
+            }
+        })?;
+    }
+    Ok(series
+        .into_iter()
+        .map(|(tag, curve)| (tag, curve.points.into()))
+        .collect())
+}
+
+fn visit_scalars(
+    files: &[(PathBuf, u64)],
+    mut visit: impl FnMut(u64, String, Point),
+) -> Result<()> {
+    let mut ordinal = 0;
+    for (path, size) in files {
+        let mut reader = BufReader::new(File::open(path)?.take(*size));
         let mut bytes = Vec::new();
         while let Some(record) = read_record(&mut reader, &mut bytes)
             .with_context(|| format!("reading {}", path.display()))?
@@ -134,25 +253,15 @@ pub(crate) fn scalars(directory: &Path) -> Result<BTreeMap<String, VecDeque<(i64
             let event = ScalarEvent::decode(record)?;
             if let Some(summary) = event.summary {
                 for value in summary.values {
-                    let Some(number) = value.number.filter(|n| n.is_finite()) else {
-                        continue;
-                    };
-                    if series.len() >= 64 && !series.contains_key(&value.tag) {
-                        continue;
+                    if let Some(number) = value.number.filter(|number| number.is_finite()) {
+                        visit(ordinal, value.tag, (event.step, number));
+                        ordinal += 1;
                     }
-                    let values = series.entry(value.tag).or_default();
-                    while values.back().is_some_and(|point| point.0 >= event.step) {
-                        values.pop_back();
-                    }
-                    if values.len() == 600 {
-                        values.pop_front();
-                    }
-                    values.push_back((event.step, number));
                 }
             }
         }
     }
-    Ok(series)
+    Ok(())
 }
 
 fn read_record<'a>(reader: &mut impl Read, bytes: &'a mut Vec<u8>) -> Result<Option<&'a [u8]>> {
@@ -294,6 +403,46 @@ mod tests {
     fn checksums_match_the_standard_test_vector() {
         assert_eq!(crc32(b"123456789", 0x82f6_3b78), 0xe306_9283);
         assert_eq!(crc32(b"123456789", 0xedb8_8320), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn long_resumed_curves_keep_endpoints_and_surviving_extrema() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut events = Events::new(directory.path())?;
+        for epoch in 1..=10_100 {
+            let loss = match epoch {
+                189 => -9.0,
+                194 => -100.0,
+                201 => 90.0,
+                _ => 1.0,
+            };
+            events.summary(epoch * 7, &[("loss".into(), loss)], &[])?;
+        }
+        events.summary(192 * 7, &[("loss".into(), 2.0)], &[])?;
+        for epoch in 193..=10_200 {
+            let loss = if epoch == 5017 { 7.0 } else { 1.0 };
+            events.summary(epoch * 7, &[("loss".into(), loss)], &[])?;
+        }
+        let series = scalars(directory.path())?;
+        let points = &series["loss"];
+        assert!(points.len() <= 600);
+        assert_eq!(points.front(), Some(&(7, 1.0)));
+        assert_eq!(points.back(), Some(&(10_200 * 7, 1.0)));
+        assert_eq!(
+            points.iter().map(|point| point.1).reduce(f32::min),
+            Some(-9.0)
+        );
+        assert_eq!(
+            points.iter().map(|point| point.1).reduce(f32::max),
+            Some(7.0)
+        );
+        assert!(
+            points
+                .iter()
+                .zip(points.iter().skip(1))
+                .all(|(a, b)| a.0 < b.0)
+        );
+        Ok(())
     }
 
     #[test]

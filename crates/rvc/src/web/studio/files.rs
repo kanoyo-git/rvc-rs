@@ -26,6 +26,31 @@ const ARCHIVE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_RESULT_SETS: usize = 8;
 
+pub(super) async fn training_log(
+    State(state): State<Shared>,
+    RoutePath(name): RoutePath<String>,
+    request: Request,
+) -> WebResult<Response> {
+    let path = state
+        .paths
+        .experiments
+        .join(filename(&name)?)
+        .join("train.log");
+    let mime = "text/plain; charset=utf-8"
+        .parse()
+        .expect("static log MIME");
+    let mut response = ServeFile::new_with_mime(path, &mime)
+        .try_call(request)
+        .await
+        .map_err(anyhow::Error::from)?
+        .map(Body::new);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
 pub(in crate::web) struct Files {
     pub(super) workspace: TempDir,
     results: Mutex<VecDeque<HashMap<Uuid, Artifact>>>,

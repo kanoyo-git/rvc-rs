@@ -14,7 +14,14 @@ let datasetPaths;
 let experiments = { runs: [], resumable: [], all: [] };
 const fileList = (id) => [...document.getElementById(id).files];
 const fileName = (path) => String(path).split(/[\\/]/).pop();
-const number = (id) => Number(value(id));
+const number = (id) => {
+  const input = document.getElementById(id);
+  if (input.matches(".range-row input, #resumeTotal") && !input.reportValidity()) {
+    input.focus();
+    throw new Error(`${input.labels[0].textContent.trim()} · ${input.validationMessage}`);
+  }
+  return Number(input.value);
+};
 const optionalNumber = (id) => value(id) === "" ? null : number(id);
 // Native errors can carry a whole libtorch backtrace: keep the part a person can act on.
 const tidy = (message) => String(message).split(/\n(?:Exception raised from|frame #\d)/)[0].trim();
@@ -39,7 +46,7 @@ function listen(selector, event, handler) {
   }));
 }
 
-function action(id, output, run) {
+function action(id, output, run, available = () => true) {
   listen("#" + id, "click", async event => {
     const button = event.currentTarget;
     const target = $("#" + output);
@@ -50,7 +57,7 @@ function action(id, output, run) {
     } catch (error) {
       explain(error, target);
     } finally {
-      button.disabled = false;
+      button.disabled = !available();
     }
   });
 }
@@ -81,6 +88,8 @@ function localize() {
   renderSpeakers();
   syncSeparationModel();
   syncGate();
+  renderEmbedders();
+  if (pretrainedChoices && loadedPretrainedQuery === pretrainedQuery()) renderPretrained(pretrainedChoices, loadedPretrainedQuery);
   tally.render();
   if (Object.keys(metrics).length) renderMetrics();
   repaintPlayers();
@@ -177,6 +186,13 @@ function progressBar(output) {
   };
 }
 
+function displayJobLine(line) {
+  const match = /^Epoch (\d+\/\d+) completed in (\d+\.\d+) s$/.exec(line);
+  if (!match) return line;
+  const seconds = Number(match[2]).toLocaleString(document.documentElement.lang, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return t("epochDuration").replace("{epoch}", match[1]).replace("{seconds}", seconds);
+}
+
 async function runJob(settings, files, output, stopId) {
   if (activeJob) throw new Error(t("busyTask"));
   const showProgress = progressBar(output);
@@ -206,7 +222,7 @@ async function runJob(settings, files, output, stopId) {
     let previous = "";
     for (;;) {
       const job = await api(task.url);
-      const text = job.log.join("\n");
+      const text = job.log.map(displayJobLine).join("\n");
       showProgress(job.status === "running" ? job.message : "");
       if (job.status === "complete") {
         log(output, text ? text + "\n" + t("done") : t("done"));
@@ -251,7 +267,7 @@ async function watchForeignJob() {
 }
 
 /* Voices */
-const embedderLabels = { hubert_base: "HuBERT Base", contentvec: "ContentVec", spin: "Spin", "spin-v2": "Spin-v2", mhubert147: "mHuBERT-147", w2v_ru: "wav2vec 2.0 ru" };
+const embedderLabels = { hubert_base: "ContentVec (RVC)", contentvec: "ContentVec (Applio)", spin: "Spin", "spin-v2": "Spin-v2", mhubert147: "mHuBERT-147", w2v_ru: "wav2vec 2.0 ru" };
 
 // Indexes inside an experiment folder get the experiment name, to tell copies apart.
 function indexLabel(path) {
@@ -630,6 +646,7 @@ function trainParams() {
   const config = configTraining();
   const timbre = value("timbreMode");
   const pool = timbre === "pool" ? requireValue(value("timbrePool"), "chooseFeaturePool") : null;
+  const phoneticLoss = Math.max(0, number("phoneticLoss") || 0);
   const gpus = list(value("trainGpus")).map(Number);
   if (gpus.some(gpu => !Number.isInteger(gpu) || gpu < 0)) throw new Error(t("badGpus"));
   return {
@@ -646,8 +663,8 @@ function trainParams() {
     mrd: checked("mrdDisc"),
     unvoiced_f0: value("unvoicedF0") || null,
     stft_loss: Math.max(0, number("stftLoss") || 0),
-    phonetic_loss: Math.max(0, number("phoneticLoss") || 0),
-    phonetic_encoder: value("phoneticEncoder") || "mhubert147",
+    phonetic_loss: phoneticLoss,
+    phonetic_encoder: phoneticLoss > 0 ? value("phoneticEncoder") || null : null,
     hf_bands: checked("hfBands"), dec_aa: checked("decAa"),
     layer_aug: value("layerAug") ? experiment(value("layerAug")) : null,
     layer_aug_prob: number("layerAugProb"),
@@ -676,16 +693,24 @@ function syncTrainingControls() {
   $("#timbreExcludeWrap").hidden = !explicitPool;
   $("#downloadEmbedder").disabled = !value("trainEmbedder");
   $("#layerAugProbWrap").hidden = !value("layerAug");
+  const phonetic = $("#phoneticEncoder");
+  const enabled = number("phoneticLoss") > 0;
+  phonetic.disabled = !enabled;
+  phonetic.hidden = !enabled;
+  $("#phoneticEncoderOff").hidden = enabled;
+  if (phonetic.options.length) {
+    const primary = value("trainEmbedder");
+    phonetic.options[0].text = primary ? `${t("sameContentEmbedder")} · ${embedderLabels[primary] || primary}` : t("sameContentEmbedder");
+  }
 }
 
-function embedderOptions(automatic) {
-  return [
-    ...(automatic ? [{ value: "", key: "automatic" }] : []),
-    ...options.embedders.map(item => ({
-      value: item.name,
-      label: (embedderLabels[item.name] || item.name) + (item.installed ? "" : " · " + t(item.name === "w2v_ru" ? "notInstalled" : "downloadsOnUse")),
-    })),
-  ];
+function embedderOptions() {
+  // A catalog selection can arrive before the server replies with local install status.
+  const choices = options?.embedders ?? Object.keys(embedderLabels).map(name => ({ name }));
+  return choices.map(item => ({
+    value: item.name,
+    label: (embedderLabels[item.name] || item.name) + (item.installed === false ? " · " + t(item.name === "w2v_ru" ? "notInstalled" : "downloadsOnUse") : ""),
+  }));
 }
 
 let datasetRevision = 0;
@@ -719,6 +744,7 @@ listen("#trainsetZip", "change", async () => {
   }
 });
 
+listen("#phoneticLoss", "input", syncTrainingControls);
 listen('#trainEmbedder, #timbreMode, #layerAug, #trainVersion, #noiseReduce, input[name="mode"]', "change", syncTrainingControls);
 listen('#trainVersion, input[name="sr"], input[name="ifF0"]', "change", () => loadPretrained());
 action("runPre", "preLog", async output => {
@@ -760,8 +786,9 @@ action("buildFeaturePool", "trainLog", async output => {
   }
 });
 action("runTrain", "trainLog", async output => {
-  const result = await runJob({ operation: "train", ...trainParams() }, [], output, "stopTrain");
-  if (result) await afterTraining(result, output);
+  const settings = trainParams();
+  const result = await runJob({ operation: "train", ...settings }, [], output, "stopTrain");
+  if (result) await afterTraining(result, output, settings.name);
 });
 action("runIndex", "trainLog", async output => {
   await runJob({
@@ -769,13 +796,22 @@ action("runIndex", "trainLog", async output => {
   }, [], output, "stopIndex");
 });
 action("runAll", "trainLog", async output => {
+  const settings = trainParams();
   const result = await runJob({
-    operation: "train_all", ...trainParams(), ...prepParams(), f0_method: radio("tf0"),
+    operation: "train_all", ...settings, ...prepParams(), f0_method: radio("tf0"),
   }, [], output, "stopAll");
-  if (result) await afterTraining(result.training, output);
+  if (result) await afterTraining(result.training, output, settings.name);
 });
 
+const CONTENTVEC_NVC_DIRECTORY = "NVC-Pretrained-Rage-ContentVec";
+function pretrainedFolderLabel(folder) {
+  if (folder === CONTENTVEC_NVC_DIRECTORY) return "NVC-Pretrained";
+  if (folder === "NVC-Pretrained") return t("legacyNvcPretrained");
+  return folder;
+}
+
 let pretrainedRevision = 0;
+let pretrainedChoices;
 let loadedPretrainedQuery;
 let pretrainedSets = [];
 const selectedSet = () => pretrainedSets.find(item => item.id === value("preCatalog"));
@@ -795,7 +831,11 @@ async function loadPretrained() {
   const revision = ++pretrainedRevision;
   const query = pretrainedQuery();
   const data = await api("/api/studio/pretrained?" + query);
-  if (revision !== pretrainedRevision) return;
+  if (revision === pretrainedRevision) renderPretrained(data, query);
+}
+
+function renderPretrained(data, query) {
+  pretrainedChoices = data;
   const old = selectedSet();
   const sameQuery = query === loadedPretrainedQuery;
   const installed = new Set(data.installed);
@@ -808,7 +848,7 @@ async function loadPretrained() {
     if (!discriminators.has(d) || pretrainedSets.some(item => item.paths[0] === g)) continue;
     const folder = g.split(/[\\/]/).at(-2);
     const label = g === data.default_generator ? "RVC " + value("trainVersion")
-      : folder === "NVC-Pretrained" ? folder + " · mHuBERT-147" : folder;
+      : pretrainedFolderLabel(folder);
     pretrainedSets.push({ id: "local:" + g, name: label, paths: [g, d],
       installed: installed.has(g) && installed.has(d), downloadable: false });
   }
@@ -817,16 +857,19 @@ async function loadPretrained() {
       || [data.default_generator, data.default_discriminator];
   const options = paths => [
     { value: "", key: "noPretrained" },
-    ...paths.map(path => ({
-      value: path,
-      label: path.split(/[\\/]/).slice(-2).join("/") + (installed.has(path) ? "" : " · " + t("downloadsOnTrain")),
-    })),
+    ...paths.map(path => {
+      const [folder, file] = path.split(/[\\/]/).slice(-2);
+      return { value: path, label: `${pretrainedFolderLabel(folder)}/${file}` + (installed.has(path) ? "" : " · " + t("downloadsOnTrain")) };
+    }),
     { value: "custom", key: "pretrainedPath" },
   ];
   fill($("#preG"), options(data.generator), selectPaths[0] || "");
   fill($("#preD"), options(data.discriminator), selectPaths[1] || "");
   fill($("#preCatalog"), [
-    ...pretrainedSets.map(item => ({ value: item.id, label: item.name + (item.installed ? " · " + t("installed") : "") })),
+    ...pretrainedSets.map(item => ({
+      value: item.id,
+      label: (item.name === CONTENTVEC_NVC_DIRECTORY ? "NVC-Pretrained" : item.name) + (item.installed ? " · " + t("installed") : ""),
+    })),
     { value: "none", key: "noPretrained" }, { value: "manual", key: "manualPretrained" },
   ]);
   loadedPretrainedQuery = query;
@@ -856,12 +899,12 @@ const NVC_RECIPE = {
   latestOnly: false, saveSmall: true, cacheGpu: false,
   unvoicedF0: "", layerAug: "", layerAugProb: 0.5, hfBands: true, emaWeights: false,
   multiScaleMel: false, mrdDisc: false, decAa: false, freshStart: false,
-  stftLoss: 0, phoneticLoss: 0, phoneticEncoder: "mhubert147", trainOnly: "", timbreMode: "off",
+  stftLoss: 0, phoneticLoss: 0, trainOnly: "", timbreMode: "off",
 };
 const CONTENTVEC_RECIPE = { ...NVC_RECIPE, trainEmbedder: "hubert_base", hfBands: false, unvoicedF0: "zero", totalEpoch: 60, saveEvery: 60 };
 const NVC_PRETRAINS = new Map([
   ["NVC-Pretrained", { settings: NVC_RECIPE, hint: "nvcPretrainedHint" }],
-  ["NVC-Pretrained-Rage-ContentVec", { settings: CONTENTVEC_RECIPE, hint: "contentvecNvcPretrainedHint" }],
+  [CONTENTVEC_NVC_DIRECTORY, { settings: CONTENTVEC_RECIPE, hint: "contentvecNvcPretrainedHint" }],
 ]);
 
 function readRecipeSettings() {
@@ -930,8 +973,13 @@ listen("#downloadPretrained", "click", async () => {
 });
 listen("#refreshPretrained", "click", () => loadPretrained());
 
-async function afterTraining(result, output) {
-  log(output, `${t("done")} ${result.model} · ${t("completedEpoch")} ${result.epochs_completed}`);
+async function afterTraining(result, output, experimentName) {
+  const link = document.createElement("a");
+  link.href = "/api/studio/train-log/" + encodeURIComponent(experimentName);
+  link.download = experimentName + "-train.log";
+  link.dataset.i18n = "downloadTrainingLog";
+  link.textContent = t("downloadTrainingLog");
+  output.append(` ${result.model} · ${t("completedEpoch")} ${result.epochs_completed}\n`, link);
   await Promise.all([updateModels(), refreshRuns()]);
   $("#trainExport").replaceChildren(exportLink(fileName(result.model), "btn"));
 }
@@ -942,26 +990,36 @@ async function refreshRuns() {
   fill($("#metricRun"), runs.length ? runs : [{ value: "", key: "metricsEmpty" }]);
   const current = value("resumeExp");
   fill($("#resumeExp"), resumable.length ? resumable : [{ value: "", key: "resumeEmpty" }]);
-  $("#runResume").disabled = !resumable.length;
   fill($("#layerAug"), [{ value: "", key: "off" }, ...all]);
   fill($("#laSource"), all.length ? all : [{ value: "", key: "noExperiments" }]);
   syncTrainingControls();
   if (current !== value("resumeExp") || !$("#resumeInfo").children.length) await showResume();
 }
 let resumeRevision = 0;
+let manualResumeTotal;
+listen("#resumeTotal", "input", event => { manualResumeTotal = event.currentTarget.value; });
 async function showResume() {
   const revision = ++resumeRevision;
   const name = value("resumeExp");
+  const total = $("#resumeTotal");
+  const run = $("#runResume");
+  run.disabled = true;
+  total.disabled = true;
+  total.value = "";
+  $("#resumeLimit").hidden = true;
   if (!name) {
     facts($("#resumeInfo"), []);
     return;
   }
-  const total = $("#resumeTotal");
-  const previous = total.value;
   const info = await api("/api/studio/resume?" + new URLSearchParams({ name }));
   if (revision !== resumeRevision || name !== value("resumeExp")) return;
-  total.min = info.epoch + 1;
-  if (total.value === previous) total.value = info.epoch + 10;
+  const maximum = Number(total.max);
+  const atLimit = info.epoch >= maximum;
+  total.min = Math.min(info.epoch + 1, maximum);
+  total.disabled = atLimit;
+  run.disabled = atLimit;
+  $("#resumeLimit").hidden = !atLimit;
+  if (!atLimit) total.value = manualResumeTotal ?? Math.min(info.epoch + 10, maximum);
   facts($("#resumeInfo"), [
     [t("model"), `RVC ${info.version} · ${info.sample_rate / 1000} kHz · ${embedderLabels[info.embedder] || info.embedder}`],
     [t("completedEpoch"), String(info.epoch)],
@@ -973,15 +1031,16 @@ async function showResume() {
 listen("#refreshResume", "click", refreshRuns);
 listen("#resumeExp", "change", showResume);
 action("runResume", "resumeLog", async output => {
+  const name = requireValue(value("resumeExp"), "resumeEmpty");
   const result = await runJob({
-    operation: "resume", name: requireValue(value("resumeExp"), "resumeEmpty"), epochs: number("resumeTotal"),
+    operation: "resume", name, epochs: number("resumeTotal"),
     ...trainingPrecision("resumePrecision"), gradient_checkpointing: checkpointing("resumeCheckpointing"),
   }, [], output, "stopResume");
   if (result) {
-    await afterTraining(result, output);
+    await afterTraining(result, output, name);
     await showResume();
   }
-});
+}, () => !$("#resumeTotal").disabled);
 
 /* Layers and effects */
 function syncLayers() {
@@ -1057,11 +1116,11 @@ function renderMetrics() {
   svg.setAttribute("aria-label", value("metricName"));
   const left = 64, right = width - 16, top = 12, bottom = height - 28;
   const half = Math.max(0, Math.round(values.length / 40));
+  const sums = [0];
+  for (const v of ys) sums.push(sums.at(-1) + v);
   const smooth = ys.map((_, i) => {
     const from = Math.max(0, i - half), to = Math.min(ys.length, i + half + 1);
-    let sum = 0;
-    for (let j = from; j < to; j++) sum += ys[j];
-    return sum / (to - from);
+    return (sums[to] - sums[from]) / (to - from);
   });
   const lo = Math.min(...ys), hi = Math.max(...ys);
   const first = values[0][0], last = values.at(-1)[0];
@@ -1184,9 +1243,10 @@ action("runExtCkpt", "eLog", output => editModel(output, {
 }));
 
 function renderEmbedders() {
-  fill($("#trainEmbedder"), embedderOptions(true));
-  fill($("#laEmbedder"), embedderOptions(true));
-  fill($("#phoneticEncoder"), embedderOptions(false), value("phoneticEncoder") || "mhubert147");
+  const choices = embedderOptions();
+  fill($("#trainEmbedder"), [{ value: "", key: "experimentEmbedder" }, ...choices]);
+  fill($("#laEmbedder"), [{ value: "", key: "automatic" }, ...choices]);
+  fill($("#phoneticEncoder"), [{ value: "", key: "sameContentEmbedder" }, ...choices]);
   syncTrainingControls();
 }
 

@@ -109,18 +109,32 @@ export function toast(message, error = false) {
   });
 }
 
-export function syncRange(input) {
-  const output = input.parentElement.querySelector("output");
-  if (output) output.value = input.value;
-  const min = Number(input.min), max = Number(input.max);
-  input.style.setProperty("--val", `${100 * (Number(input.value) - min) / (max - min)}%`);
+export function syncRange(number) {
+  const slider = number.previousElementSibling;
+  for (const key of ["min", "max", "step", "disabled"]) slider[key] = number[key];
+  if (Number.isFinite(number.valueAsNumber) && number.validity.valid) slider.value = number.value;
+  const fraction = (slider.valueAsNumber - Number(slider.min)) / (Number(slider.max) - Number(slider.min));
+  slider.style.setProperty("--val", `${100 * fraction}%`);
 }
 
 export function bindRanges(root = document) {
-  $$("input[type=range]", root).forEach(input => {
-    if (input.closest(".player")) return;
-    input.addEventListener("input", () => syncRange(input));
-    syncRange(input);
+  const bounds = new MutationObserver(changes => changes.forEach(({ target }) => syncRange(target)));
+  $$(".range-row input[type=number]", root).forEach(number => {
+    const slider = number.previousElementSibling;
+    slider.addEventListener("input", () => {
+      number.value = slider.value;
+      number.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    slider.addEventListener("change", () => number.dispatchEvent(new Event("change", { bubbles: true })));
+    number.addEventListener("input", () => syncRange(number));
+    number.addEventListener("keydown", event => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (number.reportValidity()) number.blur();
+      }
+    });
+    bounds.observe(number, { attributes: true, attributeFilter: ["min", "max", "step", "disabled"] });
+    syncRange(number);
   });
 }
 

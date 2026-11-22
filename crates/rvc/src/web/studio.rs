@@ -107,6 +107,7 @@ pub(super) fn routes() -> Router<Shared> {
         .route("/api/studio/experiments", get(experiments))
         .route("/api/studio/resume", get(resume))
         .route("/api/studio/metrics", get(metrics))
+        .route("/api/studio/train-log/{name}", get(files::training_log))
         .route("/api/studio/media/{id}", get(files::media))
         .route("/api/studio/job/{id}", get(job).delete(cancel))
         .route(
@@ -575,6 +576,7 @@ impl Extra {
                     multiscale_mel: info.multiscale_mel,
                     stft_loss: info.stft_loss,
                     phonetic_loss: info.phonetic_loss,
+                    phonetic_encoder: info.phonetic_encoder,
                     mrd: info.mrd,
                     ema_decay: info.ema_decay,
                     ..Default::default()

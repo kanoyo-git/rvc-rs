@@ -11,6 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
@@ -110,9 +111,9 @@ pub struct Request {
     /// `enc_p` to fit a new content encoder while the decoder, flow and posterior stay frozen).
     #[arg(long, value_delimiter = ',')]
     pub train_only: Vec<String>,
-    /// Encoder for the phonetic loss. mHuBERT-147 covers Russian and 146 other languages.
-    #[arg(long, value_enum, default_value = "mhubert147")]
-    pub phonetic_encoder: Embedder,
+    /// Encoder for the optional phonetic loss. Defaults to the experiment's content embedder.
+    #[arg(long, value_enum)]
+    pub phonetic_encoder: Option<Embedder>,
     /// F0 on unvoiced frames: `interpolate` (RVC) or `zero` (NVC). Requires raw F0 from extraction.
     #[arg(long, value_enum)]
     pub unvoiced_f0: Option<Unvoiced>,
@@ -174,7 +175,7 @@ impl Default for Request {
             stft_loss: 0.0,
             phonetic_loss: 0.0,
             train_only: Vec::new(),
-            phonetic_encoder: Embedder::Mhubert147,
+            phonetic_encoder: None,
             unvoiced_f0: None,
             hf_bands: false,
             dec_aa: false,
@@ -443,15 +444,20 @@ fn run_on_devices(
         .multiscale_mel
         .then(|| MultiScaleMel::new(request.sample_rate, device))
         .transpose()?;
-    let phonetic_directory = request.phonetic_encoder.directory(paths);
+    let phonetic_encoder = (request.phonetic_loss > 0.0)
+        .then_some(request.phonetic_encoder.unwrap_or(embedder));
+    let phonetic_directory = phonetic_encoder
+        .map(|encoder| encoder.install(paths, &mut progress))
+        .transpose()?;
     let auxiliary = step::Auxiliary {
         stft: (request.stft_loss > 0.0)
             .then(|| MultiResolutionStft::new(device))
             .transpose()?,
-        phonetic: (request.phonetic_loss > 0.0)
-            .then(|| {
+        phonetic: phonetic_directory
+            .as_deref()
+            .map(|directory| {
                 PhoneticLoss::new(
-                    &phonetic_directory,
+                    directory,
                     i64::from(request.sample_rate),
                     device,
                     precision.kind(),
@@ -539,12 +545,8 @@ fn run_on_devices(
             mel: mel_config,
             multiscale: request.multiscale_mel,
             stft: request.stft_loss > 0.0,
-            phonetic: (request.phonetic_loss > 0.0).then(|| {
-                (
-                    phonetic_directory.as_path(),
-                    i64::from(request.sample_rate),
-                    precision.kind(),
-                )
+            phonetic: phonetic_directory.as_deref().map(|directory| {
+                (directory, i64::from(request.sample_rate), precision.kind())
             }),
             resolution: discriminator.has_resolution_branches(),
             generator: &g_params,
@@ -611,7 +613,7 @@ fn run_on_devices(
     let steps_per_epoch = dataset
         .batches(batch_size, first as u64, replicas, 0)?
         .len();
-    let mut log = training_log(&experiment, &request)?;
+    let mut log = training_log(&experiment, &request, phonetic_encoder)?;
     writeln!(log, "{starting}").context("writing train.log")?;
     if let Some(note) = &frozen_note {
         log_progress(&mut log, &mut progress, note)?;
@@ -650,6 +652,7 @@ fn run_on_devices(
     let mut cached = Vec::new();
     let mut profile = Profile::new(device);
     for epoch in first..=request.epochs {
+        let epoch_started = Instant::now();
         let batches = if cached.is_empty() {
             dataset.batches(batch_size, epoch as u64, replicas, 0)?
         } else {
@@ -956,6 +959,20 @@ fn run_on_devices(
         }
         g_lr.step(&mut g)?;
         d_lr.step(&mut d)?;
+        for device in devices {
+            if let Device::Cuda(index) = device {
+                tch::Cuda::synchronize(*index as i64);
+            }
+        }
+        log_progress(
+            &mut log,
+            &mut progress,
+            &format!(
+                "Epoch {epoch}/{} completed in {:.2} s",
+                request.epochs,
+                epoch_started.elapsed().as_secs_f64()
+            ),
+        )?;
     }
     let model = paths.weights.join(format!("{name}.pth"));
     edit::compact(
@@ -1123,7 +1140,11 @@ fn notify(progress: &mut impl FnMut(&str) -> ControlFlow<()>, message: &str) -> 
     Ok(())
 }
 
-fn training_log(experiment: &Path, request: &Request) -> Result<File> {
+fn training_log(
+    experiment: &Path,
+    request: &Request,
+    phonetic_encoder: Option<Embedder>,
+) -> Result<File> {
     let path = experiment.join("train.log");
     let mut log = OpenOptions::new()
         .read(true)
@@ -1153,7 +1174,7 @@ fn training_log(experiment: &Path, request: &Request) -> Result<File> {
         "multiscale_mel": request.multiscale_mel,
         "stft_loss": request.stft_loss,
         "phonetic_loss": request.phonetic_loss,
-        "phonetic_encoder": request.phonetic_encoder.name(),
+        "phonetic_encoder": phonetic_encoder,
         "mrd": request.mrd,
         "ema_decay": request.ema_decay,
     });
@@ -1259,6 +1280,7 @@ pub(crate) struct ResumeInfo {
     pub multiscale_mel: bool,
     pub stft_loss: f64,
     pub phonetic_loss: f64,
+    pub phonetic_encoder: Option<Embedder>,
     pub mrd: bool,
     pub ema_decay: f64,
     pub embedder: Embedder,
@@ -1303,6 +1325,7 @@ pub(crate) fn resume_info(experiment: &Path) -> Result<ResumeInfo> {
         multiscale_mel: false,
         stft_loss: 0.0,
         phonetic_loss: 0.0,
+        phonetic_encoder: None,
         mrd: false,
         ema_decay: 0.0,
         embedder: config.embedder_model.unwrap_or_default(),
@@ -1344,12 +1367,25 @@ pub(crate) fn resume_info(experiment: &Path) -> Result<ResumeInfo> {
                 info.phonetic_loss = value["phonetic_loss"]
                     .as_f64()
                     .unwrap_or(info.phonetic_loss);
+                info.phonetic_encoder = saved_phonetic_encoder(&value, info.phonetic_loss)?;
                 info.mrd = value["mrd"].as_bool().unwrap_or(info.mrd);
                 info.ema_decay = value["ema_decay"].as_f64().unwrap_or(info.ema_decay);
             }
         }
     }
     Ok(info)
+}
+
+fn saved_phonetic_encoder(metadata: &serde_json::Value, weight: f64) -> Result<Option<Embedder>> {
+    if weight == 0.0 {
+        return Ok(None);
+    }
+    // Older runs that omitted this field used mHuBERT-147 for the auxiliary loss.
+    match metadata.get("phonetic_encoder") {
+        Some(value) => serde_json::from_value(value.clone())
+            .context("reading phonetic encoder in train.log"),
+        None => Ok(Some(Embedder::Mhubert147)),
+    }
 }
 
 #[derive(Default)]
@@ -1587,6 +1623,16 @@ fn finish_pending_pair<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_restores_an_active_phonetic_encoder_from_the_training_log() -> Result<()> {
+        let log = json!({ "phonetic_encoder": "hubert_base" });
+        assert_eq!(saved_phonetic_encoder(&log, 0.1)?, Some(Embedder::HubertBase));
+        assert_eq!(saved_phonetic_encoder(&log, 0.0)?, None);
+        assert_eq!(saved_phonetic_encoder(&json!({}), 0.1)?, Some(Embedder::Mhubert147));
+        assert_eq!(saved_phonetic_encoder(&json!({"phonetic_encoder": null}), 0.1)?, None);
+        Ok(())
+    }
 
     #[test]
     fn recovers_training_pair_after_second_replacement_fails() -> Result<()> {

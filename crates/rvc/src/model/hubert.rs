@@ -137,11 +137,12 @@ impl Hubert {
     }
 
     fn forward(&self, w: &Weights, x: Tensor, v2: bool) -> Result<Tensor> {
-        let x = match self.layers {
-            Layers::Stable(layers) => encode_stable(w, x, layers)?,
-            Layers::Chosen(layers) => encode(w, x, layers, |_, _| Ok(()))?,
-            Layers::Default => encode(w, x, if v2 { 12 } else { 9 }, |_, _| Ok(()))?,
+        let count = match self.layers {
+            Layers::Stable(n) | Layers::Chosen(n) => n,
+            Layers::Default if v2 => 12,
+            Layers::Default => 9,
         };
+        let x = self.layers.encode(w, x, count, |_, _| Ok(()))?;
         // A stored projection maps other encoders onto RVC's 768 content channels.
         if w.contains("pca.weight") {
             return w.linear(&x, "pca");
@@ -236,7 +237,12 @@ pub(super) fn encode(
 /// Runs the first `layers` layers of a pre-LN wav2vec 2.0 encoder (layer-norm convolutions,
 /// `do_stable_layer_norm`) on `[batch, 1, samples]` audio and returns the last layer's output
 /// before the final encoder norm, as `hidden_states[layers]` in Transformers.
-pub(super) fn encode_stable(w: &Weights, mut x: Tensor, layers: usize) -> Result<Tensor> {
+fn encode_stable(
+    w: &Weights,
+    mut x: Tensor,
+    layers: usize,
+    mut tap: impl FnMut(usize, &Tensor) -> Result<()>,
+) -> Result<Tensor> {
     for (i, stride) in [5, 2, 2, 2, 2, 2, 2].into_iter().enumerate() {
         let layer = format!("feature_extractor.conv_layers.{i}");
         x = w.conv(&x, &format!("{layer}.conv"), stride, 0, 1, 1)?;
@@ -283,18 +289,19 @@ pub(super) fn encode_stable(w: &Weights, mut x: Tensor, layers: usize) -> Result
         )?
         .transpose(1, 2)
         .reshape([batch, -1, width]);
-        x += w.linear(&attn, &format!("{prefix}.out_proj"))?;
+        x = x.f_add(&w.linear(&attn, &format!("{prefix}.out_proj"))?)?;
         let hidden = w.norm(&x, &format!("{layer}.final_layer_norm"), 1e-5)?;
         let hidden = w
             .linear(&hidden, &format!("{layer}.feed_forward.intermediate_dense"))?
             .gelu("none");
-        x += w.linear(&hidden, &format!("{layer}.feed_forward.output_dense"))?;
+        x = x.f_add(&w.linear(&hidden, &format!("{layer}.feed_forward.output_dense"))?)?;
+        tap(i, &x)?;
     }
     Ok(x)
 }
 
 #[derive(Clone, Copy)]
-enum Layers {
+pub(super) enum Layers {
     /// RVC's layer: 12 for v2, 9 plus `final_proj` for v1.
     Default,
     /// `rvc_layer` from config.json on a post-LN HuBERT encoder.
@@ -303,10 +310,25 @@ enum Layers {
     Stable(usize),
 }
 
+impl Layers {
+    pub(super) fn encode(
+        self,
+        weights: &Weights,
+        input: Tensor,
+        count: usize,
+        tap: impl FnMut(usize, &Tensor) -> Result<()>,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Stable(_) => encode_stable(weights, input, count, tap),
+            _ => encode(weights, input, count, tap),
+        }
+    }
+}
+
 /// Reads the output layer from config.json. `rvc_layer` overrides RVC's choice; pre-LN
 /// wav2vec 2.0 encoders default to layer 18, where a Russian CTC model keeps phonetics most
 /// linearly separable in our probe.
-fn layers(directory: &Path) -> Result<Layers> {
+pub(super) fn layers(directory: &Path) -> Result<Layers> {
     let path = directory.join("config.json");
     let Ok(file) = File::open(&path) else {
         return Ok(Layers::Default);

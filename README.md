@@ -71,7 +71,7 @@ rvc train-index --experiment logs/my-voice
 | mHuBERT-147, ContentVec, SPIN | Hugging Face (utter-project, IAHispano/Applio) |
 | FCPE | пакет [torchfcpe 0.0.4](https://pypi.org/project/torchfcpe/0.0.4/) на PyPI |
 
-**NVC-Pretrained** (GPL-3.0) использует ContentVec (`hubert_base`) и обучен на вокале, включая рейдж. В Studio и Colab выберите его для обучения на 40 кГц. Генератор включает парные входы через метаданные весов. Новая пара скачивается в `assets/pretrained_v2/NVC-Pretrained-Rage-ContentVec/`. Каталог `assets/pretrained_v2/NVC-Pretrained/` хранит прежнюю версию для экспериментов с mHuBERT-147.
+**NVC-Pretrained** (GPL-3.0) использует ContentVec (`hubert_base`) и обучен на вокале, включая рейдж. В Studio и Colab выберите его для обучения на 40 кГц. Основной эмбеддер в Studio подписан **ContentVec (RVC)**. Кодировщик в разделе «Качество и эксперименты» участвует в обучении при положительном весе фонетической потери. По умолчанию он использует тот же эмбеддер. Генератор включает парные входы через метаданные весов. Новая пара скачивается в `assets/pretrained_v2/NVC-Pretrained-Rage-ContentVec/`. Каталог `assets/pretrained_v2/NVC-Pretrained/` хранит прежнюю версию для экспериментов с mHuBERT-147.
 
 ## Документация
 
