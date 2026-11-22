@@ -28,13 +28,12 @@ export function savedFiles() {
     const store = tx.objectStore("files");
     const key = [scope, input.id];
     const intent = marker(input);
+    const marked = preference(intent, null) === revision;
     if (input.files.length) store.put({ revision, files: [...input.files] }, key);
     else store.delete(key);
     tx.oncomplete = () => forget(intent, revision);
     tx.onabort = () => {
-      if (!db || edits.get(input) !== revision) return;
-      const latest = preference(intent, revision);
-      if (latest !== revision) return;
+      if (!db || edits.get(input) !== revision || (marked && preference(intent, null) !== revision)) return;
       const cleanup = db.transaction("files", "readwrite");
       cleanup.objectStore("files").delete(key);
       cleanup.oncomplete = () => forget(intent, revision);
