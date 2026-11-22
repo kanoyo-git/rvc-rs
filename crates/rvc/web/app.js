@@ -211,7 +211,15 @@ function displayJobLine(line) {
   return duration + " · " + t("epochEta").replace("{time}", eta);
 }
 
-const jobs = studioJobs({ tally, progressBar, displayLine: displayJobLine, completed: presentResult, explain });
+function jobButtonAvailable(button) {
+  if (button.id === "downloadPretrained") {
+    const pair = selectedSet();
+    return Boolean(pair?.downloadable && !pair.installed);
+  }
+  if (button.id === "runResume") return !$("#resumeTotal").disabled;
+  return button.id !== "runCover" || options.cover;
+}
+const jobs = studioJobs({ tally, progressBar, displayLine: displayJobLine, completed: presentResult, available: jobButtonAvailable, explain });
 const runJob = jobs.run;
 
 /* Voices */
@@ -765,7 +773,8 @@ function syncPretrained() {
   for (const id of ["preG", "preD"]) $("#" + id + "PathWrap").hidden = value(id) !== "custom";
   const pair = pretrainedSets.find(item => item.paths[0] === value("preG") && item.paths[1] === value("preD"));
   $("#preCatalog").value = pair?.id ?? (value("preG") || value("preD") ? "manual" : "none");
-  $("#downloadPretrained").disabled = !pair?.downloadable || pair.installed;
+  const download = $("#downloadPretrained");
+  download.disabled = Boolean(download.dataset.jobLock) || !jobButtonAvailable(download);
   syncNvcPretrained();
 }
 
@@ -1046,7 +1055,7 @@ async function showResume() {
   const atLimit = info.epoch >= maximum;
   total.min = Math.min(info.epoch + 1, maximum);
   total.disabled = atLimit;
-  run.disabled = atLimit;
+  run.disabled = atLimit || Boolean(run.dataset.jobLock);
   $("#resumeLimit").hidden = !atLimit;
   if (!atLimit) {
     const wanted = Number(session.saved("resume:" + name));
@@ -1325,8 +1334,11 @@ async function start() {
   syncSeparationModel();
   void restoreFiles(options.experiments);
   const panelReady = showPanel(addressPanel() || session.saved("panel") || "infer");
-  await Promise.all([updateModels(), panelReady ?? refreshRuns()]);
-  await jobs.restore(options.experiments);
+  try {
+    await Promise.all([updateModels(), panelReady ?? refreshRuns()]);
+  } finally {
+    await jobs.restore(options.experiments);
+  }
 }
 start().catch(error => {
   $("#startup").hidden = false;

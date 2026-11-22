@@ -42,7 +42,7 @@ function restoreReadingPosition(output, id) {
   observer.observe(output);
 }
 
-export function studioJobs({ tally, progressBar, displayLine, completed, explain }) {
+export function studioJobs({ tally, progressBar, displayLine, completed, available, explain }) {
   let active;
   let syncing;
   let restored = false;
@@ -60,7 +60,7 @@ export function studioJobs({ tally, progressBar, displayLine, completed, explain
       stop.hidden = true;
       if (start.dataset.jobLock === task.id) {
         delete start.dataset.jobLock;
-        start.disabled = start.id === "runResume" && byId("resumeTotal").disabled;
+        start.disabled = !available(start);
       }
       task.progress("");
       tally.stop();

@@ -245,7 +245,7 @@ fn page(file: &NamedTempFile, end: u64, cursor: u64) -> Result<(Vec<String>, u64
         let mut last = [0u8];
         file.read_exact(&mut last)?;
         ensure!(
-            last == [b'\n'],
+            last[0] == b'\n',
             "job log cursor is not at a record boundary"
         );
     }
