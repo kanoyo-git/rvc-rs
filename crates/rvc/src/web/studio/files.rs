@@ -203,14 +203,69 @@ pub(super) struct Uploads {
     pub(super) files: Vec<PathBuf>,
 }
 
+pub(super) struct DatasetPaths {
+    pub(super) single: PathBuf,
+    pub(super) multi_folder: PathBuf,
+}
+
 impl Uploads {
     pub(super) fn one(&self) -> Result<&Path> {
         ensure!(self.files.len() == 1, "upload one file");
         Ok(&self.files[0])
     }
+
+    pub(super) fn into_dataset(self, workspace: &Path) -> Result<DatasetPaths> {
+        ensure!(
+            !self.files.is_empty(),
+            "upload a dataset ZIP or audio files"
+        );
+        if let [archive] = self.files.as_slice()
+            && archive
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
+            let extracted = TempDir::new_in(workspace)?;
+            let audio = unzip(archive, extracted.path(), crate::audio::is_audio, || Ok(()))?;
+            ensure!(
+                !audio.is_empty(),
+                "the dataset archive contains no audio files"
+            );
+            let mut entries = fs::read_dir(extracted.path())?;
+            let first = entries.next().transpose()?.context("empty dataset")?.path();
+            let wrapper = entries.next().is_none() && first.is_dir();
+            let has_speaker_folder =
+                wrapper && crate::dataset::scan_speakers(extracted.path()).is_ok();
+            let root = extracted.keep();
+            let single = if wrapper { first } else { root.clone() };
+            let multi_folder = if has_speaker_folder {
+                root
+            } else {
+                single.clone()
+            };
+            return Ok(DatasetPaths {
+                single,
+                multi_folder,
+            });
+        }
+        ensure!(
+            self.files.iter().all(|path| crate::audio::is_audio(path)),
+            "choose one ZIP archive or a selection of audio files"
+        );
+        let root = TempDir::new_in(workspace)?;
+        let single = root.path().join("speaker_0_1");
+        fs::rename(self.directory.path(), &single)?;
+        Ok(DatasetPaths {
+            single,
+            multi_folder: root.keep(),
+        })
+    }
 }
 
-pub(super) async fn upload(state: &Shared, mut form: Multipart) -> Result<(Value, Uploads)> {
+pub(super) async fn upload(
+    state: &Shared,
+    mut form: Multipart,
+    dataset: bool,
+) -> Result<(Value, Uploads)> {
     let directory = TempDir::new_in(state.studio.workspace.path())?;
     let mut files = Vec::new();
     let mut settings = Value::Null;
@@ -230,7 +285,7 @@ pub(super) async fn upload(state: &Shared, mut form: Multipart) -> Result<(Value
             Some("files") => {
                 ensure!(files.len() < 1000, "too many uploaded files");
                 let name = field.file_name().context("upload has no filename")?;
-                let path = directory.path().join(filename(name)?);
+                let path = upload_path(directory.path(), name, dataset, files.len())?;
                 let mut file = tokio::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -247,6 +302,22 @@ pub(super) async fn upload(state: &Shared, mut form: Multipart) -> Result<(Value
         }
     }
     Ok((settings, Uploads { directory, files }))
+}
+
+fn upload_path(directory: &Path, name: &str, dataset: bool, count: usize) -> Result<PathBuf> {
+    let name = filename(name)?;
+    let mut target = directory.join(name);
+    if dataset && crate::audio::is_audio(name) {
+        let extension = name.extension().context("audio file has no extension")?;
+        let mut number = count + 1;
+        while target.exists() {
+            target = directory
+                .join(format!("upload-{number}"))
+                .with_extension(extension);
+            number += 1;
+        }
+    }
+    Ok(target)
 }
 
 pub(super) fn filename(name: &str) -> Result<&Path> {
@@ -303,4 +374,63 @@ pub(super) fn unzip(
         extracted.push(target);
     }
     Ok(extracted)
+}
+
+#[cfg(test)]
+mod dataset_tests {
+    use super::*;
+    use std::io::Write;
+    use zip::{ZipWriter, write::SimpleFileOptions};
+
+    #[test]
+    fn loose_audio_keeps_every_file_in_the_preprocess_folder() -> Result<()> {
+        let workspace = TempDir::new()?;
+        let directory = TempDir::new_in(workspace.path())?;
+        let mut files = Vec::new();
+        for (name, contents) in [
+            ("vocal.wav", "one"),
+            ("upload-3.wav", "two"),
+            ("vocal.wav", "three"),
+        ] {
+            let path = upload_path(directory.path(), name, true, files.len())?;
+            fs::write(&path, contents)?;
+            files.push(path);
+        }
+        let paths = Uploads { directory, files }.into_dataset(workspace.path())?;
+        let manifest = crate::dataset::scan_speakers(&paths.multi_folder)?;
+        assert_eq!(manifest.entries.len(), 3);
+        assert!(manifest.entries.iter().all(|entry| entry.speaker_id == 0
+            && entry.speaker_name == "speaker"
+            && entry.path.parent() == Some(&paths.single)));
+        let mut sources = fs::read_dir(paths.single)?
+            .map(|entry| fs::read_to_string(entry?.path()))
+            .collect::<io::Result<Vec<_>>>()?;
+        sources.sort();
+        assert_eq!(sources, ["one", "three", "two"]);
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_zip_preserves_single_speaker_subfolder_in_multi_mode() -> Result<()> {
+        let workspace = TempDir::new()?;
+        for prefix in ["", "dataset/"] {
+            let directory = TempDir::new_in(workspace.path())?;
+            let archive = directory.path().join("voices.ZIP");
+            let mut zip = ZipWriter::new(File::create(&archive)?);
+            zip.start_file(
+                format!("{prefix}Lover_0_1/vocal.wav"),
+                SimpleFileOptions::default(),
+            )?;
+            zip.write_all(b"test")?;
+            zip.finish()?;
+            let uploads = Uploads {
+                directory,
+                files: vec![archive],
+            };
+            let root = uploads.into_dataset(workspace.path())?.multi_folder;
+            assert_eq!(crate::dataset::scan_speakers(&root)?.entries.len(), 1);
+            assert_eq!(fs::read(root.join("Lover_0_1/vocal.wav"))?, b"test");
+        }
+        Ok(())
+    }
 }

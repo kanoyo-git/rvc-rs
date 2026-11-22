@@ -14,6 +14,95 @@ use crate::checkpoint::Checkpoint;
 mod embedder;
 pub use embedder::Embedder;
 
+/// File-conversion profile learned from matched clean and distorted singing.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArticulationProfile {
+    pub version: u8,
+    pub weights: Vec<Vec<f64>>,
+    pub bias: [f64; 18],
+    pub detector: ArticulationDetector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frication: Option<FricationProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct FricationProfile {
+    pub version: u8,
+    pub target_mix: [f64; 9],
+    pub band_strength: [f64; 9],
+    pub shape_strength: f64,
+    pub level_strength: f64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub targets: BTreeMap<i64, FricationTemplate>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct FricationTemplate {
+    /// Mean relative powers of nine bands and overall level, averaged in the power domain.
+    pub mean: [[f64; 10]; 2],
+    pub frames: [usize; 2],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArticulationDetector {
+    pub mean: [f64; 24],
+    pub scale: [f64; 24],
+    pub weights: [Vec<Vec<f64>>; 3],
+    pub bias: [Vec<f64>; 3],
+}
+
+impl ArticulationProfile {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let matrix = |rows: &[Vec<f64>], outputs, inputs| {
+            rows.len() == outputs && rows.iter().all(|r| r.len() == inputs)
+        };
+        ensure!(
+            matches!(self.version, 2 | 3),
+            "unsupported articulation profile version"
+        );
+        ensure!(
+            matrix(&self.weights, 18, 37),
+            "invalid articulation regression dimensions"
+        );
+        ensure!(
+            self.detector.scale.iter().all(|&n| n > 0.0),
+            "invalid articulation detector scale"
+        );
+        if let Some(f) = &self.frication {
+            ensure!(self.version == 3, "frication requires articulation version 3");
+            ensure!(f.version == 1 && f.target_mix.iter().chain(&f.band_strength)
+                .chain([&f.shape_strength, &f.level_strength]).all(|v| (0.0..=1.0).contains(v)), "invalid frication settings");
+            ensure!(f.targets.iter().all(|(sid, t)| *sid >= 0 && t.mean.iter().flatten().all(|x| x.is_finite() && (-61.0..=10.0).contains(x))),
+                "invalid target frication template");
+        }
+        for (i, (outputs, inputs)) in [(24, 24), (12, 24), (1, 12)].into_iter().enumerate() {
+            ensure!(
+                matrix(&self.detector.weights[i], outputs, inputs)
+                    && self.detector.bias[i].len() == outputs,
+                "invalid articulation detector dimensions"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_metadata(value: Option<Value>) -> Result<Option<Self>> {
+        let profile: Option<Self> = serde_json::from_value(value.unwrap_or(Value::Null))
+            .context("invalid articulation profile")?;
+        if let Some(profile) = &profile {
+            profile.validate()?;
+        }
+        Ok(profile)
+    }
+
+    #[cfg(feature = "inference")]
+    pub(crate) fn from_generator(checkpoint: &Checkpoint) -> Result<Option<Self>> {
+        let nested = checkpoint
+            .metadata("nvc")?
+            .and_then(|mut v| v.get_mut("articulation").map(Value::take));
+        Self::from_metadata(nested.or(checkpoint.metadata("articulation")?))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Unvoiced {
@@ -30,6 +119,8 @@ pub struct VoiceFormat {
     /// Decoder activations run anti-aliased (see `synth::alias_free`).
     #[serde(default)]
     pub dec_aa: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub articulation: Option<ArticulationProfile>,
     #[serde(skip)]
     pub normalize_input: bool,
 }
@@ -41,6 +132,7 @@ impl Default for VoiceFormat {
             f0_unvoiced: Unvoiced::default(),
             default_noise_scale: 0.66666,
             dec_aa: false,
+            articulation: None,
             normalize_input: false,
         }
     }
@@ -59,7 +151,7 @@ impl VoiceFormat {
             options.embedder = embedder;
             options.normalize_input = true;
         }
-        if let Some(meta) = checkpoint.metadata("nvc")?.filter(|value| !value.is_null()) {
+        if let Some(mut meta) = checkpoint.metadata("nvc")?.filter(|value| !value.is_null()) {
             ensure!(
                 meta["format"] == "nvc" && meta["format_version"] == 1,
                 "unsupported NVC model metadata format or version"
@@ -93,6 +185,8 @@ impl VoiceFormat {
                     .as_bool()
                     .context("invalid NVC decoder activation flag")?;
             }
+            options.articulation =
+                ArticulationProfile::from_metadata(meta.get_mut("articulation").map(Value::take))?;
             options.normalize_input = true;
         }
         Ok(options)

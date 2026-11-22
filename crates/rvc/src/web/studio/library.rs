@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::{NamedTempFile, TempDir};
@@ -33,18 +33,40 @@ pub(super) fn import(
             .url
             .as_deref()
             .context("supply a model URL or upload a file")?;
-        let name = request.name.unwrap_or_else(|| {
-            url.split(['?', '#'])
-                .next()
-                .and_then(|part| part.rsplit('/').next())
-                .filter(|part| {
-                    model_member(Path::new(part)) || part.to_lowercase().ends_with(".zip")
+        let payload = uploads.directory.path().join("download");
+        let suggested = super::shared_link::download(url, &payload, &mut report)?;
+        let requested = request.name.as_deref().filter(|s| !s.is_empty());
+        let stem = filename(requested.or(suggested.as_deref()).unwrap_or("model"))?;
+        let name = if model_member(stem) || extension(stem, "zip") {
+            stem.to_owned()
+        } else {
+            let suffix = suggested
+                .as_deref()
+                .map(Path::new)
+                .and_then(|p| {
+                    if model_member(p) && !extension(p, "pth") && !extension(p, "index") {
+                        Some("pitch.json")
+                    } else if extension(p, "index") {
+                        Some("index")
+                    } else if extension(p, "pth") {
+                        Some("pth")
+                    } else if extension(p, "zip") {
+                        Some("zip")
+                    } else {
+                        None
+                    }
                 })
-                .unwrap_or("models.zip")
-                .to_owned()
-        });
-        let path = uploads.directory.path().join(filename(&name)?);
-        download(url, &path, &mut report)?;
+                .unwrap_or_else(|| {
+                    if ModelInfo::read(&payload).is_ok() {
+                        "pth"
+                    } else {
+                        "zip"
+                    }
+                });
+            PathBuf::from(format!("{}.{suffix}", stem.display()))
+        };
+        let path = uploads.directory.path().join(name);
+        fs::rename(payload, &path)?;
         path
     } else {
         uploads.one()?.to_owned()
@@ -120,6 +142,7 @@ pub(super) struct PretrainedQuery {
 #[derive(Serialize)]
 pub(super) struct PretrainedOption {
     name: String,
+    paths: [PathBuf; 2],
     installed: bool,
 }
 
@@ -151,61 +174,51 @@ pub(super) fn choices(paths: &Paths, query: &PretrainedQuery) -> Value {
         .filter(|entry| entry.file_type().is_file() && extension(entry.path(), "pth"))
         .map(|entry| entry.into_path())
         .collect::<Vec<_>>();
-    // Known pairs (RVC and NVC-Pretrained) are listed before they exist: training fetches them.
-    let known = crate::assets::known_pretrained(paths);
-    let nvc = directory.join("NVC-Pretrained");
+    let catalog: Vec<_> = CATALOG
+        .iter()
+        .filter(|(_, entries)| {
+            query.version == Version::V2 && query.f0 && entries.contains_key(&rate)
+        })
+        .map(|(name, _)| {
+            let pair = pretrained_targets(paths, name, &rate);
+            PretrainedOption {
+                name: name.clone(),
+                installed: pair.iter().all(|path| path.is_file()),
+                paths: pair,
+            }
+        })
+        .collect();
+    let mut available: BTreeSet<PathBuf> = assets.into_iter().collect();
+    let legacy = directory.join("NVC-Pretrained");
+    available.extend(
+        crate::assets::known_pretrained(paths)
+            .into_iter()
+            .filter(|p| p.starts_with(&directory) && (!p.starts_with(&legacy) || p.is_file())),
+    );
+    available.extend(catalog.iter().flat_map(|item| item.paths.iter().cloned()));
     let role_paths = |role: &str| {
         let name = format!("{prefix}{role}{rate}.pth");
-        let matches = |path: &&PathBuf| {
-            path.file_name()
-                .is_some_and(|file| file.eq_ignore_ascii_case(&name))
-        };
-        let mut found = assets
+        let default = directory.join(&name);
+        let found: Vec<_> = available
             .iter()
-            .chain(known.iter().filter(|path| path.starts_with(&directory)))
-            .filter(matches)
-            .cloned()
-            .collect::<Vec<_>>();
-        found.sort();
-        found.dedup();
-        let preferred = nvc.join(&name);
-        let default = if found.contains(&preferred) {
-            preferred
-        } else {
-            directory.join(&name)
-        };
-        let installed = found
-            .iter()
-            .filter(|path| path.is_file())
-            .cloned()
-            .collect::<Vec<_>>();
-        (
-            found.contains(&default).then_some(default),
-            found,
-            installed,
-        )
-    };
-    let (generator, generators, installed_g) = role_paths("G");
-    let (discriminator, discriminators, installed_d) = role_paths("D");
-    let catalog = if query.version == Version::V2 && query.f0 {
-        CATALOG
-            .iter()
-            .filter(|(_, entries)| entries.contains_key(&rate))
-            .map(|(name, _)| {
-                let [g, d] = pretrained_targets(paths, name, &rate);
-                PretrainedOption {
-                    name: name.clone(),
-                    installed: g.is_file() && d.is_file(),
-                }
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|file| file.eq_ignore_ascii_case(&name))
             })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
+            .collect();
+        (available.contains(&default).then_some(default), found)
     };
+    let (generator, generators) = role_paths("G");
+    let (discriminator, discriminators) = role_paths("D");
+    let installed: Vec<_> = generators
+        .iter()
+        .chain(&discriminators)
+        .filter(|p| p.is_file())
+        .collect();
     json!({
         "generator": generators, "discriminator": discriminators,
         "default_generator": generator, "default_discriminator": discriminator,
-        "installed": installed_g.into_iter().chain(installed_d).collect::<Vec<_>>(),
+        "installed": installed,
         "catalog": catalog,
     })
 }
@@ -220,15 +233,55 @@ pub(super) struct InstallPair {
 
 fn pretrained_targets(paths: &Paths, name: &str, rate: &str) -> [PathBuf; 2] {
     let directory = paths.root.join("assets/pretrained_v2");
-    let directory = if name == "RVC v2" {
-        directory
-    } else {
-        directory.join(name)
+    let directory = match name {
+        "RVC v2" => directory,
+        "NVC-Pretrained" => directory.join("NVC-Pretrained-Rage-ContentVec"),
+        _ => directory.join(name),
     };
     [
         directory.join(format!("f0G{rate}.pth")),
         directory.join(format!("f0D{rate}.pth")),
     ]
+}
+
+/// Fetch a missing community pair for the paths actually submitted by Studio.
+pub(super) fn prepare_training(
+    paths: &Paths,
+    request: &crate::model::train::Request,
+    workspace: &Path,
+    report: &mut impl FnMut(&str) -> ControlFlow<()>,
+) -> Result<()> {
+    if request.version != Version::V2 || !request.f0 {
+        return Ok(());
+    }
+    let experiment = paths.root.join(&request.experiment);
+    if experiment.is_dir() && crate::model::train::has_checkpoint_pair(&experiment)? {
+        return Ok(());
+    }
+    let chosen = [&request.pretrained_g, &request.pretrained_d]
+        .map(|part| part.as_ref().map(|p| paths.root.join(p)));
+    let rate = format!("{}k", request.sample_rate / 1000);
+    for (name, entries) in CATALOG
+        .iter()
+        .filter(|(_, entries)| entries.contains_key(&rate))
+    {
+        let targets = pretrained_targets(paths, name, &rate);
+        if targets
+            .iter()
+            .zip(&chosen)
+            .any(|(target, part)| part.as_ref() == Some(target) && !target.is_file())
+        {
+            install_catalog_pair(
+                paths,
+                name,
+                request.sample_rate,
+                &entries[&rate],
+                workspace,
+                report,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn install_pretrained(
@@ -243,35 +296,116 @@ pub(super) fn install_pretrained(
         "invalid sample rate"
     );
     let rate = format!("{}k", request.sample_rate / 1000);
-    let urls = match (request.generator, request.discriminator) {
-        (None, None) => {
-            let entry = CATALOG
-                .get(&request.name)
-                .and_then(|set| set.get(&rate))
-                .context("unknown pretrained catalog entry")?;
-            [&entry.generator, &entry.discriminator]
-                .map(|file| format!("https://huggingface.co/{file}"))
-        }
-        (Some(g), Some(d)) => [g, d],
-        _ => bail!("both generator and discriminator URLs are required"),
-    };
-    let staging = TempDir::new_in(workspace)?;
     let targets = pretrained_targets(paths, &request.name, &rate);
+    if request.generator.is_none() && request.discriminator.is_none() {
+        let entry = CATALOG
+            .get(&request.name)
+            .and_then(|entries| entries.get(&rate))
+            .context("unknown pretrained catalog entry")?;
+        install_catalog_pair(
+            paths,
+            &request.name,
+            request.sample_rate,
+            entry,
+            workspace,
+            &mut report,
+        )?;
+        return Ok(json!({ "paths": targets }));
+    }
+    let staging = TempDir::new_in(workspace)?;
     let mut installs = Vec::new();
-    for (i, (target, url)) in targets.iter().zip(urls).enumerate() {
-        if target.is_file() {
-            check_pretrained(target, i, request.sample_rate)?;
-            continue;
+    let mut selected = Vec::new();
+    let archive_allowed = request.discriminator.is_none();
+    for (i, url) in [request.generator, request.discriminator]
+        .into_iter()
+        .enumerate()
+    {
+        let Some(url) = url else { continue };
+        let input = staging.path().join(format!("input-{i}"));
+        let suggested = super::shared_link::download(&url, &input, &mut report)?;
+        let archive = i == 0
+            && archive_allowed
+            && Checkpoint::open(&input).is_err()
+            && (suggested
+                .as_ref()
+                .is_some_and(|s| extension(Path::new(s), "zip"))
+                || zip::ZipArchive::new(File::open(&input)?).is_ok());
+        if archive {
+            let members = unzip(
+                &input,
+                staging.path(),
+                |p| extension(p, "pth"),
+                || check(&mut report, "Extracting pretrained weights"),
+            )?;
+            let mut pair: [Option<PathBuf>; 2] = [None, None];
+            for member in members {
+                let role = (0..2)
+                    .find(|&role| check_pretrained(&member, role, request.sample_rate).is_ok());
+                if let Some(role) = role {
+                    ensure!(
+                        pair[role].is_none(),
+                        "archive contains multiple compatible weights for the same role"
+                    );
+                    pair[role] = Some(member);
+                }
+            }
+            for (role, member) in pair.into_iter().enumerate() {
+                let source = member.context(
+                    "archive must contain one compatible generator and one discriminator",
+                )?;
+                installs.push(stage_install(&source, targets[role].clone())?);
+                selected.push(targets[role].clone());
+            }
+        } else {
+            check_pretrained(&input, i, request.sample_rate)?;
+            installs.push(stage_install(&input, targets[i].clone())?);
+            selected.push(targets[i].clone());
         }
-        let input = staging.path().join(format!("{i}.pth"));
-        download(&url, &input, &mut report)?;
-        check(&mut report, "Checking pretrained checkpoint")?;
-        check_pretrained(&input, i, request.sample_rate)?;
-        installs.push(stage_install(&input, target.clone())?);
     }
     check(&mut report, "Installing pretrained weights")?;
     publish(installs)?;
-    Ok(json!({ "paths": targets }))
+    Ok(json!({ "paths": selected }))
+}
+
+fn install_catalog_pair(
+    paths: &Paths,
+    name: &str,
+    sample_rate: u32,
+    entry: &CatalogWeights,
+    workspace: &Path,
+    report: &mut impl FnMut(&str) -> ControlFlow<()>,
+) -> Result<()> {
+    let rate = format!("{}k", sample_rate / 1000);
+    let targets = pretrained_targets(paths, name, &rate);
+    let staging = TempDir::new_in(workspace)?;
+    let mut installs = Vec::new();
+    for (i, (target, remote)) in targets
+        .iter()
+        .zip([&entry.generator, &entry.discriminator])
+        .enumerate()
+    {
+        if !target.is_file() && matches!(name, "RVC v2" | "NVC-Pretrained") {
+            crate::assets::pretrained(paths, target, report)?;
+        }
+        if target.is_file() {
+            check_pretrained(target, i, sample_rate)?;
+            continue;
+        }
+        let input = staging.path().join(format!("{i}.pth"));
+        crate::download::download(
+            &format!("https://huggingface.co/{remote}"),
+            &input,
+            target.file_name().and_then(|s| s.to_str()).unwrap_or(name),
+            None,
+            report,
+        )?;
+        check(report, "Checking pretrained checkpoint")?;
+        check_pretrained(&input, i, sample_rate)?;
+        installs.push(stage_install(&input, target.clone())?);
+    }
+    check(report, "Installing pretrained weights")?;
+    publish(installs)?;
+    Ok(())
 }
 
 fn check_pretrained(path: &Path, role: usize, rate: u32) -> Result<()> {
@@ -342,43 +476,72 @@ fn check(report: &mut impl FnMut(&str) -> ControlFlow<()>, message: &str) -> Res
     Ok(())
 }
 
-fn download(
-    raw: &str,
-    output: &Path,
-    report: &mut impl FnMut(&str) -> ControlFlow<()>,
-) -> Result<()> {
-    let url = direct_url(raw)?;
-    let label = url
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .split('?')
-        .next()
-        .unwrap_or_default()
-        .to_owned();
-    crate::download::download(&url, output, &label, None, report)
-}
+#[cfg(test)]
+mod pretrained_choices_tests {
+    use super::*;
 
-fn direct_url(raw: &str) -> Result<String> {
-    let url: axum::http::Uri = raw.parse().context("invalid download URL")?;
-    ensure!(
-        matches!(url.scheme_str(), Some("http" | "https")) && url.host().is_some(),
-        "use an HTTP(S) download URL"
-    );
-    match url.host().unwrap_or_default() {
-        "huggingface.co" | "hf.co" => Ok(raw.replacen("/blob/", "/resolve/", 1)),
-        "drive.google.com" => {
-            if let Some((_, rest)) = url.path().split_once("/file/d/") {
-                let id = rest.split('/').next().unwrap_or_default();
-                ensure!(!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
-                    "invalid Drive file ID");
-                Ok(format!(
-                    "https://drive.google.com/uc?export=download&id={id}"
-                ))
-            } else {
-                Ok(raw.to_owned())
+    #[test]
+    fn catalog_paths_are_selectable_before_download_and_default_to_stock() -> Result<()> {
+        let root = TempDir::new()?;
+        let paths = Paths::new(root.path())?;
+        let query = PretrainedQuery {
+            version: Version::V2,
+            sample_rate: 40_000,
+            f0: true,
+        };
+        let data = choices(&paths, &query);
+        let set = |name: &str| {
+            data["catalog"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap()
+        };
+        let stock = set("RVC v2");
+        let klm = set("KLM4");
+        let nvc = set("NVC-Pretrained");
+        assert_eq!(data["default_generator"], stock["paths"][0]);
+        assert_eq!(data["default_discriminator"], stock["paths"][1]);
+        assert_eq!(
+            klm["paths"],
+            json!(pretrained_targets(&paths, "KLM4", "40k"))
+        );
+        assert!(
+            klm["paths"][1]
+                .as_str()
+                .unwrap()
+                .ends_with("KLM4/f0D40k.pth")
+        );
+        assert!(
+            nvc["paths"][0]
+                .as_str()
+                .unwrap()
+                .ends_with("NVC-Pretrained-Rage-ContentVec/f0G40k.pth")
+        );
+        assert_eq!(klm["installed"], false);
+        for item in data["catalog"].as_array().unwrap() {
+            for (i, key) in ["generator", "discriminator"].into_iter().enumerate() {
+                assert!(data[key].as_array().unwrap().contains(&item["paths"][i]));
             }
         }
-        _ => Ok(raw.to_owned()),
+        let [g, d] = pretrained_targets(&paths, "KLM4", "40k");
+        fs::create_dir_all(g.parent().unwrap())?;
+        File::create(&g)?;
+        let partial = choices(&paths, &query);
+        assert!(partial["installed"].as_array().unwrap().contains(&json!(g)));
+        assert!(!partial["installed"].as_array().unwrap().contains(&json!(d)));
+        File::create(&d)?;
+        let complete = choices(&paths, &query);
+        assert!(
+            complete["catalog"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"] == "KLM4" && item["installed"] == true)
+        );
+        let other = choices(&paths, &PretrainedQuery { f0: false, ..query });
+        assert!(other["catalog"].as_array().unwrap().is_empty());
+        Ok(())
     }
 }

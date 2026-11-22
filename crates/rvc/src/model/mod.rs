@@ -7,6 +7,7 @@ mod fcpe;
 mod fcpe_onnx;
 mod hubert;
 pub mod aperiodic;
+mod articulation;
 pub mod fx;
 pub mod gate;
 pub mod layers;
@@ -271,10 +272,11 @@ impl Default for ConversionSettings {
 }
 
 impl ConversionSettings {
-    fn envelope_strength(self, unvoiced: Unvoiced, uses_bands: bool) -> f32 {
-        // Stock RVC renders its own consonants. Models trained with explicit
-        // unvoiced boundaries or source bands can use source frication by default.
-        self.aperiodic.unwrap_or(if uses_bands || unvoiced == Unvoiced::Zero { 1.0 } else { 0.0 })
+    fn envelope_strength(self, unvoiced: Unvoiced, uses_bands: bool, profile: Option<u8>) -> f32 {
+        // The V3 event profile learned from the dry generator. An explicit
+        // strength can still select the earlier envelope processing before it.
+        let follows_source = profile != Some(3) && (uses_bands || unvoiced == Unvoiced::Zero);
+        self.aperiodic.unwrap_or(if follows_source { 1.0 } else { 0.0 })
     }
 
     pub fn validate(self) -> Result<()> {
@@ -423,11 +425,18 @@ impl Rvc {
     /// Whether file conversion can use the original recording at [`Self::rate`].
     /// Fricative envelope transfer also needs the top octave on models without band features.
     pub fn needs_hires(&self, settings: ConversionSettings) -> bool {
-        self.uses_bands() || (self.f0.is_some() && self.envelope_strength(settings) > 0.0)
+        self.uses_bands()
+            || self.synth.info.format.articulation.is_some()
+            || (self.f0.is_some() && self.envelope_strength(settings) > 0.0)
     }
 
     fn envelope_strength(&self, settings: ConversionSettings) -> f32 {
-        settings.envelope_strength(self.synth.info.format.f0_unvoiced, self.uses_bands())
+        let format = &self.synth.info.format;
+        settings.envelope_strength(
+            format.f0_unvoiced,
+            self.uses_bands(),
+            format.articulation.as_ref().map(|p| p.version),
+        )
     }
 
     /// Convert 16 kHz `samples`, with the same recording at the model rate in `hires`.
@@ -668,7 +677,24 @@ impl Rvc {
         } else {
             settings.resample_sr
         };
-        let mut samples = limit_peak(&audio::resample(&result, rate, rate_out), 0.99);
+        let mut limit = 0.99;
+        if let Some(profile) = &self.synth.info.format.articulation {
+            // The profile learned from the final waveform of the unmodified generator.
+            // Measure at the model rate before an optional output format conversion.
+            let resampled;
+            let source = match hires {
+                Some(samples) => samples,
+                None => {
+                    resampled = audio::resample(samples, ANALYSIS_RATE, rate);
+                    &resampled
+                }
+            };
+            result = limit_peak(&result, limit);
+            articulation::apply(&mut result, source, rate, profile, self.speaker);
+            measure("articulation");
+            limit = 0.995;
+        }
+        let mut samples = limit_peak(&audio::resample(&result, rate, rate_out), limit);
         for sample in &mut samples {
             *sample = (*sample * 32768.0).trunc() / 32768.0;
         }
@@ -774,6 +800,8 @@ impl Rvc {
         Ok(())
     }
 
+    /// Streaming runs the generator directly. File articulation profiles are
+    /// calibrated against the complete phrase's 90th-percentile level.
     pub fn convert_window(
         &mut self,
         samples: &[f32],
@@ -1187,13 +1215,22 @@ mod conversion_settings_tests {
     #[test]
     fn fricative_envelope_defaults_follow_the_model_and_honor_saved_values() {
         let auto: ConversionSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(auto.envelope_strength(Unvoiced::Interpolate, false), 0.0);
-        assert_eq!(auto.envelope_strength(Unvoiced::Zero, false), 1.0);
-        assert_eq!(auto.envelope_strength(Unvoiced::Interpolate, true), 1.0);
+        for profile in [None, Some(2)] {
+            assert_eq!(auto.envelope_strength(Unvoiced::Interpolate, false, profile), 0.0);
+            assert_eq!(auto.envelope_strength(Unvoiced::Zero, false, profile), 1.0);
+            assert_eq!(auto.envelope_strength(Unvoiced::Interpolate, true, profile), 1.0);
+        }
+        for mode in [Unvoiced::Interpolate, Unvoiced::Zero] {
+            for uses_bands in [false, true] {
+                assert_eq!(auto.envelope_strength(mode, uses_bands, Some(3)), 0.0);
+            }
+        }
         for (value, expected) in [("0", 0.0), ("0.5", 0.5), ("1", 1.0)] {
             let settings: ConversionSettings = serde_json::from_str(&format!(r#"{{"aperiodic":{value}}}"#)).unwrap();
             for mode in [Unvoiced::Interpolate, Unvoiced::Zero] {
-                assert_eq!(settings.envelope_strength(mode, false), expected);
+                for profile in [None, Some(2), Some(3)] {
+                    assert_eq!(settings.envelope_strength(mode, false, profile), expected);
+                }
             }
         }
     }

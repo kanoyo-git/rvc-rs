@@ -1,6 +1,6 @@
 [package]
 name = "rvc"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -11,7 +11,7 @@ required-features = ["realtime"]
 
 [features]
 default = ["inference", "realtime", "index-training"]
-inference = ["dep:tch", "dep:cc", "dep:ndarray", "dep:ndarray-npy", "dep:rustfft", "dep:rand", "dep:serde_yaml", "dep:sha2", "dep:base64", "dep:uuid", "dep:libloading", "dep:prost", "dep:tower-http", "dep:tokio-util", "tokio/fs", "tokio/io-util", "tokio/process"]
+inference = ["dep:tch", "dep:cc", "dep:ndarray", "dep:ndarray-npy", "dep:rustfft", "dep:rand", "dep:serde_yaml", "dep:sha2", "dep:base64", "dep:mega", "dep:percent-encoding", "dep:reqwest", "dep:scraper", "dep:uuid", "dep:libloading", "dep:prost", "dep:tower-http", "dep:tokio-util", "tokio/fs", "tokio/io-util", "tokio/process"]
 realtime = ["inference", "dep:cpal", "dep:rtrb", "dep:windows"]
 asio = ["realtime", "cpal/asio"]
 cuda-graph = ["inference"]
@@ -27,15 +27,19 @@ clap = { version = "4", features = ["derive"] }
 cpal = { version = "0.18.2", optional = true }
 hound = "3.5"
 libloading = { version = "0.8", optional = true }
+mega = { version = "0.8", optional = true }
 ndarray = { version = "0.17", optional = true }
 ndarray-npy = { version = "0.10", default-features = false, optional = true }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "api-24", "alternative-backend", "directml"], optional = true }
+percent-encoding = { version = "2", optional = true }
 prost = { version = "0.14", optional = true }
 rand = { version = "0.9", optional = true }
 rayon = "1"
 regex = "1"
+reqwest = { version = "0.12", features = ["cookies"], optional = true }
 rtrb = { version = "0.3", optional = true }
 rustfft = { version = "6", optional = true }
+scraper = { version = "0.24", default-features = false, optional = true }
 same-file = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -45,7 +49,7 @@ sha2 = { version = "0.10", optional = true }
 tch = { version = "0.20", optional = true }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["io"], optional = true }
+tokio-util = { version = "0.7", features = ["io", "compat"], optional = true }
 tower-http = { version = "0.6", features = ["fs"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
 walkdir = "2"

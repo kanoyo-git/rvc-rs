@@ -247,7 +247,7 @@ const PRETRAINED: &[(&str, Remote)] = &[
     (
         "assets/pretrained_v2/NVC-Pretrained/f0G40k.pth",
         Remote {
-            url: "https://huggingface.co/kanoyo/NVC-Pretrained/resolve/main/f0G40k.pth",
+            url: "https://huggingface.co/kanoyo/NVC-Pretrained/resolve/049489d65f0c26bd02589ed0e818a46dc7efffd7/f0G40k.pth",
             size: 73103601,
             sha256: "c225a44605e49dd504bd08ea6c9507188ac7d00d9474e8df2926e1bd27e59b2b",
         },
@@ -255,9 +255,25 @@ const PRETRAINED: &[(&str, Remote)] = &[
     (
         "assets/pretrained_v2/NVC-Pretrained/f0D40k.pth",
         Remote {
-            url: "https://huggingface.co/kanoyo/NVC-Pretrained/resolve/main/f0D40k.pth",
+            url: "https://huggingface.co/kanoyo/NVC-Pretrained/resolve/049489d65f0c26bd02589ed0e818a46dc7efffd7/f0D40k.pth",
             size: 142875513,
             sha256: "2c66d29628f30d52463ed7952229cec65a4bbf90327181853f2dc15fc95d5513",
+        },
+    ),
+    (
+        "assets/pretrained_v2/NVC-Pretrained-Rage-ContentVec/f0G40k.pth",
+        Remote {
+            url: "https://huggingface.co/kanoyo/NVC-Pretrained/resolve/ea0f8e4a894e564f86f0d4037514965b112f4ae0/f0G40k.pth",
+            size: 73107807,
+            sha256: "20900d74b2afe19174c9495fa8e9ca084f5213e9da9e3e8fc4c5a85de035c53d",
+        },
+    ),
+    (
+        "assets/pretrained_v2/NVC-Pretrained-Rage-ContentVec/f0D40k.pth",
+        Remote {
+            url: "https://huggingface.co/kanoyo/NVC-Pretrained/resolve/ea0f8e4a894e564f86f0d4037514965b112f4ae0/f0D40k.pth",
+            size: 142875703,
+            sha256: "6b6ab091e70801b28e3f41f335f2fc5f3f35c75b39ae2628d419644ec2b0fa09",
         },
     ),
 ];
@@ -450,14 +466,18 @@ fn plan_separation(paths: &Paths, preset: &str, out: &mut Vec<Missing>) -> Resul
     Ok(())
 }
 
-fn training_paths(paths: &Paths, request: &train::Request) -> Vec<std::path::PathBuf> {
+fn training_paths(paths: &Paths, request: &train::Request) -> Result<Vec<std::path::PathBuf>> {
+    let experiment = paths.root.join(&request.experiment);
+    if experiment.is_dir() && train::has_checkpoint_pair(&experiment)? {
+        return Ok(Vec::new());
+    }
     let rate = request.sample_rate / 1000;
     let prefix = if request.f0 { "f0" } else { "" };
     let directory = match request.version {
         crate::model::train_data::Version::V2 => "pretrained_v2",
         crate::model::train_data::Version::V1 => "pretrained",
     };
-    [("G", &request.pretrained_g), ("D", &request.pretrained_d)]
+    Ok([("G", &request.pretrained_g), ("D", &request.pretrained_d)]
         .into_iter()
         .filter_map(|(kind, custom)| match custom {
             Some(path) if !path.as_os_str().is_empty() => Some(paths.root.join(path)),
@@ -471,7 +491,7 @@ fn training_paths(paths: &Paths, request: &train::Request) -> Vec<std::path::Pat
                     .join(format!("{prefix}{kind}{rate}k.pth")),
             ),
         })
-        .collect()
+        .collect())
 }
 
 fn known(paths: &Paths, path: &Path) -> Option<&'static Remote> {
@@ -512,7 +532,7 @@ pub fn missing(paths: &Paths, needs: &[Need]) -> Result<Vec<Missing>> {
                 if !paths.experiments.join("mute").join("0_gt_wavs").is_dir() {
                     out.push(Missing::remote("mute.zip", &MUTE));
                 }
-                for path in training_paths(paths, request) {
+                for path in training_paths(paths, request)? {
                     if !path.is_file()
                         && let Some(remote) = known(paths, &path)
                     {
@@ -738,6 +758,36 @@ pub fn pretrained(
     }
 }
 
+/// Fetch the stock multi-speaker generator for input-only training augmentation.
+/// A user's replacement at the usual pretrained path remains available for training.
+pub(crate) fn paired_donor(
+    paths: &Paths,
+    cache: &Path,
+    report: &mut impl FnMut(&str) -> ControlFlow<()>,
+) -> Result<(std::path::PathBuf, &'static str)> {
+    let standard = paths.root.join("assets/pretrained_v2/f0G40k.pth");
+    let remote = known(paths, &standard).context("missing stock donor resource")?;
+    let digest = |path: &Path| -> Result<String> {
+        let mut hasher = Sha256::new();
+        io::copy(&mut File::open(path)?, &mut hasher)?;
+        Ok(format!("{:x}", hasher.finalize()))
+    };
+    if !standard.exists() {
+        fetch(&standard, remote, report)?;
+    }
+    if digest(&standard)? == remote.sha256 {
+        return Ok((standard, remote.sha256));
+    }
+    let isolated = cache.join(format!("{}.pth", remote.sha256));
+    fetch(&isolated, remote, report)?;
+    ensure!(
+        digest(&isolated)? == remote.sha256,
+        "paired training donor checksum mismatch in {}",
+        isolated.display()
+    );
+    Ok((isolated, remote.sha256))
+}
+
 /// Paths of every pretrained checkpoint this module can download.
 pub fn known_pretrained(paths: &Paths) -> Vec<std::path::PathBuf> {
     PRETRAINED
@@ -774,7 +824,7 @@ pub fn training(
     report: &mut impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<()> {
     mute(paths, report)?;
-    for path in training_paths(paths, request) {
+    for path in training_paths(paths, request)? {
         pretrained(paths, &path, report)?;
     }
     Ok(())

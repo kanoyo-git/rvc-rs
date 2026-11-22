@@ -493,26 +493,37 @@ fn extract(
                 if hubert.is_none() {
                     hubert = Some(Hubert::load(&input.hubert_root, device, kind, true)?);
                 }
-                let x = hubert
-                    .as_ref()
-                    .context("HuBERT unavailable")?
-                    .extract(&wave, input.v2)?;
-                let n = x.size()[1] as usize;
-                let values =
-                    Vec::<f32>::try_from(x.to_kind(Kind::Float).to_device(Device::Cpu).view([-1]))?;
-                ensure!(
-                    values.iter().all(|v| v.is_finite()),
-                    "HuBERT returned non-finite values"
-                );
-                npy(
+                write_features(
+                    hubert.as_ref().context("HuBERT unavailable")?,
+                    &wave,
+                    input.v2,
+                    input.dims,
                     &feature_file,
-                    &Array2::from_shape_vec((n, input.dims), values)?,
                 )?;
                 report.features += 1;
             }
         }
         Ok(report)
     })
+}
+
+pub(super) fn write_features(
+    hubert: &Hubert,
+    wave: &[f32],
+    v2: bool,
+    dims: usize,
+    path: &Path,
+) -> Result<()> {
+    let features = hubert.extract(wave, v2)?;
+    let rows = features.size()[1] as usize;
+    let values = Vec::<f32>::try_from(
+        features.to_kind(Kind::Float).to_device(Device::Cpu).view([-1]),
+    )?;
+    ensure!(
+        values.iter().all(|v| v.is_finite()),
+        "HuBERT returned non-finite values"
+    );
+    npy(path, &Array2::from_shape_vec((rows, dims), values)?)
 }
 
 fn npy(path: &Path, data: &impl WriteNpyExt) -> Result<()> {

@@ -17,3 +17,7 @@ RVC-RS — самостоятельная реализация функций и
 ## RVC Realtime VST
 
 При переносе плагина сохранена совместимость форматов пресетов и настроек исходного RVC Realtime VST от RVC-BOSS. [Лицензия RVC Realtime VST](licenses/rvc-realtime-vst.txt)
+
+## Загрузка по ссылке
+
+Для HTTP-загрузок и разбора страниц Studio использует reqwest, percent-encoding и scraper. Файлы MEGA расшифровывает mega-rs. [Лицензии компонентов](licenses/shared-links.txt)

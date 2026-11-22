@@ -1,8 +1,8 @@
 {
   "NVC-Pretrained": {
     "40k": {
-      "G": "kanoyo/NVC-Pretrained/resolve/main/f0G40k.pth",
-      "D": "kanoyo/NVC-Pretrained/resolve/main/f0D40k.pth"
+      "G": "kanoyo/NVC-Pretrained/resolve/ea0f8e4a894e564f86f0d4037514965b112f4ae0/f0G40k.pth",
+      "D": "kanoyo/NVC-Pretrained/resolve/ea0f8e4a894e564f86f0d4037514965b112f4ae0/f0D40k.pth"
     }
   },
   "RVC v2": {

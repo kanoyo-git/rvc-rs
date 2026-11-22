@@ -1,6 +1,7 @@
 pub(super) mod activation;
 mod ema;
 pub(crate) mod events;
+pub(super) mod paired;
 mod parallel;
 mod precision;
 mod step;
@@ -26,7 +27,7 @@ use super::train_losses::{
     self, MelConfig, MelSpectrogram, MultiResolutionStft, MultiScaleMel, PhoneticLoss,
 };
 use super::weights;
-use crate::catalog::{Embedder, Paths, Unvoiced};
+use crate::catalog::{ArticulationProfile, Embedder, Paths, Unvoiced};
 use crate::checkpoint::{
     Checkpoint,
     write::{self, Value},
@@ -389,13 +390,42 @@ fn run_on_devices(
         "multi-scale mel requires training segments longer than 1024 samples"
     );
     dataset.configure_timbre(paths, &experiment, &mut config, device, &mut progress)?;
+    if let Some((g, _)) = &resume {
+        config.model.paired_content = paired::version(g)?;
+        if let Some(profile) = ArticulationProfile::from_generator(g)? {
+            config.model.articulation = Some(profile);
+        }
+    } else {
+        let architecture = pretrained_architecture(paths, &request)?;
+        config.model.hf_bands = request.hf_bands || architecture.bands;
+        config.model.dec_aa = request.dec_aa || architecture.anti_alias;
+        config.model.articulation = architecture.articulation;
+        config.model.paired_content = architecture.paired_content;
+    }
+    if resume.is_none()
+        && let Some(profile) = &mut config.model.articulation
+        && let Some(frication) = &mut profile.frication
+    {
+        notify(&mut progress, "Measuring breath and fricative spectra in each training speaker")?;
+        frication.targets = super::articulation::frication::fit(
+            dataset.frication_sources(), request.sample_rate, &profile.detector,
+        )?;
+    }
     if let Some(directory) = &request.layer_aug {
         dataset.configure_layers(paths.root.join(directory), request.layer_aug_prob)?;
-    }
-    if resume.is_none() {
-        let (bands, aa) = pretrained_architecture(paths, &request)?;
-        config.model.hf_bands = request.hf_bands || bands;
-        config.model.dec_aa = request.dec_aa || aa;
+    } else if config.model.paired_content != 0 {
+        let pairs = paired::prepare(
+            paths,
+            &experiment,
+            config.model.paired_content,
+            dataset.paired_sources(),
+            version,
+            embedder,
+            request.sample_rate,
+            device,
+            &mut progress,
+        )?;
+        dataset.set_paired_sources(pairs, config.model.hf_bands);
     }
     config.save(&experiment)?;
     let train = &config.train;
@@ -610,6 +640,13 @@ fn run_on_devices(
         c_stft: request.stft_loss,
         c_phonetic: request.phonetic_loss,
     };
+    // A GPU batch contains one specific draw of the input features. Reusing that
+    // batch every epoch would freeze the clean/alternate choice for each clip.
+    let dynamic_pairs = config.model.paired_content != 0 && request.layer_aug.is_none();
+    let cache_batches = request.cache_data_in_gpu && !dynamic_pairs;
+    if request.cache_data_in_gpu && dynamic_pairs {
+        notify(&mut progress, "Rebuilding paired inputs each epoch to resample clean and augmented features")?;
+    }
     let mut cached = Vec::new();
     let mut profile = Profile::new(device);
     for epoch in first..=request.epochs {
@@ -618,7 +655,7 @@ fn run_on_devices(
         } else {
             Vec::new()
         };
-        if request.cache_data_in_gpu && cached.is_empty() {
+        if cache_batches && cached.is_empty() {
             for (index, indices) in batches.iter().enumerate() {
                 notify(
                     &mut progress,
@@ -650,7 +687,7 @@ fn run_on_devices(
             let count = replica.prepare_epoch(
                 &dataset,
                 batches,
-                request.cache_data_in_gpu,
+                cache_batches,
                 |index| batch_seed(train.seed, epoch, index, rank + 1),
                 &mut progress,
             )?;
@@ -880,6 +917,8 @@ fn run_on_devices(
                 (&d, discriminator.state_dict()),
                 train.learning_rate,
                 config.model.dec_aa,
+                config.model.articulation.as_ref(),
+                config.model.paired_content,
             )?;
             if request.save_weights {
                 let path = paths.weights.join(format!("{name}_e{epoch}_s{global}.pth"));
@@ -1313,10 +1352,17 @@ pub(crate) fn resume_info(experiment: &Path) -> Result<ResumeInfo> {
     Ok(info)
 }
 
-/// Whether the pretrained generator has band conditioning and anti-aliased activations.
-fn pretrained_architecture(paths: &Paths, request: &Request) -> Result<(bool, bool)> {
+#[derive(Default)]
+struct PretrainedArchitecture {
+    bands: bool,
+    anti_alias: bool,
+    articulation: Option<ArticulationProfile>,
+    paired_content: u8,
+}
+
+fn pretrained_architecture(paths: &Paths, request: &Request) -> Result<PretrainedArchitecture> {
     let Some(model) = pretrained_path(paths, request, "G") else {
-        return Ok((false, false));
+        return Ok(PretrainedArchitecture::default());
     };
     let checkpoint = Checkpoint::open(&model)?;
     let section = if checkpoint.has("model") {
@@ -1334,7 +1380,12 @@ fn pretrained_architecture(paths: &Paths, request: &Request) -> Result<(bool, bo
             .metadata("dec_aa")?
             .and_then(|value| value.as_bool()))
         .unwrap_or(false);
-    Ok((bands, aa))
+    Ok(PretrainedArchitecture {
+        bands,
+        anti_alias: aa,
+        articulation: ArticulationProfile::from_generator(&checkpoint)?,
+        paired_content: paired::version(&checkpoint)?,
+    })
 }
 
 fn pretrained_path(paths: &Paths, request: &Request, kind: &str) -> Option<PathBuf> {
@@ -1427,6 +1478,8 @@ fn save_pair(
     d: Save<'_>,
     initial_rate: f64,
     dec_aa: bool,
+    articulation: Option<&ArticulationProfile>,
+    paired_content: u8,
 ) -> Result<()> {
     let staging = tempfile::TempDir::new_in(experiment)?;
     let names = checkpoint_names(suffix);
@@ -1441,6 +1494,14 @@ fn save_pair(
         if dec_aa {
             // Lets a run that starts from this checkpoint as pretrained keep the decoder layout.
             entries.push(("dec_aa".into(), json!(true).into()));
+        }
+        if filename == &names[0]
+            && let Some(profile) = articulation
+        {
+            entries.push(("articulation".into(), json!(profile).into()));
+        }
+        if filename == &names[0] && paired_content != 0 {
+            entries.push(("paired_content".into(), json!(paired_content).into()));
         }
         let data = Value::Dict(entries);
         write::write(&staging.path().join(filename), &data, false)?;
@@ -1549,6 +1610,8 @@ mod tests {
                 (&optimizer, parameters()),
                 0.02,
                 false,
+                None,
+                0,
             )
         };
 

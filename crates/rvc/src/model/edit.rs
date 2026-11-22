@@ -6,7 +6,7 @@ use serde_json::{Value as Json, json};
 use tch::{Device, Kind, Tensor};
 
 use super::train_data::{Config, Version};
-use crate::catalog::{Unvoiced, VoiceFormat};
+use crate::catalog::{ArticulationProfile, Unvoiced, VoiceFormat};
 use crate::checkpoint::{
     Checkpoint,
     write::{self, Key, Value},
@@ -42,11 +42,15 @@ pub fn extract(path: &Path, output: &Path, options: Export<'_>) -> Result<()> {
         } else {
             None
         };
-        let config = Config::load(
+        let mut config = Config::load(
             path.parent().unwrap_or_else(|| Path::new(".")),
             options.version,
             options.sample_rate,
         )?;
+        if let Some(profile) = ArticulationProfile::from_generator(&checkpoint)? {
+            config.model.articulation = Some(profile);
+        }
+        config.model.paired_content = super::train::paired::version(&checkpoint)?;
         let state = checkpoint.weights(section, Device::Cpu)?;
         compact(output, &config, state, options)
     })
@@ -271,6 +275,9 @@ pub fn compact(
         ("info".into(), json!(options.description)),
         ("version".into(), json!(options.version.name())),
     ]);
+    if config.model.paired_content != 0 {
+        metadata.insert("paired_content".into(), json!(config.model.paired_content));
+    }
     if !config.speaker_info.is_empty() {
         metadata.insert("speaker_info".into(), json!(config.speaker_info));
     }
@@ -280,6 +287,7 @@ pub fn compact(
         || config.data.default_noise_scale != 0.66666
         || config.model.dec_aa
         || config.model.hf_bands
+        || config.model.articulation.is_some()
     {
         let augmentation = config
             .data
@@ -292,7 +300,7 @@ pub fn compact(
                 })
             });
         metadata.insert("embedder_model".into(), json!(embedder));
-        metadata.insert("nvc".into(), json!({
+        let mut nvc = json!({
             "format": "nvc", "format_version": 1,
             "architecture": format!("rvc-{}-{}", options.version.name(), if options.uses_f0 { "nsf" } else { "nono" }),
             "embedder": embedder, "sample_rate": options.sample_rate,
@@ -300,7 +308,11 @@ pub fn compact(
             "f0_unvoiced": config.data.f0_unvoiced, "content_aug": augmentation,
             "default_noise_scale": config.data.default_noise_scale,
             "dec_aa": config.model.dec_aa, "hf_bands": config.model.hf_bands,
-        }));
+        });
+        if let Some(profile) = &config.model.articulation {
+            nvc["articulation"] = json!(profile);
+        }
+        metadata.insert("nvc".into(), nvc);
     }
     let state: BTreeMap<_, _> = state
         .into_iter()

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tch::{Device, Kind, Tensor};
 
-use crate::catalog::{Embedder, Unvoiced};
+use crate::catalog::{ArticulationProfile, Embedder, Unvoiced};
 use crate::{audio, dataset};
 
 use super::{coarse_pitch, extract::RAW_F0, timbre};
@@ -146,8 +146,17 @@ pub struct ModelConfig {
     /// Anti-aliased decoder activations.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dec_aa: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub articulation: Option<ArticulationProfile>,
+    /// Version of the input-only, paired speaker augmentation recipe.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub paired_content: u8,
     #[serde(flatten)]
     other: BTreeMap<String, Value>,
+}
+
+fn is_zero(value: &u8) -> bool {
+    *value == 0
 }
 
 impl Config {
@@ -187,6 +196,9 @@ impl Config {
                 && parsed.train.segment_size >= parsed.data.hop_length,
             "invalid training window or segment size"
         );
+        if let Some(profile) = &parsed.model.articulation {
+            profile.validate()?;
+        }
         Ok(parsed)
     }
 }
@@ -434,6 +446,8 @@ pub struct Dataset {
     mute_dir: Option<PathBuf>,
     /// Layered copy of the clips (see `model::layers`) and how often to read it.
     layers: Option<(PathBuf, f64)>,
+    /// Source wave and phone features of each paired example, indexed by clean WAV.
+    pairs: BTreeMap<PathBuf, (Option<PathBuf>, PathBuf)>,
 }
 
 impl Dataset {
@@ -520,6 +534,7 @@ impl Dataset {
             uses_f0,
             augment: None,
             layers: None,
+            pairs: BTreeMap::new(),
             mute_dir: None,
         })
     }
@@ -540,6 +555,35 @@ impl Dataset {
 
     pub fn sample_count(&self) -> usize {
         self.records.len()
+    }
+
+    pub(super) fn paired_sources(&self) -> BTreeSet<PathBuf> {
+        self.records
+            .iter()
+            .filter(|record| self.mute_dir.as_ref().is_none_or(|mute| !record.wave.starts_with(mute)))
+            .map(|record| record.wave.clone())
+            .collect()
+    }
+
+    /// Clean recordings grouped by the same speaker ID the voice will receive at inference.
+    pub(super) fn frication_sources(&self) -> BTreeMap<i64, BTreeSet<PathBuf>> {
+        let mut sources = BTreeMap::<_, BTreeSet<_>>::new();
+        for record in &self.records {
+            if self.mute_dir.as_ref().is_none_or(|mute| !record.wave.starts_with(mute)) {
+                sources.entry(record.sid).or_default().insert(record.wave.clone());
+            }
+        }
+        sources
+    }
+
+    pub(super) fn set_paired_sources(
+        &mut self,
+        pairs: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
+        source_bands: bool,
+    ) {
+        self.pairs = pairs.into_iter()
+            .map(|(clean, (wave, phone))| (clean, (source_bands.then_some(wave), phone)))
+            .collect();
     }
 
     /// Read content features, F0 and source bands from the layered copy in
@@ -791,11 +835,14 @@ impl Dataset {
             .filter(|(_, probability)| !mute && rng.random_bool(*probability))
             .and_then(|(directory, _)| self.layered(clean, directory));
         let record = layered.as_ref().unwrap_or(clean);
-        let band_wave = layered
-            .as_ref()
-            .map(|layered| waveform(&layered.wave, self.data.sampling_rate))
+        let pair = self.pairs.get(&clean.wave).filter(|_| rng.random_bool(0.72));
+        let phone_path = pair.map_or(&record.phone, |(_, phone)| phone);
+        let band_wave = pair
+            .and_then(|(wave, _)| wave.as_ref())
+            .or_else(|| layered.as_ref().map(|record| &record.wave))
+            .map(|path| waveform(path, self.data.sampling_rate))
             .transpose()?;
-        let mut features: Array2<f32> = float_array(&record.phone)?;
+        let mut features: Array2<f32> = float_array(phone_path)?;
         if let Some(augment) = self.augment.as_ref().filter(|_| !mute) {
             augment.mix(&clean.phone, &mut features, rng)?;
         }
@@ -803,7 +850,7 @@ impl Dataset {
         ensure!(
             features.ncols() == dims as usize,
             "expected {dims} HuBERT channels ({})",
-            record.phone.display()
+            phone_path.display()
         );
         let feature_frames = (features
             .nrows()
@@ -1159,6 +1206,35 @@ fn waveform(path: &Path, rate: u32) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_batches_keep_clean_wave_pitch_and_speaker_on_every_draw() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let root = project.path();
+        let clean = root.join("clean.wav");
+        let paired_wave = root.join("other.wav");
+        let paired_phone = root.join("other.npy");
+        fs::write(&clean, audio::encode_wav(&[0.25; 8000], 40_000, false)?)?;
+        fs::write(&paired_wave, audio::encode_wav(&[-0.20; 8000], 40_000, false)?)?;
+        ndarray_npy::write_npy(root.join("clean.npy"), &Array2::<f32>::ones((10, 768)))?;
+        ndarray_npy::write_npy(&paired_phone, &Array2::<f32>::from_elem((10,768), 2.0))?;
+        ndarray_npy::write_npy(root.join("coarse.npy"), &Array1::<i64>::from_elem(20, 80))?;
+        ndarray_npy::write_npy(root.join("hz.npy"), &Array1::<f32>::from_elem(20, 180.0))?;
+        let config = Config::load(root, Version::V2, 40_000)?;
+        let mut dataset=Dataset::from_text("clean.wav|clean.npy|coarse.npy|hz.npy|7", &config.data, Version::V2, true, root)?;
+        dataset.set_paired_sources(BTreeMap::from([(clean.clone(),(paired_wave,paired_phone))]), false);
+        let mut seen=[false; 2];
+        for seed in 0..32 {
+            let staged=dataset.stage_example(&dataset.records[0],&mut StdRng::seed_from_u64(seed))?;
+            let value=staged.phone.double_value(&[0,0]);
+            assert!(value==1.0 || value==2.0); seen[(value as usize)-1]=true;
+            assert_eq!(staged.sid,7); assert_eq!(staged.wave.double_value(&[0,0]),8192.0);
+            let (coarse,hz)=staged.pitch.unwrap(); assert_eq!(coarse.int64_value(&[0]),80);assert_eq!(hz.double_value(&[0]),180.0);
+            assert!(staged.band_wave.is_none());
+        }
+        assert_eq!(seen,[true,true]);
+        Ok(())
+    }
 
     #[test]
     fn prepare_keeps_existing_filelist_and_resolves_project_relative_paths() -> Result<()> {

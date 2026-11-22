@@ -40,14 +40,15 @@ rvc cover --model assets/weights/voice.pth --input song.flac --output covers/
 rvc separate --input song.flac --output stems/ --preset vocals-bs-roformer-368
 ```
 
-Обучение голоса из CLI:
+Для обучения голоса с опубликованным NVC-Pretrained используйте ContentVec при извлечении признаков и обучении.
 
 ```bash
 rvc preprocess --input dataset/ --experiment logs/my-voice --sample-rate 40000
-rvc extract --experiment logs/my-voice --embedder mhubert147 --f0-method rmvpe
-rvc train --experiment logs/my-voice --embedder mhubert147 --epochs 200 --save-weights \
-  --pretrained-g assets/pretrained_v2/NVC-Pretrained/f0G40k.pth \
-  --pretrained-d assets/pretrained_v2/NVC-Pretrained/f0D40k.pth
+rvc extract --experiment logs/my-voice --embedder hubert_base --f0-method rmvpe
+rvc train --experiment logs/my-voice --embedder hubert_base --sample-rate 40000 \
+  --epochs 60 --batch-size 8 --save-every 60 --save-weights --unvoiced-f0 zero \
+  --pretrained-g assets/pretrained_v2/NVC-Pretrained-Rage-ContentVec/f0G40k.pth \
+  --pretrained-d assets/pretrained_v2/NVC-Pretrained-Rage-ContentVec/f0D40k.pth
 rvc train-index --experiment logs/my-voice
 ```
 
@@ -67,7 +68,8 @@ rvc train-index --experiment logs/my-voice
 | NMVPE | [kanoyo/nvc_resources](https://huggingface.co/kanoyo/nvc_resources) |
 | mHuBERT-147, ContentVec, SPIN | Hugging Face (utter-project, IAHispano/Applio) |
 | FCPE | пакет [torchfcpe 0.0.4](https://pypi.org/project/torchfcpe/0.0.4/) на PyPI |
-**NVC-Pretrained** (GPL-3.0) — претрейн 40 кГц на признаках mHuBERT-147, дообученный на русской речи и пении, а также на крике, скриме и гроуле. Голоса от него обучайте с `--embedder mhubert147`, без `--layer-aug`.
+
+**NVC-Pretrained** (GPL-3.0) использует ContentVec (`hubert_base`) и обучен на вокале, включая рейдж. В Studio и Colab выберите его для обучения на 40 кГц. Генератор включает парные входы через метаданные весов. Новая пара скачивается в `assets/pretrained_v2/NVC-Pretrained-Rage-ContentVec/`. Каталог `assets/pretrained_v2/NVC-Pretrained/` хранит прежнюю версию для экспериментов с mHuBERT-147.
 
 ## Документация
 

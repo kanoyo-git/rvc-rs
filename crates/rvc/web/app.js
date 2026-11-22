@@ -9,6 +9,8 @@ let live;
 let activeJob;
 let metrics = {};
 let datasetPath;
+let datasetUploading = false;
+let datasetPaths;
 let experiments = { runs: [], resumable: [], all: [] };
 const fileList = (id) => [...document.getElementById(id).files];
 const fileName = (path) => String(path).split(/[\\/]/).pop();
@@ -546,8 +548,9 @@ action("runLib", "libLog", async output => {
   const name = value("libName");
   const settings = pair ? {
     operation: "pretrained", name: requireValue(name, "chooseImportName"), sample_rate: number("libRate"),
-    generator: requireValue(value("libGUrl"), "chooseUrl"), discriminator: requireValue(value("libDUrl"), "chooseUrl"),
+    generator: value("libGUrl").trim() || null, discriminator: value("libDUrl").trim() || null,
   } : { operation: "import", name: name || null, url: value("libUrl") || null };
+  if (pair && !settings.generator && !settings.discriminator) throw new Error(t("chooseUrl"));
   const result = await runJob(settings, pair ? [] : fileList("libFile"), output, "stopLib");
   if (result) {
     log(output, result.paths.join("\n"));
@@ -598,6 +601,7 @@ function configTraining() {
 
 function prepParams() {
   const source = radio("mode");
+  if (source !== "manifest" && datasetUploading) throw new Error(t("waitForDataset"));
   return {
     source, input: source === "manifest" ? null : requireValue(value("trainset"), "chooseDataset"),
     workers: number("cpuWorkers"), segment_seconds: number("segmentSeconds"),
@@ -622,6 +626,7 @@ const checkpointing = (id) => value(id) ? value(id) === "true" : null;
 const list = (text) => text.split(",").map(item => item.trim()).filter(Boolean);
 
 function trainParams() {
+  if (loadedPretrainedQuery !== pretrainedQuery()) throw new Error(t("loadingPretrained"));
   const config = configTraining();
   const timbre = value("timbreMode");
   const pool = timbre === "pool" ? requireValue(value("timbrePool"), "chooseFeaturePool") : null;
@@ -654,6 +659,10 @@ function trainParams() {
 
 function syncTrainingControls() {
   const source = radio("mode");
+  if (datasetPaths && source !== "manifest" && value("trainset") === datasetPath) {
+    datasetPath = datasetPaths[source];
+    $("#trainset").value = datasetPath;
+  }
   $("#multiHelp").hidden = source !== "multi_folder";
   $("#spkWrap").hidden = source !== "single";
   $("#trainsetWrap").hidden = source === "manifest";
@@ -683,22 +692,30 @@ let datasetRevision = 0;
 listen("#trainsetZip", "change", async () => {
   const revision = ++datasetRevision;
   const files = fileList("trainsetZip");
-  if (!files.length) {
-    if (value("trainset") === datasetPath) $("#trainset").value = "";
-    return;
-  }
+  if (value("trainset") === datasetPath) $("#trainset").value = "";
+  datasetPath = undefined;
+  datasetPaths = undefined;
+  datasetUploading = false;
+  if (!files.length) return;
   const output = $("#preLog");
   const original = value("trainset");
+  const archive = files.length === 1 && /\.zip$/i.test(files[0].name);
+  const mode = radio("mode");
   try {
-    const data = await upload("/api/studio/dataset", null, files, pct => {
+    if (!archive && files.some(file => /\.zip$/i.test(file.name))) throw new Error(t("chooseDatasetUpload"));
+    datasetUploading = true;
+    const data = await upload("/api/studio/dataset", { mode }, files, pct => {
       if (revision === datasetRevision) log(output, `${t("uploading")} · ${pct}%`);
     });
     if (revision !== datasetRevision) return;
-    datasetPath = data.path;
+    datasetPaths = data;
+    datasetPath = data[radio("mode")] || data.path;
     if (value("trainset") === original) $("#trainset").value = datasetPath;
     log(output, `${t("datasetReady")} ${datasetPath}`);
   } catch (error) {
     if (revision === datasetRevision) explain(error, output);
+  } finally {
+    if (revision === datasetRevision) datasetUploading = false;
   }
 });
 
@@ -760,22 +777,45 @@ action("runAll", "trainLog", async output => {
 
 let pretrainedRevision = 0;
 let loadedPretrainedQuery;
-function syncPretrainedPaths() {
+let pretrainedSets = [];
+const selectedSet = () => pretrainedSets.find(item => item.id === value("preCatalog"));
+const pretrainedQuery = () => new URLSearchParams({
+  version: value("trainVersion"), sample_rate: parseInt(radio("sr"), 10) * 1000, f0: radio("ifF0") === "1",
+}).toString();
+
+function syncPretrained() {
   for (const id of ["preG", "preD"]) $("#" + id + "PathWrap").hidden = value(id) !== "custom";
+  const pair = pretrainedSets.find(item => item.paths[0] === value("preG") && item.paths[1] === value("preD"));
+  $("#preCatalog").value = pair?.id ?? (value("preG") || value("preD") ? "manual" : "none");
+  $("#downloadPretrained").disabled = !pair?.downloadable || pair.installed;
+  syncNvcPretrained();
 }
-listen("#preG, #preD", "change", syncPretrainedPaths);
-async function loadPretrained(preferred) {
+
+async function loadPretrained() {
   const revision = ++pretrainedRevision;
-  const query = new URLSearchParams({
-    version: value("trainVersion"), sample_rate: parseInt(radio("sr"), 10) * 1000,
-    f0: radio("ifF0") === "1",
-  });
+  const query = pretrainedQuery();
   const data = await api("/api/studio/pretrained?" + query);
   if (revision !== pretrainedRevision) return;
-  const keep = query.toString() === loadedPretrainedQuery;
-  loadedPretrainedQuery = query.toString();
-  const installed = new Set(data.installed || []);
-  const makeOptions = paths => [
+  const old = selectedSet();
+  const sameQuery = query === loadedPretrainedQuery;
+  const installed = new Set(data.installed);
+  pretrainedSets = data.catalog.map(item => ({
+    ...item, id: item.name, downloadable: true,
+  }));
+  const discriminators = new Set(data.discriminator);
+  for (const g of data.generator) {
+    const d = g.replace(/([\\/])(f0)?G(\d+k\.pth)$/i, "$1$2D$3");
+    if (!discriminators.has(d) || pretrainedSets.some(item => item.paths[0] === g)) continue;
+    const folder = g.split(/[\\/]/).at(-2);
+    const label = g === data.default_generator ? "RVC " + value("trainVersion")
+      : folder === "NVC-Pretrained" ? folder + " · mHuBERT-147" : folder;
+    pretrainedSets.push({ id: "local:" + g, name: label, paths: [g, d],
+      installed: installed.has(g) && installed.has(d), downloadable: false });
+  }
+  const selectPaths = sameQuery ? [value("preG"), value("preD")]
+    : (old?.downloadable && pretrainedSets.find(item => item.id === old.id)?.paths)
+      || [data.default_generator, data.default_discriminator];
+  const options = paths => [
     { value: "", key: "noPretrained" },
     ...paths.map(path => ({
       value: path,
@@ -783,15 +823,30 @@ async function loadPretrained(preferred) {
     })),
     { value: "custom", key: "pretrainedPath" },
   ];
-  fill($("#preG"), makeOptions(data.generator), preferred?.[0] ?? (keep ? value("preG") : data.default_generator) ?? "");
-  fill($("#preD"), makeOptions(data.discriminator), preferred?.[1] ?? (keep ? value("preD") : data.default_discriminator) ?? "");
-  fill($("#preCatalog"), data.catalog.length ? data.catalog.map(item => ({
-    value: item.name, label: item.name + (item.installed ? " · " + t("installed") : ""),
-  })) : [{ value: "", key: "catalogEmpty" }]);
-  $("#downloadPretrained").disabled = !data.catalog.length;
-  syncPretrainedPaths();
-  syncNvcPretrained();
+  fill($("#preG"), options(data.generator), selectPaths[0] || "");
+  fill($("#preD"), options(data.discriminator), selectPaths[1] || "");
+  fill($("#preCatalog"), [
+    ...pretrainedSets.map(item => ({ value: item.id, label: item.name + (item.installed ? " · " + t("installed") : "") })),
+    { value: "none", key: "noPretrained" }, { value: "manual", key: "manualPretrained" },
+  ]);
+  loadedPretrainedQuery = query;
+  syncPretrained();
 }
+listen("#preCatalog", "change", () => {
+  const pair = selectedSet();
+  const fallback = value("preCatalog") === "manual" ? "custom" : "";
+  $("#preG").value = pair?.paths[0] ?? fallback;
+  $("#preD").value = pair?.paths[1] ?? fallback;
+  syncPretrained();
+});
+listen("#preG", "change", () => {
+  if (selectedSet()) {
+    const pair = pretrainedSets.find(item => item.paths[0] === value("preG"));
+    if (pair) $("#preD").value = pair.paths[1];
+  }
+  syncPretrained();
+});
+listen("#preGPath, #preD, #preDPath", "change", syncPretrained);
 // The full recipe NVC-Pretrained voices were checked with (preprocess, extract and train).
 // Anything not listed there ran with the CLI defaults, set here explicitly.
 const NVC_RECIPE = {
@@ -803,8 +858,21 @@ const NVC_RECIPE = {
   multiScaleMel: false, mrdDisc: false, decAa: false, freshStart: false,
   stftLoss: 0, phoneticLoss: 0, phoneticEncoder: "mhubert147", trainOnly: "", timbreMode: "off",
 };
-function applyNvcRecipe() {
-  for (const [id, setting] of Object.entries(NVC_RECIPE)) {
+const CONTENTVEC_RECIPE = { ...NVC_RECIPE, trainEmbedder: "hubert_base", hfBands: false, unvoicedF0: "zero", totalEpoch: 60, saveEvery: 60 };
+const NVC_PRETRAINS = new Map([
+  ["NVC-Pretrained", { settings: NVC_RECIPE, hint: "nvcPretrainedHint" }],
+  ["NVC-Pretrained-Rage-ContentVec", { settings: CONTENTVEC_RECIPE, hint: "contentvecNvcPretrainedHint" }],
+]);
+
+function readRecipeSettings() {
+  return Object.fromEntries(Object.keys(NVC_RECIPE).map(id => {
+    const input = $("#" + id);
+    return [id, input ? (input.type === "checkbox" ? input.checked : input.value) : radio(id)];
+  }));
+}
+
+function applyNvcRecipe(settings) {
+  for (const [id, setting] of Object.entries(settings)) {
     const radios = $$(`input[type=radio][name="${id}"]`);
     if (radios.length) {
       const match = radios.find(input => input.value === setting && !input.disabled);
@@ -820,21 +888,45 @@ function applyNvcRecipe() {
   }
   syncTrainingControls();
 }
-// Applied when NVC-Pretrained becomes the selected pretrain, so later edits stay.
-let nvcSelected = false;
+let activeRecipe;
+let beforeRecipe;
+let appliedRecipe;
 function syncNvcPretrained() {
-  const nvc = /NVC-Pretrained/.test(value("preG"));
-  $("#nvcPretrainedHint").hidden = !nvc;
-  if (nvc && !nvcSelected) applyNvcRecipe();
-  nvcSelected = nvc;
+  const path = value("preG") === "custom" ? value("preGPath") : value("preG");
+  const recipe = NVC_PRETRAINS.get(path.split(/[\\/]/).at(-2));
+  const hint = $("#nvcPretrainedHint");
+  hint.hidden = !recipe;
+  if (recipe) {
+    hint.dataset.i18n = recipe.hint;
+    hint.textContent = t(recipe.hint);
+  }
+  if (recipe === activeRecipe) return;
+  if (activeRecipe) {
+    const current = readRecipeSettings();
+    const restore = Object.entries(beforeRecipe).filter(([id]) => current[id] === appliedRecipe[id]);
+    applyNvcRecipe(Object.fromEntries(restore));
+  }
+  if (recipe) {
+    beforeRecipe = readRecipeSettings();
+    applyNvcRecipe(recipe.settings);
+    appliedRecipe = readRecipeSettings();
+  }
+  activeRecipe = recipe;
 }
-listen("#preG", "change", syncNvcPretrained);
-action("downloadPretrained", "trainLog", async output => {
-  const result = await runJob({
-    operation: "pretrained", name: requireValue(value("preCatalog"), "noPretrained"),
-    sample_rate: parseInt(radio("sr"), 10) * 1000,
-  }, [], output, "stopPretrained");
-  if (result) await loadPretrained(result.paths);
+listen("#downloadPretrained", "click", async () => {
+  const output = $("#trainLog");
+  const pair = selectedSet();
+  if (!pair?.downloadable) return;
+  $("#downloadPretrained").disabled = true;
+  log(output, "");
+  try {
+    await runJob({ operation: "pretrained", name: pair.name, sample_rate: parseInt(radio("sr"), 10) * 1000 },
+      [], output, "stopPretrained");
+  } catch (error) {
+    explain(error, output);
+  } finally {
+    await loadPretrained();
+  }
 });
 listen("#refreshPretrained", "click", () => loadPretrained());
 

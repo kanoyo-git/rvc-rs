@@ -1,5 +1,6 @@
 mod files;
 mod library;
+mod shared_link;
 
 use std::fs;
 use std::path::PathBuf;
@@ -371,24 +372,19 @@ async fn metrics(
 }
 
 async fn dataset(State(state): State<Shared>, form: Multipart) -> WebResult<Json<Value>> {
-    let (_, uploads) = files::upload(&state, form).await?;
-    let path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
-        let zip = uploads.one()?;
-        let extracted = tempfile::TempDir::new_in(state.studio.workspace.path())?;
-        let files = files::unzip(zip, extracted.path(), audio::is_audio, || Ok(()))?;
-        ensure!(
-            !files.is_empty(),
-            "the dataset archive contains no audio files"
-        );
-        let mut entries = fs::read_dir(extracted.path())?;
-        let first = entries.next().transpose()?.context("empty dataset")?.path();
-        let one_folder = entries.next().is_none() && first.is_dir();
-        let root = extracted.keep();
-        Ok(if one_folder { first } else { root })
-    })
-    .await
-    .map_err(anyhow::Error::from)??;
-    Ok(Json(json!({ "path": path })))
+    let (settings, uploads) = files::upload(&state, form, true).await?;
+    let paths =
+        tokio::task::spawn_blocking(move || uploads.into_dataset(state.studio.workspace.path()))
+            .await
+            .map_err(anyhow::Error::from)??;
+    let selected = if settings["mode"] == "multi_folder" {
+        &paths.multi_folder
+    } else {
+        &paths.single
+    };
+    Ok(Json(
+        json!({ "path": selected, "single": paths.single, "multi_folder": paths.multi_folder }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -865,6 +861,20 @@ fn native(
         }
         _ => ensure!(uploads.files.is_empty(), "unexpected uploaded files"),
     }
+    let training = match &action {
+        Action::Train { request } => Some(request),
+        #[cfg(feature = "index-training")]
+        Action::TrainAll { request, .. } => Some(request),
+        _ => None,
+    };
+    if let Some(request) = training {
+        library::prepare_training(
+            &state.paths,
+            request,
+            state.studio.workspace.path(),
+            &mut |s| job_progress(state, cancelled, s),
+        )?;
+    }
     let preset = match &action {
         Action::Separate { preset, .. } => {
             separation::PRESETS.iter().find(|item| item.id == preset)
@@ -900,7 +910,7 @@ fn native(
 }
 
 async fn start(State(state): State<Shared>, form: Multipart) -> WebResult<Response> {
-    let (settings, uploads) = files::upload(&state, form).await?;
+    let (settings, uploads) = files::upload(&state, form, false).await?;
     let operation = settings["operation"]
         .as_str()
         .context("job operation is required")?
